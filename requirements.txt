@@ -1,0 +1,2 @@
+# No third-party dependencies.
+# WhatsApp Studio runs on the Python 3.10+ standard library only.
