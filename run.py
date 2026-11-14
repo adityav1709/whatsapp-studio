@@ -24,7 +24,7 @@ def main():
     store = LeadStore(BASE / "data" / "leads.json")
     bookings = BookingStore(BASE / "data" / "bookings.json")
     handoffs = HandoffStore(BASE / "data" / "handoffs.json")
-    studio = Studio(profile, store, verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"), bookings=bookings, handoffs=handoffs)
+    studio = Studio(profile, store, verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"), bookings=bookings, handoffs=handoffs, outbox_path=BASE / "data" / "outbox.json")
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     httpd = make_server(studio, host=host, port=port)

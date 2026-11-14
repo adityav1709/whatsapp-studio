@@ -26,6 +26,37 @@ customer as a lead, and lets the owner see everything on one simple dashboard.
   on localhost. The secret and the password are never logged or returned
   in any response
 
+**v1.1 — dashboard redesign, owner booking ping, outbox on disk**
+- Dashboard rebuilt for the owner's phone: one column, cards not
+  tables, viewport meta, WhatsApp green, white background, system
+  font. First on the page is today at a glance (people messaged,
+  bookings today, people waiting, plus the rupees total for today's
+  bookings), then people waiting for you, then today's bookings, then
+  replies the bot sent, then people who messaged. The big stop/resume
+  control sits at the top
+- People waiting are cards, not rows: who they are, what they asked,
+  the last thing they said, how long they have waited, a tap-to-call
+  link, and a large "I handled it" button. A resolved handoff is a
+  count ("0 handled today"), not a row
+- The owner's words, not jargon: "People waiting for you" instead of
+  a handoffs table, "The bot told them..." instead of a status code.
+  Failed sends are loud — "SEND FAILED" plus the plain reason ("did
+  not reach the customer") — so a silent failure is impossible to miss
+- Owner ping for a new booking: the moment a booking is confirmed,
+  the owner gets a ping through the same notifier as handoffs
+  (Telegram when configured, best-effort — a failed ping never breaks
+  the booking). Double-booked attempts and cancellations do not ping
+- Outbox persisted: replies the bot sent are now saved to
+  `data/outbox.json` (last 100), loaded on startup, so the reply
+  history survives a restart. Bookings, leads and handoffs were
+  already on disk; the outbox was the last in-memory-only piece
+- Honest limit: on Render's free tier the disk is ephemeral — a
+  redeploy or a restart on a new instance can still lose
+  `data/*.json`. Bookings, leads, handoffs and the outbox all live in
+  JSON files under `data/`; a real database or a persistent disk is
+  the proper fix when the pilot grows beyond 3–4 shops. Until then,
+  the dashboard is the owner's record, not the disk
+
 **v0.4a — live sending: customer replies go out for real**
 - A sender module (`whatsapp_studio/send.py`, same shape as the Telegram
   notifier): stdlib `urllib` POST to the pinned Graph API version
@@ -136,7 +167,8 @@ runtime — never in the repo). With both set, the server sends customer
 replies live; without them it stays in demo mode and records everything
 to the outbox. `WHATSAPP_DRY_RUN=1` forces record-only even with a token
 set, so a pilot can watch exactly what would be sent before any message
-leaves. The owner WhatsApp ping is v0.4b (needs a template).
+leaves. A confirmed booking pings the owner through the notifier
+(Telegram when configured). The owner WhatsApp ping is v0.4b (needs a template).
 
 **Before a public pilot (v1.0 security)**
 Set both of these from the environment at runtime — never in the repo:
