@@ -1,9 +1,10 @@
-"""Start WhatsApp Studio with the demo business profile.
+"""Start WhatsApp Studio with a business profile.
 
 Usage:  python3 run.py
 Env:    PORT (default 8000), HOST (default 127.0.0.1; set 0.0.0.0 when
         hosting so the platform can reach it), VERIFY_TOKEN (default
-        "studio-demo")
+        "studio-demo"), PROFILE_PATH (default demo/demo_business.json —
+        point it at a prospect's own profile JSON to serve their shop)
 """
 from __future__ import annotations
 
@@ -19,8 +20,15 @@ from whatsapp_studio.leads import LeadStore
 BASE = Path(__file__).resolve().parent
 
 
+def load_profile():
+    """The business this install serves. PROFILE_PATH lets Aditya point
+    the server at a prospect's JSON file without editing code."""
+    path = os.environ.get("PROFILE_PATH") or str(BASE / "demo" / "demo_business.json")
+    return BusinessProfile.from_json(path)
+
+
 def main():
-    profile = BusinessProfile.from_json(BASE / "demo" / "demo_business.json")
+    profile = load_profile()
     store = LeadStore(BASE / "data" / "leads.json")
     bookings = BookingStore(BASE / "data" / "bookings.json")
     handoffs = HandoffStore(BASE / "data" / "handoffs.json")

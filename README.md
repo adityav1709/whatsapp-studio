@@ -5,7 +5,60 @@ A small business in India lives on WhatsApp. Customers message "facial ka price 
 or training clients. WhatsApp Studio answers those messages instantly, captures the
 customer as a lead, and lets the owner see everything on one simple dashboard.
 
-**v1.0 — security prerequisites, so the server can face the internet**
+**v1.2 — the complete product: the bot holds a conversation, and nothing it says is a lie**
+- Conversation, not one message: the bot remembers what it asked — "book facial"
+  then "tomorrow 11am" confirms; a slot list then "11am" or "yes" books it;
+  "book" then "haircut" then a time works too. A fresh message naming its own
+  service and day always starts over. An explicit cancel, human request, or
+  reschedule is never read as an answer to the old question
+- A confirmed booking is one the shop can keep: the slot is validated against
+  opening hours, the slot grid, and closing time before anything is confirmed —
+  "3am", "9am", and a 60-minute facial at 8 PM are refused with the nearest
+  real slots. "12 baje" is noon, not midnight. Re-booking your own slot says
+  "you already have a booking at that time"
+- All times are India time (Asia/Kolkata, fixed +5:30, no tzdata): bookings,
+  cancellations, open-hours checks, and the dashboard all use IST, so a
+  booking made at 00:30 IST is for the right day
+- Non-text messages get an answer, never silence: a voice note or photo gets a
+  plain reply ("I can only read typed messages right now"), a lead record, a
+  handoff, and an owner ping. Redeliveries are still answered once
+- Reschedule actually reschedules: the old booking is cancelled and the bot
+  asks for the new day and time; with nothing to move it says so plainly
+- A closed day says "closed", never "fully booked": "closed" is a valid hours
+  value, and the bot refuses bookings on it with the closed message
+- The words real customers use: "parso" (day after tomorrow), "aaj shaam" /
+  "dopahar" / "subah" as times, and Devanagari for price, booking, hours,
+  human, thanks, and greeting
+- Data survives a crash: every JSON write goes through a uniquely-named temp
+  file plus rename, so a crash mid-write cannot corrupt a file. And the owner
+  has a way out: `GET /export` (auth-gated) downloads all leads, bookings,
+  and handoffs as one file — linked from the dashboard as "Export my data"
+- More than one customer at a time: a `capacity` number per service (default
+  1) — a two-chair salon takes two bookings at the same slot
+- A failed send pings the owner too, through the same notifier as handoffs
+  and bookings (Telegram when configured, best-effort)
+- The demo runs the prospect's own shop: `PROFILE_PATH` env var in `run.py`
+  (default `demo/demo_business.json`) so a prospect's profile JSON can be
+  served without editing code
+- Wanted, built after the demanded list: the owner replies from the dashboard
+  (a reply box on each handoff card — sent through the existing sender, the
+  handoff resolved, and with sending off the button says so plainly);
+  today's money, tomorrow's bookings, and the week line on the dashboard
+  ("Rs X booked today", "Tomorrow", "This week: N bookings, Rs X"); the
+  greeting says "I'm the assistant at ..."; repeat customers get "Welcome
+  back"; an `offers` field the bot can quote; and a booking with no name
+  asks "May I have your name?" and records the answer
+- Honest limits, unchanged: data lives in JSON files on the server's disk,
+  and on Render's free tier that disk is ephemeral — a redeploy can wipe it.
+  Atomic writes stop a crash corrupting a file; the export is the backup.
+  Export before every redeploy. A persistent disk is a paid decision for
+  when the first owner pays. The owner ping is Telegram (or the dashboard)
+  until Meta approves the WhatsApp template — the WhatsApp ping is not
+  built in code and must not be pretended. The bot reads typed messages,
+  not voice notes; it holds a short conversation, not a free-form chat.
+  One install per shop, 3–4 shops, no scale work.
+
+**v1.1 — dashboard redesign, owner booking ping, outbox on disk**
 - Webhook signature verification (`whatsapp_studio/security.py`): when
   `WHATSAPP_APP_SECRET` is set, every POST to `/webhook` must carry a
   valid `X-Hub-Signature-256` header (HMAC-SHA256 over the raw body,
@@ -157,8 +210,10 @@ curl http://127.0.0.1:8000/leads
 ```
 
 **Configure a real business**
-Edit `demo/demo_business.json` (or point `run.py` at your own JSON): name,
-category, city, hours, services with INR prices, address. No code changes needed.
+Edit `demo/demo_business.json` (or set `PROFILE_PATH` to your own JSON file
+and restart): name, category, city, hours (a day's value may be "closed"),
+services with INR prices and an optional `capacity` (how many customers at
+once), address, `offers`, greeting. No code changes needed.
 
 **Going live**
 Sending replies through Meta for real needs a WhatsApp Business app and a
