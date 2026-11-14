@@ -5,6 +5,20 @@ A small business in India lives on WhatsApp. Customers message "facial ka price 
 or training clients. WhatsApp Studio answers those messages instantly, captures the
 customer as a lead, and lets the owner see everything on one simple dashboard.
 
+**v0.2 — booking with real availability**
+- Customers book in plain language: "book haircut tomorrow 11am",
+  "facial on Saturday 4pm", "kal 11 baje" — day and time are parsed from
+  the message (English + Hinglish)
+- Slots are generated from the business's opening hours and the service's
+  duration, and checked against confirmed bookings before anything is
+  promised — a double-booked slot is refused with the nearest free
+  alternatives instead
+- No time given? The bot lists the free slots for that day. Past times
+  are rejected with what is still free today
+- "cancel my booking" cancels the customer's latest upcoming booking
+- Bookings are persisted to JSON and shown on the dashboard
+  (`GET /bookings`, dashboard at `GET /`)
+
 **v0.1 — what works today**
 - Webhook endpoint that accepts Meta WhatsApp Cloud API message payloads
   (`POST /webhook`, with Meta-style `hub.verify_token` verification on `GET /webhook`)
@@ -47,7 +61,6 @@ Sending replies through Meta for real needs a WhatsApp Business app and a
 generated and recorded, never sent. No credentials live in this repo.
 
 **Roadmap**
-- Booking slots: real availability + confirmation messages
 - Human handoff: notify the owner on WhatsApp/Telegram when a customer asks
 - Optional LLM replies (pluggable, off by default — costs money, so opt-in)
 - Multi-business: one install serving many shops, each with its own profile
