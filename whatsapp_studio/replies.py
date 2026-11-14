@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from datetime import date as _date, datetime as _datetime
 
-from .bookings import format_date, format_time, parse_hours_range
-from .intents import BOOKING, CANCEL, GREETING, HOURS, HUMAN, LOCATION, PRICE, THANKS
+from .bookings import format_date, format_time, india_now, is_closed, parse_hours_range
+from .intents import BOOKING, CANCEL, GREETING, HOURS, HUMAN, LOCATION, OFFER, PRICE, THANKS
 
 
 def booking_confirmed(profile, booking):
@@ -33,7 +33,59 @@ def booking_taken(profile, service, day, start_min, alternatives):
     return " ".join(lines)
 
 
+def booking_already_yours(profile, service, day, start_min, alternatives):
+    """The slot is taken — by the same customer. Say so plainly."""
+    lines = [
+        f"You already have a booking at {format_time(start_min)} on "
+        f"{format_date(day)} ({service.name}).",
+    ]
+    if alternatives:
+        lines.append(
+            "If you want a different time, the nearest free slots that day are: "
+            + ", ".join(format_time(s) for s in alternatives[:4])
+            + ". Reply with one of these times to book it."
+        )
+    return " ".join(lines)
+
+
+def booking_invalid_slot(profile, service, day, start_min, hours_text, alternatives):
+    """A slot the shop cannot keep: closed, outside hours, or off the
+    slot grid. Never confirm it — say why, and offer the nearest real ones."""
+    if is_closed(hours_text):
+        return f"Sorry, we are closed on {format_date(day)}."
+    span = parse_hours_range(hours_text)
+    open_min, close_min = span if span else (None, None)
+    if open_min is not None and (
+        start_min < open_min or start_min + service.duration_min > close_min
+    ):
+        lines = [
+            f"Sorry, {format_time(start_min)} on {format_date(day)} is outside "
+            f"our hours ({hours_text})."
+        ]
+    else:
+        lines = [
+            f"Sorry, {format_time(start_min)} is not a slot we offer — "
+            f"{service.name} starts every {service.duration_min} minutes"
+            + (
+                f" from {format_time(open_min)}."
+                if open_min is not None
+                else "."
+            )
+        ]
+    if alternatives:
+        lines.append(
+            "The nearest free slots that day are: "
+            + ", ".join(format_time(s) for s in alternatives[:4])
+            + ". Reply with one of these times to book it."
+        )
+    else:
+        lines.append("Would another day work?")
+    return " ".join(lines)
+
+
 def slots_available(profile, service, day, slots):
+    if is_closed(profile.hours_today(day.weekday())):
+        return f"Sorry, we are closed on {format_date(day)}."
     if not slots:
         return (
             f"Sorry, {service.name} is fully booked on {format_date(day)}. "
@@ -59,6 +111,21 @@ def booking_none_to_cancel(profile):
     return "I could not find an upcoming booking for you to cancel."
 
 
+def booking_reschedule_ask(profile, booking):
+    """The old booking is cancelled; ask for the new day and time."""
+    return (
+        f"Done — your {booking['service']} on "
+        f"{format_date(_date.fromisoformat(booking['date']))} "
+        f"at {format_time(booking['start_min'])} is cancelled. "
+        "Which day and time would you like instead? "
+        "For example, 'tomorrow 4pm'."
+    )
+
+
+def booking_none_to_reschedule(profile):
+    return "I could not find a booking to move."
+
+
 def booking_ask_when(profile, service):
     return (
         f"Great, {service.name} (Rs {service.price}, {service.duration_min} min). "
@@ -67,7 +134,10 @@ def booking_ask_when(profile, service):
 
 
 def _is_open_now(profile, now):
-    span = parse_hours_range(profile.hours_today(now.weekday()))
+    hours_text = profile.hours_today(now.weekday())
+    if is_closed(hours_text):
+        return False
+    span = parse_hours_range(hours_text)
     if span is None:
         return True
     open_min, close_min = span
@@ -83,7 +153,7 @@ def handoff_confirmation(profile, reason, now=None):
     themselves. After hours it says plainly that the shop is closed and
     exactly when they will hear back — never a quick-reply promise.
     """
-    now = now or _datetime.now()
+    now = now or india_now()
     if _is_open_now(profile, now):
         lead = (
             "I couldn't quite get that, so I've passed this to the team"
@@ -111,11 +181,19 @@ def handoff_confirmation(profile, reason, now=None):
     )
 
 
-def build_reply(profile, intent, text, service=None, now=None):
+def build_reply(profile, intent, text, service=None, now=None, returning=False, customer_name=""):
     name = profile.name
     if intent == GREETING:
         services = ", ".join(s.name for s in profile.services[:4])
-        base = profile.greeting or f"Hello! Welcome to {name}."
+        if returning:
+            base = (
+                f"Welcome back{', ' + customer_name if customer_name else ''}! "
+                f"Good to see you at {name} again."
+            )
+        else:
+            base = profile.greeting or f"Hello! Welcome to {name}."
+        if "assistant" not in base.lower():
+            base += f" I'm the assistant at {name}."
         extra = f" We offer {services}." if services else ""
         return (
             f"{base}{extra} How can I help you today? "
@@ -137,6 +215,10 @@ def build_reply(profile, intent, text, service=None, now=None):
             lines.append(f"- {s.name}: Rs {s.price}")
         lines.append("Reply with the service name to book, or ask me anything else.")
         return "\n".join(lines)
+    if intent == OFFER:
+        if profile.offers:
+            return f"Yes! At {name}: {profile.offers}"
+        return f"We have no current offers at {name} right now."
     if intent == BOOKING:
         if service is not None:
             return booking_ask_when(profile, service)

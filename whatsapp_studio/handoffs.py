@@ -9,6 +9,9 @@ it resolved on the dashboard and the bot resumes from the next message.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -27,12 +30,32 @@ def age_text(opened_at, now=None):
     return f"{hours // 24}d {hours % 24}h"
 
 
+def _atomic_write(path, text):
+    """Write a file so a crash mid-write cannot corrupt it: a uniquely
+    named temp file in the same directory, then a rename. The server
+    handles webhooks on threads, so the temp name must be unique per
+    write — two webhooks at the same moment must never share one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class HandoffStore:
     """Handoffs persisted as JSON; path=None keeps them in memory only."""
 
     def __init__(self, path=None):
         self.path = Path(path) if path else None
         self._handoffs = []
+        self._save_lock = threading.Lock()
         if self.path and self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -43,8 +66,8 @@ class HandoffStore:
     def _save(self):
         if self.path is None:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._handoffs, indent=2), encoding="utf-8")
+        with self._save_lock:
+            _atomic_write(self.path, json.dumps(self._handoffs, indent=2))
 
     def open(self, phone, name, reason, trigger_message):
         """Open a handoff, or return the open one if there already is one."""

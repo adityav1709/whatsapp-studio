@@ -5,10 +5,11 @@ onboarding flow) can edit it without touching code.
 """
 from __future__ import annotations
 
-import datetime
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .bookings import india_today
 
 
 @dataclass
@@ -17,6 +18,9 @@ class Service:
     price: int  # INR
     duration_min: int = 30
     description: str = ""
+    # How many customers can be served at once (chairs, doctors, trainers).
+    # 1 is one provider; a two-chair salon sets 2.
+    capacity: int = 1
 
 
 @dataclass
@@ -29,6 +33,7 @@ class BusinessProfile:
     services: list = field(default_factory=list)
     greeting: str = ""
     address: str = ""
+    offers: str = ""  # e.g. "20% off on all facials this week"
 
     @classmethod
     def from_json(cls, path):
@@ -43,6 +48,7 @@ class BusinessProfile:
             services=services,
             greeting=data.get("greeting", ""),
             address=data.get("address", ""),
+            offers=data.get("offers", ""),
         )
 
     def service_named(self, text):
@@ -60,9 +66,10 @@ class BusinessProfile:
         return None
 
     def hours_today(self, weekday=None):
-        """Opening hours for a weekday (0=Mon .. 6=Sun); defaults to today."""
+        """Opening hours for a weekday (0=Mon .. 6=Sun); defaults to today
+        in India. A day's value may be "closed"."""
         if weekday is None:
-            weekday = datetime.date.today().weekday()
+            weekday = india_today().weekday()
         keys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
         day = keys[weekday]
         if day in self.hours:

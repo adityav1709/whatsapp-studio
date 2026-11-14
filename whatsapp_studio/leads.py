@@ -7,14 +7,37 @@ volume says so.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import threading
 import time
 from pathlib import Path
+
+
+def _atomic_write(path, text):
+    """Write a file so a crash mid-write cannot corrupt it: a uniquely
+    named temp file in the same directory, then a rename. The server
+    handles webhooks on threads, so the temp name must be unique per
+    write — two webhooks at the same moment must never share one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class LeadStore:
     def __init__(self, path):
         self.path = Path(path)
         self._leads = {}
+        self._save_lock = threading.Lock()
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -25,8 +48,8 @@ class LeadStore:
                 self._leads = {}
 
     def _save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._leads, indent=2), encoding="utf-8")
+        with self._save_lock:
+            _atomic_write(self.path, json.dumps(self._leads, indent=2))
 
     def record_message(self, phone, text, intent, sender_name="", wamid=None):
         now = int(time.time())

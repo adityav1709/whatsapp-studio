@@ -13,18 +13,23 @@ HOURS = "hours"
 PRICE = "price"
 BOOKING = "booking"
 CANCEL = "cancel"
+RESCHEDULE = "reschedule"
+OFFER = "offer"
 LOCATION = "location"
 HUMAN = "human"
 THANKS = "thanks"
 FALLBACK = "fallback"
 
 _PATTERNS = {
-    GREETING: [r"\b(hi|hii+|hello|hey|namaste|namaskar|good\s+(morning|afternoon|evening))\b"],
-    HOURS: [r"\b(timing|timings|hours|open|close|closed|kab\s+khulta|kitne\s+baje|open\s+hai)\b"],
-    PRICE: [r"\b(price|prices|pricing|rate|rates|cost|charges|fees|kitne\s+ka|kitna|kya\s+price|charges\s+kya|how\s+much)\b"],
-    BOOKING: [r"\b(book|booking|appointment|slot|reserve|schedule|book\s+karna|appointment\s+chahiye)\b"],
-    CANCEL: [r"\b(cancel|reschedule)\b.*\b(booking|appointment|slot)\b",
+    GREETING: [r"\b(hi|hii+|hello|hey|namaste|namaskar|good\s+(morning|afternoon|evening))\b", r"नमस्ते"],
+    HOURS: [r"\b(timing|timings|hours|open|close|closed|kab\s+khulta|kitne\s+baje|open\s+hai)\b", r"समय", r"खुला", r"बंद"],
+    PRICE: [r"\b(price|prices|pricing|rate|rates|cost|charges|fees|kitne\s+ka|kitna|kya\s+price|charges\s+kya|how\s+much)\b", r"कीमत", r"कितने", r"कितना"],
+    BOOKING: [r"\b(book|booking|appointment|slot|reserve|schedule|book\s+karna|appointment\s+chahiye)\b", r"बुक", r"अपॉइंटमेंट"],
+    CANCEL: [r"\bcancel\b.*\b(booking|appointment|slot)\b",
              r"\bcancel\s+my\b"],
+    RESCHEDULE: [r"\breschedule\b",
+                 r"\b(move|change|shift)\b.*\b(booking|appointment|slot)\b"],
+    OFFER: [r"\b(offer|offers|discount|deal|deals|coupon|promo)\b"],
     LOCATION: [r"\b(where|location|address|kahan|kaha|kahaan|address\s+kya|location\s+kya|reach|direction)\b"],
     HUMAN: [
         # Person-specific only: "talk to" on its own is not a handoff —
@@ -35,15 +40,17 @@ _PATTERNS = {
         r"\b(human|manager|owner)\b",
         r"\bcall me\b",
         r"\b(agent|insaan|madam|kisi)\s+se\s+baat\b",
+        r"इंसान", r"मैनेजर",
     ],
-    THANKS: [r"\b(thank|thanks|shukriya|dhanyavad)\b"],
+    THANKS: [r"\b(thank|thanks|shukriya|dhanyavad)\b", r"धन्यवाद"],
 }
 
 # A message asking something beats a bare greeting. A request for a person
 # beats a topic (booking, price, hours) but not a cancellation: "let me
 # talk to a person about my booking" is a handoff, "cancel my booking" is
-# still a cancellation.
-_PRIORITY = [CANCEL, HUMAN, BOOKING, PRICE, HOURS, LOCATION, THANKS, GREETING]
+# still a cancellation. A reschedule beats a fresh booking: "move my
+# booking" is moving the old one, not making a new one.
+_PRIORITY = [CANCEL, HUMAN, RESCHEDULE, BOOKING, PRICE, OFFER, HOURS, LOCATION, THANKS, GREETING]
 
 
 def detect_intent(text):

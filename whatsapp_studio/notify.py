@@ -1,8 +1,10 @@
-"""Owner notifications for handoffs and bookings. Best-effort helpers on top
-of the dashboard, never a reason for a handoff or a booking to fail.
+"""Owner notifications for handoffs, bookings, and failed sends. Best-effort
+helpers on top of the dashboard, never a reason for a handoff or a booking
+to fail.
 
-The interface is an object with ``notify(business_name, handoff)`` and
-``notify_booking(business_name, booking)``, so a WhatsApp notifier can
+The interface is an object with ``notify(business_name, handoff)``,
+``notify_booking(business_name, booking)`` and
+``notify_send_failed(business_name, entry)``, so a WhatsApp notifier can
 plug in later without touching the app. Today there are two
 implementations: Telegram (owner-supplied bot token and chat id from the
 environment, off by default) and a null one that does nothing. No
@@ -60,6 +62,17 @@ class TelegramNotifier:
             f"{format_time(booking['start_min'])} · Rs {booking['price']}"
         )
 
+    def notify_send_failed(self, business_name, entry):
+        """A reply that never reached the customer is the worst failure a
+        receptionist can have — the owner hears about it, not just the
+        dashboard."""
+        self._send(
+            f"Message did not send — {business_name}\n"
+            f"{entry.get('to')}\n"
+            f"\"{(entry.get('body') or '')[:200]}\"\n"
+            f"Error: {entry.get('send_error') or 'unknown'}"
+        )
+
 
 class NullNotifier:
     """No notification configured; handoffs and bookings queue on the
@@ -69,6 +82,9 @@ class NullNotifier:
         return None
 
     def notify_booking(self, business_name, booking):
+        return None
+
+    def notify_send_failed(self, business_name, entry):
         return None
 
 

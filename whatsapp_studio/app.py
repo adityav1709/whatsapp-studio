@@ -16,21 +16,36 @@ from __future__ import annotations
 import html
 import json
 import os
+import tempfile
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .bookings import BookingStore, parse_day, parse_time
+from .bookings import (
+    IST,
+    BookingStore,
+    has_relative_time,
+    india_now,
+    india_today,
+    parse_day,
+    parse_time,
+    validate_slot,
+)
 from .handoffs import HandoffStore, age_text
-from .intents import BOOKING, CANCEL, FALLBACK, HUMAN, PRICE, detect_intent
+from .intents import BOOKING, CANCEL, FALLBACK, HUMAN, PRICE, RESCHEDULE, detect_intent
 from .notify import notifier_from_env
 from .replies import (
+    booking_already_yours,
+    booking_ask_when,
     booking_cancelled,
     booking_confirmed,
+    booking_invalid_slot,
     booking_none_to_cancel,
+    booking_none_to_reschedule,
+    booking_reschedule_ask,
     booking_taken,
     build_reply,
     handoff_confirmation,
@@ -38,6 +53,25 @@ from .replies import (
 )
 from .security import check_basic_auth, verify_webhook_signature
 from .send import MAX_TEXT_CHARS, sender_from_env
+
+
+def _atomic_write(path, text):
+    """Write a file so a crash mid-write cannot corrupt it: a uniquely
+    named temp file in the same directory, then a rename. The server
+    handles webhooks on threads, so the temp name must be unique per
+    write — two webhooks at the same moment must never share one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class Studio:
@@ -65,7 +99,14 @@ class Studio:
         # With a path, the reply history survives a restart the same way
         # leads and bookings do; without one it stays in memory only.
         self._outbox_path = Path(outbox_path) if outbox_path else None
+        self._outbox_lock = threading.Lock()
         self.outbox = self._load_outbox()
+        # What the bot is waiting for from each phone: the question it
+        # asked last ("which day and time?", "which service?", a slot
+        # list). The next message from that phone is read in that
+        # context, so a customer can book in two or three messages.
+        # Transient by nature: a restart mid-conversation drops it.
+        self._pending = {}
 
     def _load_outbox(self):
         if self._outbox_path is None or not self._outbox_path.exists():
@@ -83,8 +124,8 @@ class Studio:
             return
         if len(self.outbox) > 100:
             del self.outbox[:-100]
-        self._outbox_path.parent.mkdir(parents=True, exist_ok=True)
-        self._outbox_path.write_text(json.dumps(self.outbox, indent=2), encoding="utf-8")
+        with self._outbox_lock:
+            _atomic_write(self._outbox_path, json.dumps(self.outbox, indent=2))
 
     @property
     def live(self):
@@ -162,23 +203,120 @@ class Studio:
         except Exception as exc:
             entry["send_status"] = "failed"
             entry["send_error"] = str(exc) or exc.__class__.__name__
+            # A failed send means a customer got silence after asking for
+            # something — the owner hears about it, not just the dashboard.
+            try:
+                self.notifier.notify_send_failed(self.profile.name, entry)
+            except Exception:
+                pass
             return
         entry["send_status"] = "sent"
         entry["wamid"] = wamid
+
+    def _record_reply(self, phone, text, intent, sender_name, reply, wamid=None):
+        """Record the incoming message, queue the reply, and send it if live."""
+        self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
+        entry = {"to": phone, "body": reply, "intent": intent}
+        self.outbox.append(entry)
+        self._dispatch(entry)
+        self._save_outbox()
+        return entry
+
+    def _resolve_pending(self, phone, text, sender_name, intent, now):
+        """Read a message in the context of the question the bot last
+        asked this phone. Returns the reply, or None when the message is
+        not an answer to that question — then normal handling takes over.
+        Only a plain answer counts: a price question, a greeting, or a
+        new topic is answered on its own merits, not as a booking answer."""
+        pending = self._pending.get(phone)
+        if pending is None:
+            return None
+        kind = pending.get("kind")
+        if kind == "booking_ask_service":
+            if intent not in (FALLBACK, BOOKING):
+                return None
+            service = self.profile.service_named(text)
+            if service is None:
+                return None
+            return self._handle_booking(phone, text, sender_name, service, now)
+        if kind == "booking_ask_when":
+            if intent not in (FALLBACK, BOOKING):
+                return None
+            service = self.profile.service_named(pending.get("service") or "")
+            if service is None:
+                return None
+            return self._handle_booking(phone, text, sender_name, service, now)
+        if kind == "slots_available":
+            if intent not in (FALLBACK, BOOKING):
+                return None
+            service = self.profile.service_named(pending.get("service") or "")
+            if service is None:
+                return None
+            # The message's own day wins over the pending day: "parso
+            # 11am" after a slot list for tomorrow is the day after
+            # tomorrow, not tomorrow.
+            today = (now or india_now()).date()
+            day = parse_day(text, today)
+            if day is None:
+                day = (
+                    date.fromisoformat(pending["day"])
+                    if pending.get("day")
+                    else today
+                )
+            if text.strip().lower() in (
+                "yes", "yeah", "yep", "ok", "okay", "first", "first one",
+                "book it", "haan", "ha",
+            ):
+                slots = pending.get("slots") or []
+                if not slots:
+                    return None
+                return self._confirm_booking(phone, sender_name, service, day, slots[0])
+            start = parse_time(text)
+            if start is None:
+                return None
+            return self._confirm_booking(phone, sender_name, service, day, start)
+        if kind == "ask_name":
+            if intent != FALLBACK:
+                return None
+            name = text.strip()
+            words = name.split()
+            if not (1 <= len(words) <= 3) or not all(w.isalpha() for w in words):
+                return None
+            if parse_day(text) is not None or parse_time(text) is not None:
+                return None
+            updated = self.bookings.update_latest_name(phone, name)
+            self._pending.pop(phone, None)
+            if updated is None:
+                return None
+            return f"Thanks, {name}! I've noted that down. See you then."
+        return None
 
     def handle_message(self, phone, text, sender_name="", now=None, wamid=None):
         intent = detect_intent(text)
         # A handoff is total: while one is open the message is recorded for
         # the owner to read, but the bot sends nothing — not even a booking.
         if self.handoffs.open_for(phone) is not None:
+            self._pending.pop(phone, None)
             self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
             return {"to": phone, "body": None, "intent": intent, "paused": True}
+        # An explicit cancel, human request, or reschedule is always a
+        # fresh intent — never an answer to the question the bot asked.
+        # So is a fresh booking that names its own service: the message
+        # is self-contained, and the pending question is abandoned.
+        if intent not in (CANCEL, HUMAN, RESCHEDULE) and phone in self._pending:
+            if intent == BOOKING and self.profile.service_named(text) is not None:
+                self._pending.pop(phone, None)
+            else:
+                reply = self._resolve_pending(phone, text, sender_name, intent, now)
+                if reply is not None:
+                    return self._record_reply(phone, text, intent, sender_name, reply, wamid)
         reason = None
         if intent == HUMAN:
             reason = "asked for a person"
         elif intent == FALLBACK and self._fallback_streak(phone) >= 2:
             reason = "couldn't help"
         if reason is not None:
+            self._pending.pop(phone, None)
             handoff = self.handoffs.open(phone, sender_name, reason, text)
             reply = handoff_confirmation(self.profile, reason, now)
             self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
@@ -195,22 +333,29 @@ class Studio:
         if intent in (PRICE, BOOKING):
             service = self.profile.service_named(text)
         if intent == BOOKING and service is not None:
-            reply = self._handle_booking(phone, text, sender_name, service)
+            reply = self._handle_booking(phone, text, sender_name, service, now)
+        elif intent == BOOKING:
+            self._pending[phone] = {"kind": "booking_ask_service"}
+            reply = build_reply(self.profile, intent, text, service=service, now=now)
         elif intent == CANCEL:
+            self._pending.pop(phone, None)
             cancelled = self.bookings.cancel_latest(phone)
             reply = (
                 booking_cancelled(self.profile, cancelled)
                 if cancelled
                 else booking_none_to_cancel(self.profile)
             )
+        elif intent == RESCHEDULE:
+            reply = self._handle_reschedule(phone, sender_name, now)
         else:
-            reply = build_reply(self.profile, intent, text, service=service, now=now)
-        self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
-        entry = {"to": phone, "body": reply, "intent": intent}
-        self.outbox.append(entry)
-        self._dispatch(entry)
-        self._save_outbox()
-        return entry
+            lead = self.leads.get(phone)
+            returning = lead is not None and lead["message_count"] > 0
+            reply = build_reply(
+                self.profile, intent, text, service=service, now=now,
+                returning=returning,
+                customer_name=(lead or {}).get("name", ""),
+            )
+        return self._record_reply(phone, text, intent, sender_name, reply, wamid)
 
     def _fallback_streak(self, phone):
         """Trailing fallback intents for this phone, counting the message in flight.
@@ -235,54 +380,177 @@ class Studio:
                 break
         return count
 
-    def _handle_booking(self, phone, text, sender_name, service):
-        """Book a slot, or show free slots, from a booking message."""
-        today = date.today()
-        day = parse_day(text, today) or today
-        start = parse_time(text)
-        if start is None:
-            slots = self.bookings.free_slots(
-                day, service, self.profile.hours_today(day.weekday())
-            )
-            return slots_available(self.profile, service, day, slots)
-        if day == today and start <= datetime.now().hour * 60 + datetime.now().minute:
-            slots = self.bookings.free_slots(
-                day, service, self.profile.hours_today(day.weekday())
-            )
-            future = [
-                s for s in slots
-                if s > datetime.now().hour * 60 + datetime.now().minute
-            ]
-            if not future:
-                return slots_available(self.profile, service, day, [])
-            return (
-                f"That time has already passed today. "
-                + slots_available(self.profile, service, day, future)
+    def _nearest_slots(self, day, service, start, limit=4):
+        """Free slots nearest to a requested time, for offering alternatives."""
+        free = self.bookings.free_slots(
+            day, service, self.profile.hours_today(day.weekday())
+        )
+        return sorted(free, key=lambda s: abs(s - start))[:limit]
+
+    def _confirm_booking(self, phone, sender_name, service, day, start):
+        """Validate a slot, book it, and ping the owner. A slot the shop
+        cannot keep is never confirmed — the bot says why and offers the
+        nearest real ones instead."""
+        hours_text = self.profile.hours_today(day.weekday())
+        if not validate_slot(day, start, service, hours_text):
+            alternatives = self._nearest_slots(day, service, start)
+            self._pending[phone] = {
+                "kind": "slots_available",
+                "service": service.name,
+                "day": day.isoformat(),
+                "slots": alternatives,
+            }
+            return booking_invalid_slot(
+                self.profile, service, day, start, hours_text, alternatives
             )
         booking = self.bookings.book(phone, sender_name, service, day, start)
-        if booking is not None:
-            # A confirmed booking pings the owner the same way a handoff
-            # does: best-effort, never a reason for the booking to fail.
-            try:
-                self.notifier.notify_booking(self.profile.name, booking)
-            except Exception:
-                pass
-            return booking_confirmed(self.profile, booking)
-        alternatives = [
-            s
-            for s in self.bookings.free_slots(
-                day, service, self.profile.hours_today(day.weekday())
+        if booking is None:
+            alternatives = self._nearest_slots(day, service, start)
+            self._pending[phone] = {
+                "kind": "slots_available",
+                "service": service.name,
+                "day": day.isoformat(),
+                "slots": alternatives,
+            }
+            mine = [
+                b for b in self.bookings.overlapping(
+                    day, start, service.duration_min
+                )
+                if b["phone"] == phone
+            ]
+            if mine:
+                return booking_already_yours(
+                    self.profile, service, day, start, alternatives
+                )
+            return booking_taken(self.profile, service, day, start, alternatives)
+        self._pending.pop(phone, None)
+        # A confirmed booking pings the owner the same way a handoff
+        # does: best-effort, never a reason for the booking to fail.
+        try:
+            self.notifier.notify_booking(self.profile.name, booking)
+        except Exception:
+            pass
+        reply = booking_confirmed(self.profile, booking)
+        lead = self.leads.get(phone)
+        if not sender_name and not (lead and lead.get("name")):
+            self._pending[phone] = {"kind": "ask_name"}
+            reply += " May I have your name?"
+        return reply
+
+    def _handle_booking(self, phone, text, sender_name, service, now=None):
+        """Book a slot, or show free slots, from a booking message."""
+        now = now or india_now()
+        today = now.date()
+        now_min = now.hour * 60 + now.minute
+        day = parse_day(text, today) or today
+        start = parse_time(text)
+        hours_text = self.profile.hours_today(day.weekday())
+        if start is None:
+            if parse_day(text, today) is None:
+                # No day and no time: ask which day and time, and wait
+                # for the answer instead of guessing.
+                self._pending[phone] = {
+                    "kind": "booking_ask_when",
+                    "service": service.name,
+                }
+                return booking_ask_when(self.profile, service)
+            slots = self.bookings.free_slots(day, service, hours_text)
+            self._pending[phone] = {
+                "kind": "slots_available",
+                "service": service.name,
+                "day": day.isoformat(),
+                "slots": slots,
+            }
+            return slots_available(self.profile, service, day, slots)
+        # A time of day ("subah") with no day means the next such time:
+        # if it has already passed today, it is tomorrow's.
+        if (
+            parse_day(text, today) is None
+            and has_relative_time(text)
+            and day == today
+            and start <= now_min
+        ):
+            day = today + timedelta(days=1)
+            hours_text = self.profile.hours_today(day.weekday())
+        if day == today and start <= now_min:
+            slots = self.bookings.free_slots(day, service, hours_text)
+            future = [s for s in slots if s > now_min]
+            if not future:
+                return slots_available(self.profile, service, day, [])
+            self._pending[phone] = {
+                "kind": "slots_available",
+                "service": service.name,
+                "day": day.isoformat(),
+                "slots": future,
+            }
+            return (
+                "That time has already passed today. "
+                + slots_available(self.profile, service, day, future)
             )
-            if abs(s - start) <= 120
-        ]
-        return booking_taken(self.profile, service, day, start, alternatives)
+        return self._confirm_booking(phone, sender_name, service, day, start)
+
+    def _handle_reschedule(self, phone, sender_name, now):
+        """Move a booking: cancel the latest one, then ask for the new
+        day and time. Never silently destroy a booking the customer
+        wanted to keep — if there is nothing to move, say so."""
+        cancelled = self.bookings.cancel_latest(phone)
+        if cancelled is None:
+            return booking_none_to_reschedule(self.profile)
+        self._pending.pop(phone, None)
+        service = self.profile.service_named(cancelled["service"])
+        if service is not None:
+            self._pending[phone] = {
+                "kind": "booking_ask_when",
+                "service": service.name,
+            }
+        return booking_reschedule_ask(self.profile, cancelled)
+
+    def handle_non_text_message(self, phone, msg_type, sender_name="", wamid=None):
+        """A voice note, photo, or anything else that is not typed text
+        gets an honest answer, a lead record, and a handoff — never
+        silence. The bot reads typed messages, not voice notes, and says
+        so instead of claiming it will listen later."""
+        labels = {
+            "audio": "voice note",
+            "image": "photo",
+            "video": "video",
+            "location": "location",
+            "sticker": "sticker",
+            "document": "document",
+        }
+        label = labels.get(msg_type, "message")
+        # While a handoff is open the bot stays quiet; the message is
+        # still recorded for the owner to read.
+        if self.handoffs.open_for(phone) is not None:
+            self.leads.record_message(
+                phone, f"[sent a {label}]", HUMAN, sender_name, wamid=wamid
+            )
+            return None
+        reason = f"sent a {label}"
+        handoff = self.handoffs.open(phone, sender_name, reason, f"sent a {label}")
+        reply = (
+            "I can only read typed messages right now — please type it "
+            "and I will help right away."
+        )
+        self.leads.record_message(
+            phone, f"[sent a {label}]", HUMAN, sender_name, wamid=wamid
+        )
+        entry = {"to": phone, "body": reply, "intent": HUMAN, "handoff": handoff["id"]}
+        self.outbox.append(entry)
+        self._dispatch(entry)
+        self._save_outbox()
+        try:
+            self.notifier.notify(self.profile.name, handoff)
+        except Exception:
+            pass
+        return entry
 
     def handle_webhook_payload(self, payload):
         """Process a Meta WhatsApp Cloud API webhook payload. Returns count."""
         count = 0
         # Meta mixes status updates and non-text messages into the same payload
-        # shape. Skip anything that isn't a text message rather than letting
-        # one odd entry kill the whole batch.
+        # shape. Skip status updates, but answer non-text messages honestly
+        # rather than dropping them — real customers send voice notes.
         for entry in payload.get("entry", []) or []:
             for change in entry.get("changes", []) or []:
                 value = change.get("value", {}) or {}
@@ -291,10 +559,7 @@ class Studio:
                     for c in value.get("contacts", []) or []
                 }
                 for msg in value.get("messages", []) or []:
-                    if msg.get("type") != "text":
-                        continue
                     phone = msg.get("from", "")
-                    text = (msg.get("text") or {}).get("body", "")
                     if not phone:
                         continue
                     # Meta redelivers when it does not get a 200 fast. The
@@ -305,6 +570,13 @@ class Studio:
                     wamid = msg.get("id")
                     if wamid and self.leads.has_wamid(phone, wamid):
                         continue
+                    if msg.get("type") != "text":
+                        self.handle_non_text_message(
+                            phone, msg.get("type", ""), contacts.get(phone, ""), wamid=wamid
+                        )
+                        count += 1
+                        continue
+                    text = (msg.get("text") or {}).get("body", "")
                     self.handle_message(phone, text, contacts.get(phone, ""), wamid=wamid)
                     count += 1
         return count
@@ -315,7 +587,7 @@ class Studio:
         tests assert on are kept verbatim."""
         from .bookings import format_date, format_time
 
-        today = date.today()
+        today = india_today()
         open_handoffs = [
             h for h in self.handoffs.all_handoffs() if h["status"] == "open"
         ]
@@ -325,14 +597,23 @@ class Studio:
         resolved_today = [
             h for h in resolved
             if h.get("resolved_at")
-            and datetime.fromtimestamp(h["resolved_at"]).date() == today
+            and datetime.fromtimestamp(h["resolved_at"], tz=IST).date() == today
         ]
         leads = self.leads.all_leads()
         todays = self.bookings.bookings_on(today)
         rupees_today = sum(b["price"] for b in todays)
+        tomorrow = today + timedelta(days=1)
+        tomorrows = self.bookings.bookings_on(tomorrow)
+        monday = today - timedelta(days=today.weekday())
+        sunday = monday + timedelta(days=6)
+        week_bookings = [
+            b for b in self.bookings.all_bookings()
+            if monday <= date.fromisoformat(b["date"]) <= sunday
+        ]
+        week_rupees = sum(b["price"] for b in week_bookings)
         messaged_today = sum(
             1 for lead in leads
-            if datetime.fromtimestamp(lead["last_seen"]).date() == today
+            if datetime.fromtimestamp(lead["last_seen"], tz=IST).date() == today
         )
         waiting = len(open_handoffs)
 
@@ -421,6 +702,21 @@ class Studio:
                 card += "<p class='since'>Since then:</p><p class='said'>“{}”</p>".format(
                     "<br>".join(html.escape(m[:200]) for m in since[-5:])
                 )
+            reply_label = "Send reply" if self.live else "Record reply — sending is off"
+            card += (
+                "<form method='post' action='/handoffs/{}/reply'>"
+                "<input type='text' name='text' placeholder='Reply to {}…' required>"
+                "<button type='submit' class='big'>{}</button></form>"
+            ).format(
+                handoff["id"],
+                html.escape(handoff.get("name") or "them"),
+                reply_label,
+            )
+            if not self.live:
+                card += (
+                    "<p class='quiet'>Sending is off — your reply will be "
+                    "recorded here, not sent on WhatsApp.</p>"
+                )
             card += (
                 "<form method='post' action='/handoffs/resolve'>"
                 "<input type='hidden' name='handoff_id' value='{}'>"
@@ -432,21 +728,25 @@ class Studio:
             "<p class='allclear'>All clear — nobody is waiting for you.</p>"
         )
 
-        book_items = []
-        for b in todays:
-            digits = "".join(c for c in b["phone"] if c.isdigit())
-            book_items.append(
-                "<li><strong>{}</strong> — {} for {} — Rs {} · "
-                "<a href='tel:+{}'>{}</a></li>".format(
-                    html.escape(format_time(b["start_min"])),
-                    html.escape(b["service"]),
-                    html.escape(b.get("name") or "—"),
-                    b["price"],
-                    digits,
-                    html.escape(b["phone"]),
+        def booking_rows(bookings):
+            rows = []
+            for b in bookings:
+                digits = "".join(c for c in b["phone"] if c.isdigit())
+                rows.append(
+                    "<li><strong>{}</strong> — {} for {} — Rs {} · "
+                    "<a href='tel:+{}'>{}</a></li>".format(
+                        html.escape(format_time(b["start_min"])),
+                        html.escape(b["service"]),
+                        html.escape(b.get("name") or "—"),
+                        b["price"],
+                        digits,
+                        html.escape(b["phone"]),
+                    )
                 )
-            )
-        book_body = "".join(book_items) or "<li>No bookings today.</li>"
+            return rows
+
+        book_body = "".join(booking_rows(todays)) or "<li>No bookings today.</li>"
+        tomorrow_body = "".join(booking_rows(tomorrows)) or "<li>No bookings tomorrow.</li>"
 
         entries = list(reversed(self.outbox))
         failed = [e for e in entries if (e.get("send_status") or "") == "failed"]
@@ -527,6 +827,8 @@ class Studio:
             "button{min-height:44px;padding:10px 20px;font-size:16px;border-radius:10px;"
             "border:1px solid #128c7e;background:#128c7e;color:#fff;cursor:pointer}"
             "button.big{width:100%;margin-top:8px}"
+            "input[type=text]{width:100%;box-sizing:border-box;min-height:44px;"
+            "padding:10px 12px;font-size:16px;border:1px solid #ccc;border-radius:10px;margin:8px 0}"
             "a{color:#128c7e}"
             "@media (max-width:480px){.nums{flex-direction:column;gap:4px}.num{text-align:left}}"
         )
@@ -548,10 +850,15 @@ class Studio:
             "<p class='quiet'>{} handled today.</p>"
             "<h2>Bookings today ({})</h2>"
             "<ul class='list'>{}</ul>"
+            "<h2>Tomorrow ({})</h2>"
+            "<ul class='list'>{}</ul>"
+            "<p>This week: {} bookings, Rs {}.</p>"
             "<h2>Replies the bot sent</h2>"
             "<ul class='list'>{}</ul>"
             "<h2>People who messaged</h2>"
             "<ul class='list'>{}</ul>"
+            "<p class='quiet'><a href='/export'>Export my data</a> — download "
+            "all leads, bookings and handoffs as one file.</p>"
             "</div></body></html>"
         ).format(
             html.escape(self.profile.name),
@@ -567,6 +874,10 @@ class Studio:
             len(resolved_today),
             html.escape(format_date(today)),
             book_body,
+            html.escape(format_date(tomorrow)),
+            tomorrow_body,
+            len(week_bookings),
+            week_rupees,
             out_body,
             lead_body,
         )
@@ -642,6 +953,24 @@ def make_handler(studio):
                 self._send_json(200, {"bookings": studio.bookings.all_bookings()})
             elif parsed.path == "/handoffs":
                 self._send_json(200, {"handoffs": studio.handoffs.all_handoffs()})
+            elif parsed.path == "/export":
+                # The owner's way out and the backup before a redeploy:
+                # everything as one downloadable JSON file.
+                payload = {
+                    "leads": studio.leads.all_leads(),
+                    "bookings": studio.bookings.all_bookings(),
+                    "handoffs": studio.handoffs.all_handoffs(),
+                }
+                data = json.dumps(payload, indent=2).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header(
+                    "Content-Disposition",
+                    'attachment; filename="whatsapp-studio-export.json"',
+                )
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
             elif parsed.path == "/":
                 self._send_text(200, studio.dashboard_html(), "text/html")
             else:
@@ -699,6 +1028,49 @@ def make_handler(studio):
                 if handoff_id is None or studio.handoffs.resolve(handoff_id) is None:
                     self._send_json(404, {"error": "handoff not found"})
                     return
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path.startswith("/handoffs/") and parsed.path.endswith("/reply"):
+                # The owner replies from the dashboard: the text goes to
+                # the customer through the existing sender, is recorded in
+                # the outbox, and the handoff is resolved — the owner
+                # handled it by replying. With sending off, the reply is
+                # recorded but not sent, and the page says so.
+                try:
+                    handoff_id = int(parsed.path.strip("/").split("/")[1])
+                except (ValueError, IndexError):
+                    self._send_json(404, {"error": "handoff not found"})
+                    return
+                handoff = next(
+                    (
+                        h for h in studio.handoffs.all_handoffs()
+                        if h["id"] == handoff_id and h["status"] == "open"
+                    ),
+                    None,
+                )
+                if handoff is None:
+                    self._send_json(404, {"error": "handoff not found"})
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                fields = parse_qs(raw.decode("utf-8", errors="replace"))
+                text = (fields.get("text") or [""])[0].strip()
+                if not text:
+                    self._send_json(400, {"error": "empty reply"})
+                    return
+                entry = {
+                    "to": handoff["phone"],
+                    "body": text,
+                    "intent": "handoff_reply",
+                    "handoff": handoff_id,
+                }
+                studio.outbox.append(entry)
+                studio._dispatch(entry)
+                studio._save_outbox()
+                studio.handoffs.resolve(handoff_id)
                 self.send_response(303)
                 self.send_header("Location", "/")
                 self.send_header("Content-Length", "0")
