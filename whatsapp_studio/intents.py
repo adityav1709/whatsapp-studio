@@ -26,12 +26,24 @@ _PATTERNS = {
     CANCEL: [r"\b(cancel|reschedule)\b.*\b(booking|appointment|slot)\b",
              r"\bcancel\s+my\b"],
     LOCATION: [r"\b(where|location|address|kahan|kaha|kahaan|address\s+kya|location\s+kya|reach|direction)\b"],
-    HUMAN: [r"\b(human|agent|person|someone|real\s+person|call\s+me|talk\s+to)\b"],
+    HUMAN: [
+        # Person-specific only: "talk to" on its own is not a handoff —
+        # "talk to me about prices" is a price question, not a person request.
+        r"\btalk to (a |the )?(person|human|someone|manager|owner)\b",
+        r"\bspeak to (a |the )?(person|human|someone|manager|owner)\b",
+        r"\b(real person|human being)\b",
+        r"\b(human|manager|owner)\b",
+        r"\bcall me\b",
+        r"\b(agent|insaan|madam|kisi)\s+se\s+baat\b",
+    ],
     THANKS: [r"\b(thank|thanks|shukriya|dhanyavad)\b"],
 }
 
-# A message asking something beats a bare greeting.
-_PRIORITY = [CANCEL, BOOKING, PRICE, HOURS, LOCATION, HUMAN, THANKS, GREETING]
+# A message asking something beats a bare greeting. A request for a person
+# beats a topic (booking, price, hours) but not a cancellation: "let me
+# talk to a person about my booking" is a handoff, "cancel my booking" is
+# still a cancellation.
+_PRIORITY = [CANCEL, HUMAN, BOOKING, PRICE, HOURS, LOCATION, THANKS, GREETING]
 
 
 def detect_intent(text):

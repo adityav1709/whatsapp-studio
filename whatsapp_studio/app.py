@@ -11,18 +11,22 @@ from __future__ import annotations
 import html
 import json
 import os
+import time
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .bookings import BookingStore, parse_day, parse_time
-from .intents import BOOKING, CANCEL, PRICE, detect_intent
+from .handoffs import HandoffStore, age_text
+from .intents import BOOKING, CANCEL, FALLBACK, HUMAN, PRICE, detect_intent
+from .notify import notifier_from_env
 from .replies import (
     booking_cancelled,
     booking_confirmed,
     booking_none_to_cancel,
     booking_taken,
     build_reply,
+    handoff_confirmation,
     slots_available,
 )
 
@@ -30,18 +34,41 @@ from .replies import (
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None):
         self.profile = profile
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
+        self.handoffs = handoffs if handoffs is not None else HandoffStore()
+        self.notifier = notifier if notifier is not None else notifier_from_env()
         self.verify_token = verify_token
         # Replies sit here in demo mode instead of going to Meta, so the owner can
         # read exactly what would have been sent before anything reaches a customer.
         self.outbox = []
         self.live = bool(os.environ.get("WHATSAPP_TOKEN"))
 
-    def handle_message(self, phone, text, sender_name=""):
+    def handle_message(self, phone, text, sender_name="", now=None):
         intent = detect_intent(text)
+        # A handoff is total: while one is open the message is recorded for
+        # the owner to read, but the bot sends nothing — not even a booking.
+        if self.handoffs.open_for(phone) is not None:
+            self.leads.record_message(phone, text, intent, sender_name)
+            return {"to": phone, "body": None, "intent": intent, "paused": True}
+        reason = None
+        if intent == HUMAN:
+            reason = "asked for a person"
+        elif intent == FALLBACK and self._fallback_streak(phone) >= 2:
+            reason = "couldn't help"
+        if reason is not None:
+            handoff = self.handoffs.open(phone, sender_name, reason, text)
+            reply = handoff_confirmation(self.profile, reason, now)
+            self.leads.record_message(phone, text, intent, sender_name)
+            entry = {"to": phone, "body": reply, "intent": intent, "handoff": handoff["id"]}
+            self.outbox.append(entry)
+            try:
+                self.notifier.notify(self.profile.name, handoff)
+            except Exception:
+                pass
+            return entry
         service = None
         if intent in (PRICE, BOOKING):
             service = self.profile.service_named(text)
@@ -55,11 +82,34 @@ class Studio:
                 else booking_none_to_cancel(self.profile)
             )
         else:
-            reply = build_reply(self.profile, intent, text, service=service)
+            reply = build_reply(self.profile, intent, text, service=service, now=now)
         self.leads.record_message(phone, text, intent, sender_name)
         entry = {"to": phone, "body": reply, "intent": intent}
         self.outbox.append(entry)
         return entry
+
+    def _fallback_streak(self, phone):
+        """Trailing fallback intents for this phone, counting the message in flight.
+
+        Only messages since the last resolved handoff count: once the owner
+        resolves one, a customer who is still confused starts a fresh streak.
+        """
+        count = 1
+        lead = self.leads.get(phone)
+        if lead is None:
+            return count
+        resolved_at = 0
+        for handoff in self.handoffs.all_handoffs():
+            if handoff["phone"] == phone and handoff["status"] == "resolved":
+                resolved_at = max(resolved_at, handoff["resolved_at"] or 0)
+        for message in reversed(lead["messages"]):
+            if message["ts"] <= resolved_at:
+                break
+            if message["intent"] == FALLBACK:
+                count += 1
+            else:
+                break
+        return count
 
     def _handle_booking(self, phone, text, sender_name, service):
         """Book a slot, or show free slots, from a booking message."""
@@ -124,6 +174,58 @@ class Studio:
     def dashboard_html(self):
         from .bookings import format_date, format_time
 
+        open_handoffs = [
+            h for h in self.handoffs.all_handoffs() if h["status"] == "open"
+        ]
+        resolved_handoffs = [
+            h for h in self.handoffs.all_handoffs() if h["status"] == "resolved"
+        ]
+        hand_rows = []
+        for handoff in open_handoffs:
+            lead = self.leads.get(handoff["phone"])
+            since = []
+            if lead is not None:
+                since = [
+                    m["text"]
+                    for m in lead["messages"]
+                    if m["ts"] >= handoff["opened_at"]
+                ]
+            urgent = (
+                "URGENT — "
+                if int(time.time()) - handoff["opened_at"] > 4 * 3600
+                else ""
+            )
+            hand_rows.append(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}{}</td><td>{}</td>"
+                "<td><form method='post' action='/handoffs/resolve'>"
+                "<input type='hidden' name='handoff_id' value='{}'>"
+                "<button type='submit'>Resolve</button></form></td></tr>".format(
+                    html.escape(handoff.get("name") or "—"),
+                    html.escape(handoff["phone"]),
+                    html.escape(handoff["reason"]),
+                    html.escape(handoff["trigger"][:80]),
+                    urgent,
+                    html.escape(age_text(handoff["opened_at"])),
+                    "<br>".join(html.escape(m[:120]) for m in since[-10:]) or "—",
+                    handoff["id"],
+                )
+            )
+        hand_body = "".join(hand_rows) or (
+            '<tr><td colspan="7">No open handoffs.</td></tr>'
+        )
+        resolved_rows = []
+        for handoff in resolved_handoffs[:20]:
+            resolved_rows.append(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                    html.escape(handoff.get("name") or "—"),
+                    html.escape(handoff["phone"]),
+                    html.escape(handoff["reason"]),
+                    html.escape(handoff["trigger"][:80]),
+                )
+            )
+        resolved_body = "".join(resolved_rows) or (
+            '<tr><td colspan="4">None yet.</td></tr>'
+        )
         leads = self.leads.all_leads()
         # Names and message text come from strangers on WhatsApp, so everything
         # gets escaped: unescaped, a crafted name would run script in the
@@ -161,6 +263,16 @@ class Studio:
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<title>{} — WhatsApp Studio</title></head><body>"
             "<h1>{}</h1><p>AI receptionist on WhatsApp. Replies generated: {}.</p>"
+            "<h2>Handoffs (open)</h2>"
+            "<table border='1' cellpadding='6'>"
+            "<tr><th>Name</th><th>Phone</th><th>Reason</th><th>Trigger</th><th>Open for</th><th>Messages since</th><th></th></tr>"
+            "{}"
+            "</table>"
+            "<h2>Handoffs (resolved)</h2>"
+            "<table border='1' cellpadding='6'>"
+            "<tr><th>Name</th><th>Phone</th><th>Reason</th><th>Trigger</th></tr>"
+            "{}"
+            "</table>"
             "<h2>Bookings today ({})</h2>"
             "<table border='1' cellpadding='6'>"
             "<tr><th>Name</th><th>Phone</th><th>Service</th><th>Time</th><th>Price</th></tr>"
@@ -175,6 +287,8 @@ class Studio:
             html.escape(self.profile.name),
             html.escape(self.profile.name),
             len(self.outbox),
+            hand_body,
+            resolved_body,
             format_date(today),
             book_body,
             body,
@@ -219,6 +333,8 @@ def make_handler(studio):
                 self._send_json(200, {"leads": studio.leads.all_leads()})
             elif parsed.path == "/bookings":
                 self._send_json(200, {"bookings": studio.bookings.all_bookings()})
+            elif parsed.path == "/handoffs":
+                self._send_json(200, {"handoffs": studio.handoffs.all_handoffs()})
             elif parsed.path == "/":
                 self._send_text(200, studio.dashboard_html(), "text/html")
             else:
@@ -226,6 +342,22 @@ def make_handler(studio):
 
         def do_POST(self):
             parsed = urlparse(self.path)
+            if parsed.path == "/handoffs/resolve":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                fields = parse_qs(raw.decode("utf-8", errors="replace"))
+                try:
+                    handoff_id = int((fields.get("handoff_id") or [""])[0])
+                except ValueError:
+                    handoff_id = None
+                if handoff_id is None or studio.handoffs.resolve(handoff_id) is None:
+                    self._send_json(404, {"error": "handoff not found"})
+                    return
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if parsed.path != "/webhook":
                 self._send_json(404, {"error": "not found"})
                 return

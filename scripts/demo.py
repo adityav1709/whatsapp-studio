@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 from whatsapp_studio.app import Studio, make_server  # noqa: E402
 from whatsapp_studio.bookings import BookingStore  # noqa: E402
 from whatsapp_studio.config import BusinessProfile  # noqa: E402
+from whatsapp_studio.handoffs import HandoffStore  # noqa: E402
 from whatsapp_studio.leads import LeadStore  # noqa: E402
 
 
@@ -25,7 +26,7 @@ def main():
     profile = BusinessProfile.from_json(ROOT / "demo" / "demo_business.json")
     with tempfile.TemporaryDirectory() as tmp:
         store = LeadStore(Path(tmp) / "leads.json")
-        studio = Studio(profile, store, bookings=BookingStore())
+        studio = Studio(profile, store, bookings=BookingStore(), handoffs=HandoffStore())
         httpd = make_server(studio, port=0)
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -59,6 +60,33 @@ def main():
                 print(f"--- reply to {entry['to']} (intent: {entry['intent']}) ---")
                 print(entry["body"])
                 print()
+            # A handoff: Meera asks for a person, then a follow-up that
+            # gets no reply while the handoff is open.
+            reply = studio.handle_message(
+                "919810000004", "can I talk to a person please", "Meera"
+            )
+            print(f"--- reply to {reply['to']} (intent: {reply['intent']}) ---")
+            print(reply["body"])
+            print()
+            paused = studio.handle_message(
+                "919810000004", "hello?? my booking is wrong", "Meera"
+            )
+            print(
+                "--- follow-up from 919810000004: "
+                + ("no reply (handoff open)" if paused["body"] is None else paused["body"])
+            )
+            print()
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/handoffs") as resp:
+                handoffs = json.loads(resp.read())["handoffs"]
+            print(f"open handoffs: {len([h for h in handoffs if h['status'] == 'open'])}")
+            for handoff in handoffs:
+                print(
+                    f"  {handoff['phone']} ({handoff.get('name') or 'unknown'}): "
+                    f"{handoff['reason']} — \"{handoff['trigger']}\""
+                )
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/") as resp:
+                dashboard = resp.read().decode()
+            print(f"dashboard shows handoffs: {'Handoffs' in dashboard}")
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/leads") as resp:
                 leads = json.loads(resp.read())["leads"]
             print(f"leads captured: {len(leads)}")

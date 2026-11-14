@@ -27,6 +27,23 @@ class TestIntents(unittest.TestCase):
     def test_human(self):
         self.assertEqual(detect_intent("can I talk to a human please"), "human")
 
+    def test_human_beats_booking(self):
+        self.assertEqual(
+            detect_intent("let me talk to a person about my booking"), "human"
+        )
+
+    def test_talk_about_prices_is_price(self):
+        self.assertEqual(detect_intent("talk to me about prices"), "price")
+
+    def test_hinglish_human_requests(self):
+        for text in [
+            "kisi se baat karni hai",
+            "manager se baat karni hai",
+            "agent se baat karao",
+            "speak to someone please",
+        ]:
+            self.assertEqual(detect_intent(text), "human", text)
+
     def test_thanks(self):
         self.assertEqual(detect_intent("thanks a lot!"), "thanks")
 

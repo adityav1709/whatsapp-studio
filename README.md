@@ -5,6 +5,26 @@ A small business in India lives on WhatsApp. Customers message "facial ka price 
 or training clients. WhatsApp Studio answers those messages instantly, captures the
 customer as a lead, and lets the owner see everything on one simple dashboard.
 
+**v0.3 — human handoff (the promise kept)**
+- A customer asking for a person ("talk to someone", "manager se baat karni
+  hai", "call me") — or the bot failing them twice in a row — opens a
+  handoff: it is recorded, the bot goes quiet for that customer, and the
+  owner is surfaced the request. One honest confirmation goes to the
+  customer; after hours it says plainly the shop is closed and exactly
+  when they will hear back
+- Handoffs are persisted to JSON (`GET /handoffs`, dashboard at `GET /`),
+  open ones first with the customer's messages since it opened, long-open
+  ones marked urgent. The owner resolves one with a button on the
+  dashboard and the bot resumes from the next message. No timers, no
+  auto-resolve
+- Optional Telegram ping to the owner the moment a handoff opens
+  (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` env vars, off by default,
+  best-effort — a failed ping never breaks the handoff). The notifier is a
+  small interface, so other channels can plug in later
+- Honest limit: the owner's WhatsApp ping is NOT in v0.3 — it needs the
+  live Meta send path, which is the next milestone. Until then, the owner
+  watches the dashboard or Telegram
+
 **v0.2 — booking with real availability**
 - Customers book in plain language: "book haircut tomorrow 11am",
   "facial on Saturday 4pm", "kal 11 baje" — day and time are parsed from
@@ -61,7 +81,7 @@ Sending replies through Meta for real needs a WhatsApp Business app and a
 generated and recorded, never sent. No credentials live in this repo.
 
 **Roadmap**
-- Human handoff: notify the owner on WhatsApp/Telegram when a customer asks
+- Owner ping on WhatsApp when a handoff opens (needs the live Meta send path)
 - Optional LLM replies (pluggable, off by default — costs money, so opt-in)
 - Multi-business: one install serving many shops, each with its own profile
 - Admin onboarding: business fills a form, gets a working receptionist

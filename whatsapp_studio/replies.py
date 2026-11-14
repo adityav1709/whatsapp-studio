@@ -1,9 +1,9 @@
 """Reply templates. Plain text on purpose: it needs no Meta template approval, unlike formatted messages."""
 from __future__ import annotations
 
-from datetime import date as _date
+from datetime import date as _date, datetime as _datetime
 
-from .bookings import format_date, format_time
+from .bookings import format_date, format_time, parse_hours_range
 from .intents import BOOKING, CANCEL, GREETING, HOURS, HUMAN, LOCATION, PRICE, THANKS
 
 
@@ -66,7 +66,52 @@ def booking_ask_when(profile, service):
     )
 
 
-def build_reply(profile, intent, text, service=None):
+def _is_open_now(profile, now):
+    span = parse_hours_range(profile.hours_today(now.weekday()))
+    if span is None:
+        return True
+    open_min, close_min = span
+    current = now.hour * 60 + now.minute
+    return open_min <= current < close_min
+
+
+def handoff_confirmation(profile, reason, now=None):
+    """The one honest message sent when a handoff opens.
+
+    During open hours it says who will reply, gives a real wait, and
+    confirms the chat is passed on so the customer never repeats
+    themselves. After hours it says plainly that the shop is closed and
+    exactly when they will hear back — never a quick-reply promise.
+    """
+    now = now or _datetime.now()
+    if _is_open_now(profile, now):
+        lead = (
+            "I couldn't quite get that, so I've passed this to the team"
+            if reason == "couldn't help"
+            else "I've passed this to the team"
+        )
+        return (
+            f"{lead} at {profile.name}. They will reply here within "
+            "30 minutes during working hours, and I've shared our chat "
+            "with them so you don't need to explain again."
+        )
+    span = parse_hours_range(profile.hours_today(now.weekday()))
+    if span is None:
+        return (
+            "We're closed right now. I've passed your message to the team at "
+            f"{profile.name} and they'll reply here when we open. "
+            "You don't need to message again."
+        )
+    open_min, _ = span
+    return (
+        f"We're closed right now — {profile.name} opens at "
+        f"{format_time(open_min)}. I've passed your message to the team "
+        f"and you'll hear back here by {format_time(open_min + 60)}. "
+        "You don't need to message again."
+    )
+
+
+def build_reply(profile, intent, text, service=None, now=None):
     name = profile.name
     if intent == GREETING:
         services = ", ".join(s.name for s in profile.services[:4])
@@ -105,11 +150,7 @@ def build_reply(profile, intent, text, service=None):
         address = profile.address or f"{name}, {profile.city}"
         return f"You can find us here: {address}. Would you like me to book a visit?"
     if intent == HUMAN:
-        return (
-            "Of course, I will connect you with a person from the team. "
-            "They usually reply within a few hours during working hours. "
-            "Meanwhile, can I help with prices, timings, or booking?"
-        )
+        return handoff_confirmation(profile, "asked for a person", now)
     if intent == THANKS:
         return "You are most welcome! Anything else I can help with?"
     return (
