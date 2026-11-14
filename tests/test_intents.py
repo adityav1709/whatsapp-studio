@@ -44,8 +44,36 @@ class TestIntents(unittest.TestCase):
         ]:
             self.assertEqual(detect_intent(text), "human", text)
 
-    def test_thanks(self):
-        self.assertEqual(detect_intent("thanks a lot!"), "thanks")
+    def test_reschedule(self):
+        for text in [
+            "reschedule my booking",
+            "I want to reschedule",
+            "move my booking to tomorrow",
+            "change my appointment",
+        ]:
+            self.assertEqual(detect_intent(text), "reschedule", text)
+
+    def test_cancel_still_cancel(self):
+        self.assertEqual(detect_intent("cancel my booking"), "cancel")
+
+    def test_offer(self):
+        for text in ["any offers?", "is there a discount?", "any deals today?"]:
+            self.assertEqual(detect_intent(text), "offer", text)
+
+    def test_devanagari_price(self):
+        self.assertEqual(detect_intent("फेशियल की कीमत क्या है?"), "price")
+
+    def test_devanagari_booking(self):
+        self.assertEqual(detect_intent("बुक करना है"), "booking")
+        self.assertEqual(detect_intent("अपॉइंटमेंट चाहिए"), "booking")
+
+    def test_devanagari_greeting_and_human(self):
+        self.assertEqual(detect_intent("नमस्ते"), "greeting")
+        self.assertEqual(detect_intent("मैनेजर से बात करनी है"), "human")
+
+    def test_devanagari_hours(self):
+        self.assertEqual(detect_intent("कब खुला है?"), "hours")
+        self.assertEqual(detect_intent("आज बंद है क्या?"), "hours")
 
     def test_fallback(self):
         for text in ["asdfgh", "", "   "]:

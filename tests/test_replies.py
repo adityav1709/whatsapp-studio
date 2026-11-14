@@ -50,6 +50,49 @@ class TestReplies(unittest.TestCase):
         reply = build_reply(make_profile(), "fallback", "asdfgh")
         self.assertIn("prices", reply)
 
+    def test_greeting_says_it_is_the_assistant(self):
+        reply = build_reply(make_profile(), "greeting", "hi")
+        self.assertIn("assistant", reply.lower())
+
+    def test_greeting_does_not_repeat_assistant(self):
+        profile = make_profile()
+        profile.greeting = "Hello! I'm the assistant here."
+        reply = build_reply(profile, "greeting", "hi")
+        self.assertEqual(reply.lower().count("assistant"), 1)
+
+    def test_welcome_back_greeting(self):
+        reply = build_reply(
+            make_profile(), "greeting", "hi", returning=True, customer_name="Rahul"
+        )
+        self.assertIn("Welcome back", reply)
+        self.assertIn("Rahul", reply)
+
+    def test_offer_reply_quotes_offers(self):
+        profile = make_profile()
+        profile.offers = "20% off on all facials this week"
+        reply = build_reply(profile, "offer", "any offers?")
+        self.assertIn("20% off on all facials", reply)
+
+    def test_offer_reply_when_none(self):
+        reply = build_reply(make_profile(), "offer", "any offers?")
+        self.assertIn("no current offers", reply)
+
+    def test_closed_day_handoff_does_not_promise_morning_reply(self):
+        from datetime import datetime, timezone, timedelta
+
+        from whatsapp_studio.replies import handoff_confirmation
+
+        ist = timezone(timedelta(hours=5, minutes=30))
+        profile = make_profile()
+        profile.hours = {"sun": "closed", "daily": "10:00 AM - 8:00 PM"}
+        # Sunday 15 Nov 2026, 11 PM IST — the shop is shut that day.
+        reply = handoff_confirmation(
+            profile, "asked for a person",
+            datetime(2026, 11, 15, 23, 0, tzinfo=ist),
+        )
+        self.assertIn("closed", reply.lower())
+        self.assertNotIn("11:00 AM", reply)
+
 
 if __name__ == "__main__":
     unittest.main()

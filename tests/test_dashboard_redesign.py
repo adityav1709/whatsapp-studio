@@ -11,7 +11,6 @@ use "tomorrow", never the current hour.
 import json
 import tempfile
 import unittest
-from datetime import date
 from pathlib import Path
 
 from whatsapp_studio.app import Studio
@@ -40,12 +39,16 @@ class FakeNotifier:
     def __init__(self):
         self.calls = []
         self.booking_calls = []
+        self.send_failed_calls = []
 
     def notify(self, business_name, handoff):
         self.calls.append((business_name, handoff))
 
     def notify_booking(self, business_name, booking):
         self.booking_calls.append((business_name, booking))
+
+    def notify_send_failed(self, business_name, entry):
+        self.send_failed_calls.append((business_name, entry))
 
 
 class RaisingNotifier:
@@ -98,12 +101,14 @@ class TestDashboardRedesign(unittest.TestCase):
         self.assertIn("width=device-width, initial-scale=1", html)
 
     def test_glance_numbers_match_data(self):
+        from whatsapp_studio.bookings import india_today
+
         self.studio.handle_message("919810000001", "facial ka price kya hai?", "Rahul")
         self.studio.handle_message(
             "919810000002", "can I talk to a person please", "Priya"
         )
         self.studio.bookings.book(
-            "919810000003", "Asha", make_profile().services[0], date.today(), 16 * 60
+            "919810000003", "Asha", make_profile().services[0], india_today(), 16 * 60
         )
         html = self.studio.dashboard_html()
         self.assertIn("Today: 2 people messaged, 1 booked, 1 waiting for you.", html)
@@ -169,6 +174,72 @@ class TestDashboardRedesign(unittest.TestCase):
         self.assertIn("SEND FAILED", html)
         self.assertIn("did not reach the customer", html)
         self.assertIn("meta down", html)
+
+
+class TestSendFailedPing(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.notifier = FakeNotifier()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_failed_send_pings_owner_once(self):
+        sender = FakeSender(fail_with=RuntimeError("meta down"))
+        studio = make_studio(
+            self.tmp.name, notifier=self.notifier, sender=sender
+        )
+        studio.handle_message("919810000001", "facial ka price kya hai?", "Rahul")
+        studio.wait_for_sends()
+        self.assertEqual(len(self.notifier.send_failed_calls), 1)
+        business, entry = self.notifier.send_failed_calls[0]
+        self.assertEqual(business, "Glow & Grace Salon")
+        self.assertEqual(entry["to"], "919810000001")
+        self.assertEqual(entry["send_error"], "meta down")
+
+    def test_successful_send_does_not_ping(self):
+        sender = FakeSender()
+        studio = make_studio(
+            self.tmp.name, notifier=self.notifier, sender=sender
+        )
+        studio.handle_message("919810000001", "facial ka price kya hai?", "Rahul")
+        studio.wait_for_sends()
+        self.assertEqual(len(self.notifier.send_failed_calls), 0)
+
+
+class TestMoneyTomorrowWeek(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.notifier = FakeNotifier()
+        self.studio = make_studio(self.tmp.name, notifier=self.notifier)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_money_tomorrow_and_week_match_data(self):
+        from datetime import timedelta
+
+        from whatsapp_studio.bookings import india_today
+
+        profile = make_profile()
+        today = india_today()
+        tomorrow = today + timedelta(days=1)
+        haircut, facial = profile.services[0], profile.services[1]
+        self.studio.bookings.book("919810000001", "Rahul", haircut, today, 10 * 60)
+        self.studio.bookings.book("919810000002", "Priya", facial, today, 11 * 60)
+        self.studio.bookings.book("919810000003", "Asha", facial, tomorrow, 10 * 60)
+        html = self.studio.dashboard_html()
+        self.assertIn("Rs 1998", html)
+        self.assertIn("Facial", html)
+        self.assertIn("Tomorrow", html)
+        # Tomorrow's booking is in the week line only when tomorrow is
+        # still in this calendar week (Mon-Sun).
+        monday = today - timedelta(days=today.weekday())
+        sunday = monday + timedelta(days=6)
+        in_week = monday <= tomorrow <= sunday
+        week_count = 3 if in_week else 2
+        week_rupees = 3497 if in_week else 1998
+        self.assertIn(f"This week: {week_count} bookings, Rs {week_rupees}.", html)
 
 
 class TestBookingPing(unittest.TestCase):
