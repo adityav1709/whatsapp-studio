@@ -5,6 +5,11 @@ Runs on the Python standard library only — no dependencies to install.
 Demo mode: replies are generated and recorded in the outbox, NOT sent to
 Meta. Sending for real needs WHATSAPP_TOKEN and PHONE_NUMBER_ID set and
 the Meta WhatsApp Cloud API; see README.md.
+
+Security gates (both off by default, both from the environment):
+WHATSAPP_APP_SECRET verifies the X-Hub-Signature-256 header on POST
+/webhook; DASHBOARD_PASSWORD puts Basic Auth on the dashboard and the
+data endpoints. Set both before the server is reachable from the internet.
 """
 from __future__ import annotations
 
@@ -30,13 +35,14 @@ from .replies import (
     handoff_confirmation,
     slots_available,
 )
+from .security import check_basic_auth, verify_webhook_signature
 from .send import MAX_TEXT_CHARS, sender_from_env
 
 
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None):
         self.profile = profile
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
@@ -49,6 +55,10 @@ class Studio:
         self.sending_disabled = False
         self._send_threads = []
         self.verify_token = verify_token
+        # Security gates, off by default: no secret, no verification; no
+        # password, no auth. Both come from the environment at runtime.
+        self.app_secret = app_secret if app_secret is not None else (os.environ.get("WHATSAPP_APP_SECRET") or None)
+        self.dashboard_password = dashboard_password if dashboard_password is not None else (os.environ.get("DASHBOARD_PASSWORD") or None)
         # Replies sit here in demo mode instead of going to Meta, so the owner can
         # read exactly what would have been sent before anything reaches a customer.
         self.outbox = []
@@ -469,6 +479,27 @@ def make_handler(studio):
             self.end_headers()
             self.wfile.write(data)
 
+        def _unauthorized(self):
+            data = b"authentication required"
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="WhatsApp Studio"')
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _require_auth(self):
+            """True when this request may proceed. When a dashboard
+            password is set, every path except the webhook and /health
+            needs Basic Auth — Meta calls the webhook and cannot log in,
+            and health checks must stay open."""
+            if not studio.dashboard_password:
+                return True
+            if check_basic_auth(studio.dashboard_password, self.headers.get("Authorization")):
+                return True
+            self._unauthorized()
+            return False
+
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path == "/health":
@@ -490,6 +521,8 @@ def make_handler(studio):
                     self._send_text(200, challenge)
                 else:
                     self._send_json(403, {"error": "verification failed"})
+            elif not self._require_auth():
+                return
             elif parsed.path == "/leads":
                 self._send_json(200, {"leads": studio.leads.all_leads()})
             elif parsed.path == "/bookings":
@@ -503,6 +536,31 @@ def make_handler(studio):
 
         def do_POST(self):
             parsed = urlparse(self.path)
+            if parsed.path == "/webhook":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                # The signature is checked over the raw body before
+                # anything is parsed: a request that fails it is never
+                # processed. No secret configured means no verification,
+                # exactly as before.
+                if studio.app_secret and not verify_webhook_signature(
+                    studio.app_secret, raw, self.headers.get("X-Hub-Signature-256")
+                ):
+                    self._send_json(401, {"error": "invalid signature"})
+                    return
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    self._send_json(400, {"error": "invalid json"})
+                    return
+                if not isinstance(payload, dict):
+                    self._send_json(400, {"error": "invalid payload"})
+                    return
+                count = studio.handle_webhook_payload(payload)
+                self._send_json(200, {"received": True, "processed": count})
+                return
+            if not self._require_auth():
+                return
             if parsed.path == "/sending/disable":
                 studio.disable_sending()
                 self.send_response(303)
@@ -533,21 +591,7 @@ def make_handler(studio):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            if parsed.path != "/webhook":
-                self._send_json(404, {"error": "not found"})
-                return
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length) if length else b""
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                self._send_json(400, {"error": "invalid json"})
-                return
-            if not isinstance(payload, dict):
-                self._send_json(400, {"error": "invalid payload"})
-                return
-            count = studio.handle_webhook_payload(payload)
-            self._send_json(200, {"received": True, "processed": count})
+            self._send_json(404, {"error": "not found"})
 
     return Handler
 

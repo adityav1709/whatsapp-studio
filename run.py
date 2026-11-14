@@ -32,6 +32,14 @@ def main():
         print("Dry-run mode — replies are recorded only (WHATSAPP_DRY_RUN=1).")
     else:
         print("Demo mode — replies are recorded only (set WHATSAPP_TOKEN + PHONE_NUMBER_ID to go live).")
+    if studio.app_secret:
+        print("Webhook signature verification: ON (WHATSAPP_APP_SECRET set).")
+    else:
+        print("Webhook signature verification: OFF — set WHATSAPP_APP_SECRET before a public pilot.")
+    if studio.dashboard_password:
+        print("Dashboard password: set.")
+    else:
+        print("Dashboard password: NOT SET — set DASHBOARD_PASSWORD before a public pilot.")
     print("Webhook: POST /webhook   Leads: GET /leads   Bookings: GET /bookings   Handoffs: GET /handoffs   Dashboard: GET /")
     httpd.serve_forever()
 

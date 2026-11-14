@@ -5,6 +5,27 @@ A small business in India lives on WhatsApp. Customers message "facial ka price 
 or training clients. WhatsApp Studio answers those messages instantly, captures the
 customer as a lead, and lets the owner see everything on one simple dashboard.
 
+**v1.0 — security prerequisites, so the server can face the internet**
+- Webhook signature verification (`whatsapp_studio/security.py`): when
+  `WHATSAPP_APP_SECRET` is set, every POST to `/webhook` must carry a
+  valid `X-Hub-Signature-256` header (HMAC-SHA256 over the raw body,
+  keyed by the app secret, constant-time comparison). A missing or
+  invalid signature gets a 401 and the payload is never processed. The
+  GET verification (`hub.verify_token`) is untouched. Without the env
+  var, the server behaves exactly as before — demo mode, no verification
+- Dashboard auth: when `DASHBOARD_PASSWORD` is set, the dashboard
+  (GET `/`) and every data endpoint (`/leads`, `/bookings`, `/handoffs`,
+  POST `/handoffs/resolve`, POST `/sending/*`) require HTTP Basic Auth
+  (any username, the password is the gate; a wrong or missing credential
+  gets a 401 with a `WWW-Authenticate` challenge). The webhook
+  (GET/POST `/webhook`, which Meta calls and cannot log in) and
+  `/health` stay open. Without the env var, no auth — exactly as before
+- Both are off by default and come from the environment at runtime,
+  never from the repo. Startup prints whether each is on. **Both must
+  be set before a public pilot** — until then the server only ever ran
+  on localhost. The secret and the password are never logged or returned
+  in any response
+
 **v0.4a — live sending: customer replies go out for real**
 - A sender module (`whatsapp_studio/send.py`, same shape as the Telegram
   notifier): stdlib `urllib` POST to the pinned Graph API version
@@ -36,11 +57,8 @@ customer as a lead, and lets the owner see everything on one simple dashboard.
   business-initiated and usually falls outside Meta's 24-hour window,
   so a reliable ping needs a template message (Meta approval, a
   business-admin step, not code). That is v0.4b. Telegram (v0.3) still
-  covers the owner's fast notification meanwhile. And: webhook
-  signature verification and dashboard auth are prerequisites that must
-  land BEFORE a public pilot — the webhook is reachable from the
-  internet and the dashboard can resolve handoffs. They are the next
-  build, not this one
+  covers the owner's fast notification meanwhile. Webhook signature
+  verification and dashboard auth landed in v1.0 (above)
 
 **v0.3 — human handoff (the promise kept)**
 - A customer asking for a person ("talk to someone", "manager se baat karni
@@ -118,14 +136,23 @@ runtime — never in the repo). With both set, the server sends customer
 replies live; without them it stays in demo mode and records everything
 to the outbox. `WHATSAPP_DRY_RUN=1` forces record-only even with a token
 set, so a pilot can watch exactly what would be sent before any message
-leaves. The owner WhatsApp ping is v0.4b (needs a template); webhook
-signature verification and dashboard auth must land before a public pilot.
+leaves. The owner WhatsApp ping is v0.4b (needs a template).
+
+**Before a public pilot (v1.0 security)**
+Set both of these from the environment at runtime — never in the repo:
+- `WHATSAPP_APP_SECRET` — the Meta app secret. With it set, POST
+  `/webhook` requires a valid `X-Hub-Signature-256` header; without it
+  anyone who finds the URL can inject fake messages.
+- `DASHBOARD_PASSWORD` — one shared password for the dashboard and the
+  data endpoints (HTTP Basic Auth, any username). Without it anyone who
+  finds the server can read every lead and resolve handoffs.
+Both are off by default for the local demo; the server prints whether
+each is on at startup. `GET /webhook` (Meta's verification) and
+`/health` always stay open.
 
 **Roadmap**
 - v0.4b: owner ping on WhatsApp when a handoff opens (needs a template
   message + Meta approval)
-- Webhook signature verification (`X-Hub-Signature-256`) and dashboard
-  auth — prerequisites before any public pilot
 - Optional LLM replies (pluggable, off by default — costs money, so opt-in)
 - Multi-business: one install serving many shops, each with its own profile
 - Admin onboarding: business fills a form, gets a working receptionist
