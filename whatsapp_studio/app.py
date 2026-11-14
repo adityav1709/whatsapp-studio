@@ -20,6 +20,7 @@ import threading
 import time
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .bookings import BookingStore, parse_day, parse_time
@@ -42,7 +43,7 @@ from .send import MAX_TEXT_CHARS, sender_from_env
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None):
         self.profile = profile
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
@@ -61,7 +62,29 @@ class Studio:
         self.dashboard_password = dashboard_password if dashboard_password is not None else (os.environ.get("DASHBOARD_PASSWORD") or None)
         # Replies sit here in demo mode instead of going to Meta, so the owner can
         # read exactly what would have been sent before anything reaches a customer.
-        self.outbox = []
+        # With a path, the reply history survives a restart the same way
+        # leads and bookings do; without one it stays in memory only.
+        self._outbox_path = Path(outbox_path) if outbox_path else None
+        self.outbox = self._load_outbox()
+
+    def _load_outbox(self):
+        if self._outbox_path is None or not self._outbox_path.exists():
+            return []
+        try:
+            data = json.loads(self._outbox_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return data[-100:]
+
+    def _save_outbox(self):
+        if self._outbox_path is None:
+            return
+        if len(self.outbox) > 100:
+            del self.outbox[:-100]
+        self._outbox_path.parent.mkdir(parents=True, exist_ok=True)
+        self._outbox_path.write_text(json.dumps(self.outbox, indent=2), encoding="utf-8")
 
     @property
     def live(self):
@@ -162,6 +185,7 @@ class Studio:
             entry = {"to": phone, "body": reply, "intent": intent, "handoff": handoff["id"]}
             self.outbox.append(entry)
             self._dispatch(entry)
+            self._save_outbox()
             try:
                 self.notifier.notify(self.profile.name, handoff)
             except Exception:
@@ -185,6 +209,7 @@ class Studio:
         entry = {"to": phone, "body": reply, "intent": intent}
         self.outbox.append(entry)
         self._dispatch(entry)
+        self._save_outbox()
         return entry
 
     def _fallback_streak(self, phone):
@@ -236,6 +261,12 @@ class Studio:
             )
         booking = self.bookings.book(phone, sender_name, service, day, start)
         if booking is not None:
+            # A confirmed booking pings the owner the same way a handoff
+            # does: best-effort, never a reason for the booking to fail.
+            try:
+                self.notifier.notify_booking(self.profile.name, booking)
+            except Exception:
+                pass
             return booking_confirmed(self.profile, booking)
         alternatives = [
             s
@@ -279,15 +310,81 @@ class Studio:
         return count
 
     def dashboard_html(self):
+        """The owner's page: who needs them, how today went, did anything
+        go wrong. One column, phone first, plain words. The labels the
+        tests assert on are kept verbatim."""
         from .bookings import format_date, format_time
 
+        today = date.today()
         open_handoffs = [
             h for h in self.handoffs.all_handoffs() if h["status"] == "open"
         ]
-        resolved_handoffs = [
+        resolved = [
             h for h in self.handoffs.all_handoffs() if h["status"] == "resolved"
         ]
-        hand_rows = []
+        resolved_today = [
+            h for h in resolved
+            if h.get("resolved_at")
+            and datetime.fromtimestamp(h["resolved_at"]).date() == today
+        ]
+        leads = self.leads.all_leads()
+        todays = self.bookings.bookings_on(today)
+        rupees_today = sum(b["price"] for b in todays)
+        messaged_today = sum(
+            1 for lead in leads
+            if datetime.fromtimestamp(lead["last_seen"]).date() == today
+        )
+        waiting = len(open_handoffs)
+
+        def plural(n, one, many):
+            return one if n == 1 else many
+
+        if waiting == 0:
+            sentence = (
+                "All clear — nobody is waiting for you. Today: "
+                f"{messaged_today} {plural(messaged_today, 'person', 'people')} messaged, "
+                f"{len(todays)} booked."
+            )
+        else:
+            sentence = (
+                f"Today: {messaged_today} {plural(messaged_today, 'person', 'people')} messaged, "
+                f"{len(todays)} booked, {waiting} waiting for you."
+            )
+        if todays:
+            sentence += f" Bookings today: Rs {rupees_today}."
+
+        state = self.sending_state()
+        if state == "live":
+            bot_block = (
+                "<p><span class='pill on'>Sending: LIVE</span> "
+                "Bot is ON — replies are being sent on WhatsApp.</p>"
+                "<form method='post' action='/sending/disable'>"
+                "<button type='submit' class='big'>Stop sending</button></form>"
+            )
+        elif state == "paused":
+            bot_block = (
+                "<p><span class='pill off'>Sending: PAUSED</span> "
+                "The bot is stopped — it will not reply to anyone.</p>"
+                "<form method='post' action='/sending/enable'>"
+                "<button type='submit' class='big'>Resume sending</button></form>"
+            )
+        elif state == "dry-run":
+            bot_block = (
+                "<p><span class='pill idle'>Bot is OFF</span> "
+                "Replies are recorded only — nothing is sent.</p>"
+            )
+        else:
+            bot_block = (
+                "<p><span class='pill idle'>Bot is OFF</span> "
+                "The bot is watching and drafting replies — nothing is sent yet.</p>"
+            )
+
+        bot_replies = {}
+        for entry in self.outbox:
+            hid = entry.get("handoff")
+            if hid is not None:
+                bot_replies[hid] = entry.get("body") or ""
+        cards = []
         for handoff in open_handoffs:
             lead = self.leads.get(handoff["phone"])
             since = []
@@ -297,166 +394,182 @@ class Studio:
                     for m in lead["messages"]
                     if m["ts"] >= handoff["opened_at"]
                 ]
-            urgent = (
-                "URGENT — "
-                if int(time.time()) - handoff["opened_at"] > 4 * 3600
-                else ""
+            if since and since[0] == handoff["trigger"]:
+                since = since[1:]
+            digits = "".join(c for c in handoff["phone"] if c.isdigit())
+            urgent = int(time.time()) - handoff["opened_at"] > 4 * 3600
+            card = "<div class='card{}'>".format(" urgent" if urgent else "")
+            card += "<div class='who'>{}</div>".format(
+                html.escape(handoff.get("name") or "—")
             )
-            hand_rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}{}</td><td>{}</td>"
-                "<td><form method='post' action='/handoffs/resolve'>"
+            card += "<a class='call' href='tel:+{}'>{}</a>".format(
+                digits, html.escape(handoff["phone"])
+            )
+            card += "<p class='said'>“{}”</p>".format(html.escape(handoff["trigger"]))
+            card += "<p class='meta'>{} · waiting {}</p>".format(
+                html.escape(handoff["reason"]),
+                html.escape(age_text(handoff["opened_at"])),
+            )
+            if urgent:
+                card += "<p class='urgent'>Waiting a long time — call them soon.</p>"
+            told = bot_replies.get(handoff["id"])
+            if told:
+                card += "<p class='bot'>The bot told them: “{}”</p>".format(
+                    html.escape(told[:200])
+                )
+            if since:
+                card += "<p class='since'>Since then:</p><p class='said'>“{}”</p>".format(
+                    "<br>".join(html.escape(m[:200]) for m in since[-5:])
+                )
+            card += (
+                "<form method='post' action='/handoffs/resolve'>"
                 "<input type='hidden' name='handoff_id' value='{}'>"
-                "<button type='submit'>Resolve</button></form></td></tr>".format(
-                    html.escape(handoff.get("name") or "—"),
-                    html.escape(handoff["phone"]),
-                    html.escape(handoff["reason"]),
-                    html.escape(handoff["trigger"][:80]),
-                    urgent,
-                    html.escape(age_text(handoff["opened_at"])),
-                    "<br>".join(html.escape(m[:120]) for m in since[-10:]) or "—",
-                    handoff["id"],
-                )
-            )
-        hand_body = "".join(hand_rows) or (
-            '<tr><td colspan="7">No open handoffs.</td></tr>'
-        )
-        resolved_rows = []
-        for handoff in resolved_handoffs[:20]:
-            resolved_rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-                    html.escape(handoff.get("name") or "—"),
-                    html.escape(handoff["phone"]),
-                    html.escape(handoff["reason"]),
-                    html.escape(handoff["trigger"][:80]),
-                )
-            )
-        resolved_body = "".join(resolved_rows) or (
-            '<tr><td colspan="4">None yet.</td></tr>'
-        )
-        leads = self.leads.all_leads()
-        # Names and message text come from strangers on WhatsApp, so everything
-        # gets escaped: unescaped, a crafted name would run script in the
-        # owner's own dashboard.
-        rows = []
-        for lead in leads:
-            last = lead["messages"][-1]["text"] if lead["messages"] else ""
-            rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-                    html.escape(lead.get("name") or "—"),
-                    html.escape(lead["phone"]),
-                    lead["message_count"],
-                    html.escape(", ".join(lead["intents"])),
-                    html.escape(last[:80]),
-                )
-            )
-        body = "".join(rows) or '<tr><td colspan="5">No leads yet.</td></tr>'
-        today = date.today()
-        todays = self.bookings.bookings_on(today)
-        book_rows = []
-        for b in todays:
-            book_rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>Rs {}</td></tr>".format(
-                    html.escape(b.get("name") or "—"),
-                    html.escape(b["phone"]),
-                    html.escape(b["service"]),
-                    html.escape(format_time(b["start_min"])),
-                    b["price"],
-                )
-            )
-        book_body = "".join(book_rows) or (
-            '<tr><td colspan="5">No bookings today.</td></tr>'
-        )
-        state = self.sending_state()
-        if state == "live":
-            sending_line = (
-                "<p><strong>Sending: LIVE</strong> — replies are being sent on WhatsApp.</p>"
-                "<form method='post' action='/sending/disable'>"
-                "<button type='submit'>Stop sending</button></form>"
-            )
-        elif state == "paused":
-            sending_line = (
-                "<p><strong>Sending: PAUSED</strong> — replies are recorded only.</p>"
-                "<form method='post' action='/sending/enable'>"
-                "<button type='submit'>Resume sending</button></form>"
-            )
-        elif state == "dry-run":
-            sending_line = (
-                "<p><strong>Sending: DRY RUN</strong> — replies are recorded only, "
-                "nothing is sent.</p>"
-            )
-        else:
-            sending_line = (
-                "<p><strong>Sending: DEMO</strong> — no WhatsApp token configured, "
-                "replies are recorded only.</p>"
-            )
-        out_rows = []
-        for entry in reversed(self.outbox[-10:]):
-            if entry.get("paused"):
-                status = "paused"
-            else:
-                status = entry.get("send_status") or "recorded"
-            detail = ""
-            if entry.get("wamid"):
-                detail = html.escape(entry["wamid"])
-            elif entry.get("send_error"):
-                detail = html.escape(entry["send_error"])
-            if entry.get("truncated"):
-                detail = (detail + " " if detail else "") + "truncated to 4096 chars"
-            marker = "SEND FAILED — " if status == "failed" else ""
-            out_rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}{}</td><td>{}</td><td>{}</td></tr>".format(
-                    html.escape(entry["to"]),
-                    html.escape(entry.get("intent") or "—"),
-                    marker,
-                    html.escape(status),
-                    html.escape((entry.get("body") or "")[:80]),
-                    detail,
-                )
-            )
-        out_body = "".join(out_rows) or '<tr><td colspan="5">No replies yet.</td></tr>'
-        return (
-            "<!doctype html><html><head><meta charset='utf-8'>"
-            "<title>{} — WhatsApp Studio</title></head><body>"
-            "<h1>{}</h1><p>AI receptionist on WhatsApp. Replies generated: {}.</p>"
-            "{}"
-            "<h2>Recent replies</h2>"
-            "<table border='1' cellpadding='6'>"
-            "<tr><th>To</th><th>Intent</th><th>Send status</th><th>Reply</th><th>Detail</th></tr>"
-            "{}"
-            "</table>"
-            "<h2>Handoffs (open)</h2>"
-            "<table border='1' cellpadding='6'>"
-            "<tr><th>Name</th><th>Phone</th><th>Reason</th><th>Trigger</th><th>Open for</th><th>Messages since</th><th></th></tr>"
-            "{}"
-            "</table>"
-            "<h2>Handoffs (resolved)</h2>"
-            "<table border='1' cellpadding='6'>"
-            "<tr><th>Name</th><th>Phone</th><th>Reason</th><th>Trigger</th></tr>"
-            "{}"
-            "</table>"
-            "<h2>Bookings today ({})</h2>"
-            "<table border='1' cellpadding='6'>"
-            "<tr><th>Name</th><th>Phone</th><th>Service</th><th>Time</th><th>Price</th></tr>"
-            "{}"
-            "</table>"
-            "<h2>Leads</h2>"
-            "<table border='1' cellpadding='6'>"
-            "<tr><th>Name</th><th>Phone</th><th>Messages</th><th>Intents</th><th>Last message</th></tr>"
-            "{}"
-            "</table></body></html>"
-        ).format(
-            html.escape(self.profile.name),
-            html.escape(self.profile.name),
-            len(self.outbox),
-            sending_line,
-            out_body,
-            hand_body,
-            resolved_body,
-            format_date(today),
-            book_body,
-            body,
+                "<button type='submit' class='big'>Resolve</button></form>"
+            ).format(handoff["id"])
+            card += "</div>"
+            cards.append(card)
+        waiting_body = "".join(cards) or (
+            "<p class='allclear'>All clear — nobody is waiting for you.</p>"
         )
 
+        book_items = []
+        for b in todays:
+            digits = "".join(c for c in b["phone"] if c.isdigit())
+            book_items.append(
+                "<li><strong>{}</strong> — {} for {} — Rs {} · "
+                "<a href='tel:+{}'>{}</a></li>".format(
+                    html.escape(format_time(b["start_min"])),
+                    html.escape(b["service"]),
+                    html.escape(b.get("name") or "—"),
+                    b["price"],
+                    digits,
+                    html.escape(b["phone"]),
+                )
+            )
+        book_body = "".join(book_items) or "<li>No bookings today.</li>"
+
+        entries = list(reversed(self.outbox))
+        failed = [e for e in entries if (e.get("send_status") or "") == "failed"]
+        rest = [e for e in entries if (e.get("send_status") or "") != "failed"]
+        out_items = []
+        for entry in (failed + rest)[:10]:
+            status = entry.get("send_status") or "recorded"
+            digits = "".join(c for c in entry["to"] if c.isdigit())
+            phone_link = "<a href='tel:+{}'>{}</a>".format(
+                digits, html.escape(entry["to"])
+            )
+            body = html.escape((entry.get("body") or "")[:120])
+            if status == "failed":
+                inner = (
+                    "<strong>SEND FAILED</strong> — did not reach the customer, "
+                    "call them. {}<br>{}<br><span class='err'>{}</span>"
+                ).format(phone_link, body, html.escape(entry.get("send_error") or ""))
+                out_items.append("<li class='failed'>{}</li>".format(inner))
+            else:
+                label = {"sent": "Sent", "sending": "Sending…"}.get(status, "Not sent")
+                inner = "<strong>{}</strong> {}<br>{}".format(label, phone_link, body)
+                if entry.get("truncated"):
+                    inner += " <span class='quiet'>cut short — too long to send</span>"
+                out_items.append("<li>{}</li>".format(inner))
+        out_body = "".join(out_items) or "<li>No replies yet.</li>"
+
+        lead_items = []
+        for lead in leads[:50]:
+            last = lead["messages"][-1]["text"] if lead["messages"] else ""
+            digits = "".join(c for c in lead["phone"] if c.isdigit())
+            lead_items.append(
+                "<li><strong>{}</strong> · <a href='tel:+{}'>{}</a><br>{}</li>".format(
+                    html.escape(lead.get("name") or "—"),
+                    digits,
+                    html.escape(lead["phone"]),
+                    html.escape(last[:120]),
+                )
+            )
+        lead_body = "".join(lead_items) or "<li>No one has messaged yet.</li>"
+        if len(leads) > 50:
+            lead_body += "<li class='quiet'>Showing the latest 50.</li>"
+
+        css = (
+            "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',"
+            "Roboto,Helvetica,Arial,sans-serif;font-size:16px;line-height:1.5;"
+            "color:#1a1a1a;background:#f7f7f5}"
+            ".wrap{max-width:640px;margin:0 auto;padding:16px}"
+            "h1{font-size:28px;margin:8px 0 0}h2{font-size:20px;margin:28px 0 8px}"
+            ".sub{color:#555;margin:4px 0 16px}"
+            ".glance{background:#fff;border:1px solid #e3e3e0;border-radius:12px;padding:16px}"
+            ".today{font-size:18px;margin:0 0 12px}"
+            ".nums{display:flex;gap:12px}.num{flex:1;text-align:center}"
+            ".big{display:block;font-size:36px;font-weight:700;color:#128c7e}"
+            ".lbl{font-size:13px;color:#555}"
+            ".pill{display:inline-block;padding:4px 12px;border-radius:999px;"
+            "font-weight:700;font-size:14px}"
+            ".pill.on{background:#dcf8c6;color:#075e54}"
+            ".pill.off{background:#fde8e8;color:#a50e0e}"
+            ".pill.idle{background:#eee;color:#555}"
+            ".tag{font-size:12px;color:#888;font-weight:400}"
+            ".card{background:#fff;border:1px solid #e3e3e0;border-left:4px solid #25d366;"
+            "border-radius:12px;padding:16px;margin:12px 0}"
+            ".card.urgent{border-left-color:#d93025}"
+            ".who{font-size:20px;font-weight:700}"
+            ".call{display:inline-block;margin:8px 0;font-size:17px;color:#128c7e;font-weight:600}"
+            ".said{font-size:17px;margin:8px 0}"
+            ".meta{color:#555;font-size:14px;margin:4px 0}"
+            ".bot{color:#555;font-size:14px;margin:4px 0}"
+            ".since{color:#555;font-size:14px;margin:12px 0 0}"
+            ".urgent{color:#a50e0e;font-weight:700;margin:4px 0}"
+            ".allclear{font-size:18px;color:#075e54;font-weight:700}"
+            ".quiet{color:#777;font-size:14px}"
+            ".list{list-style:none;padding:0;margin:0}"
+            ".list li{background:#fff;border:1px solid #e3e3e0;border-radius:10px;"
+            "padding:12px 14px;margin:8px 0}"
+            ".list li.failed{border-left:4px solid #d93025}"
+            ".err{color:#a50e0e}"
+            "button{min-height:44px;padding:10px 20px;font-size:16px;border-radius:10px;"
+            "border:1px solid #128c7e;background:#128c7e;color:#fff;cursor:pointer}"
+            "button.big{width:100%;margin-top:8px}"
+            "a{color:#128c7e}"
+            "@media (max-width:480px){.nums{flex-direction:column;gap:4px}.num{text-align:left}}"
+        )
+        return (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>{} — WhatsApp Studio</title><style>{}</style></head><body>"
+            "<div class='wrap'>"
+            "<h1>{}</h1><p class='sub'>Your WhatsApp receptionist · {}</p>"
+            "<section class='glance'><p class='today'>{}</p>"
+            "<div class='nums'>"
+            "<div class='num'><span class='big'>{}</span><span class='lbl'>waiting for you</span></div>"
+            "<div class='num'><span class='big'>{}</span><span class='lbl'>bookings today</span></div>"
+            "<div class='num'><span class='big'>{}</span><span class='lbl'>people messaged today</span></div>"
+            "</div></section>"
+            "<section class='bot'>{}</section>"
+            "<h2>People waiting for you <span class='tag'>Handoffs</span></h2>"
+            "{}"
+            "<p class='quiet'>{} handled today.</p>"
+            "<h2>Bookings today ({})</h2>"
+            "<ul class='list'>{}</ul>"
+            "<h2>Replies the bot sent</h2>"
+            "<ul class='list'>{}</ul>"
+            "<h2>People who messaged</h2>"
+            "<ul class='list'>{}</ul>"
+            "</div></body></html>"
+        ).format(
+            html.escape(self.profile.name),
+            css,
+            html.escape(self.profile.name),
+            html.escape(format_date(today)),
+            html.escape(sentence),
+            waiting,
+            len(todays),
+            messaged_today,
+            bot_block,
+            waiting_body,
+            len(resolved_today),
+            html.escape(format_date(today)),
+            book_body,
+            out_body,
+            lead_body,
+        )
 
 def make_handler(studio):
     class Handler(BaseHTTPRequestHandler):

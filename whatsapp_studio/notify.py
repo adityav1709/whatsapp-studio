@@ -1,33 +1,32 @@
-"""Owner notifications for handoffs. Best-effort helpers on top of the
-dashboard, never a reason for a handoff to fail.
+"""Owner notifications for handoffs and bookings. Best-effort helpers on top
+of the dashboard, never a reason for a handoff or a booking to fail.
 
-The interface is just an object with ``notify(business_name, handoff)``,
-so a WhatsApp notifier can plug in later without touching the app. Today
-there are two implementations: Telegram (owner-supplied bot token and
-chat id from the environment, off by default) and a null one that does
-nothing. No credentials live in this repo.
+The interface is an object with ``notify(business_name, handoff)`` and
+``notify_booking(business_name, booking)``, so a WhatsApp notifier can
+plug in later without touching the app. Today there are two
+implementations: Telegram (owner-supplied bot token and chat id from the
+environment, off by default) and a null one that does nothing. No
+credentials live in this repo.
 """
 from __future__ import annotations
 
 import json
 import os
 import urllib.request
+from datetime import date
+
+from .bookings import format_date, format_time
 
 
 class TelegramNotifier:
-    """Ping the owner on Telegram the moment a handoff opens."""
+    """Ping the owner on Telegram the moment a handoff opens, or a
+    customer books."""
 
     def __init__(self, token, chat_id):
         self.token = token
         self.chat_id = chat_id
 
-    def notify(self, business_name, handoff):
-        text = (
-            f"Customer needs you — {business_name}\n"
-            f"{handoff.get('name') or 'Customer'} ({handoff['phone']})\n"
-            f"Reason: {handoff['reason']}\n"
-            f"\"{handoff['trigger']}\""
-        )
+    def _send(self, text):
         payload = json.dumps({"chat_id": self.chat_id, "text": text}).encode("utf-8")
         request = urllib.request.Request(
             f"https://api.telegram.org/bot{self.token}/sendMessage",
@@ -39,15 +38,37 @@ class TelegramNotifier:
             with urllib.request.urlopen(request, timeout=10) as resp:
                 resp.read()
         except Exception:
-            # A failed ping must never break the handoff: the dashboard
-            # still shows it, and the customer still gets their confirmation.
+            # A failed ping must never break the handoff or the booking:
+            # the dashboard still shows it, and the customer still gets
+            # their confirmation.
             pass
+
+    def notify(self, business_name, handoff):
+        self._send(
+            f"Customer needs you — {business_name}\n"
+            f"{handoff.get('name') or 'Customer'} ({handoff['phone']})\n"
+            f"Reason: {handoff['reason']}\n"
+            f"\"{handoff['trigger']}\""
+        )
+
+    def notify_booking(self, business_name, booking):
+        day = date.fromisoformat(booking["date"])
+        self._send(
+            f"New booking — {business_name}\n"
+            f"{booking.get('name') or 'Customer'} ({booking['phone']})\n"
+            f"{booking['service']} — {format_date(day)}, "
+            f"{format_time(booking['start_min'])} · Rs {booking['price']}"
+        )
 
 
 class NullNotifier:
-    """No notification configured; handoffs queue on the dashboard."""
+    """No notification configured; handoffs and bookings queue on the
+    dashboard."""
 
     def notify(self, business_name, handoff):
+        return None
+
+    def notify_booking(self, business_name, booking):
         return None
 
 
