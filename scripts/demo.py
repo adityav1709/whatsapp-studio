@@ -22,11 +22,29 @@ from whatsapp_studio.handoffs import HandoffStore  # noqa: E402
 from whatsapp_studio.leads import LeadStore  # noqa: E402
 
 
+class FakeSender:
+    """Stand-in for the Meta sender: records what would be sent, never
+    touches a network. The demo runs live with this, so the whole send
+    loop is visible without a token."""
+
+    def __init__(self):
+        self.calls = []
+
+    def send(self, to, body):
+        self.calls.append((to, body))
+        return f"wamid.demo.{len(self.calls)}"
+
+
 def main():
     profile = BusinessProfile.from_json(ROOT / "demo" / "demo_business.json")
     with tempfile.TemporaryDirectory() as tmp:
         store = LeadStore(Path(tmp) / "leads.json")
-        studio = Studio(profile, store, bookings=BookingStore(), handoffs=HandoffStore())
+        sender = FakeSender()
+        studio = Studio(
+            profile, store, bookings=BookingStore(), handoffs=HandoffStore(),
+            sender=sender,
+        )
+        print(f"sending state: {studio.sending_state()} (fake sender, no token)")
         httpd = make_server(studio, port=0)
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -95,6 +113,21 @@ def main():
                     f"  {lead['phone']} ({lead.get('name') or 'unknown'}): "
                     f"{lead['message_count']} msg, intents={lead['intents']}"
                 )
+            # Live sending, with the fake sender: every reply above was
+            # "sent" on a daemon thread, so wait for the outcomes and
+            # show the audit trail.
+            studio.wait_for_sends()
+            print(f"sends attempted: {len(sender.calls)}")
+            for entry in studio.outbox:
+                outcome = entry.get("send_status") or "recorded"
+                detail = entry.get("wamid") or entry.get("send_error") or ""
+                print(
+                    f"  to {entry['to']} ({entry.get('intent') or '—'}): "
+                    f"{outcome} {detail}"
+                )
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as resp:
+                health = json.loads(resp.read())
+            print(f"health: live={health['live']} sending={health['sending']}")
         finally:
             httpd.shutdown()
             httpd.server_close()

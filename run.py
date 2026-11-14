@@ -26,6 +26,12 @@ def main():
     port = int(os.environ.get("PORT", "8000"))
     httpd = make_server(studio, port=port)
     print(f"WhatsApp Studio running for {profile.name} on http://127.0.0.1:{port}")
+    if studio.live:
+        print("Live mode — replies will be sent on WhatsApp.")
+    elif studio.dry_run:
+        print("Dry-run mode — replies are recorded only (WHATSAPP_DRY_RUN=1).")
+    else:
+        print("Demo mode — replies are recorded only (set WHATSAPP_TOKEN + PHONE_NUMBER_ID to go live).")
     print("Webhook: POST /webhook   Leads: GET /leads   Bookings: GET /bookings   Handoffs: GET /handoffs   Dashboard: GET /")
     httpd.serve_forever()
 

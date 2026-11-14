@@ -11,6 +11,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import threading
 import time
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,29 +30,115 @@ from .replies import (
     handoff_confirmation,
     slots_available,
 )
+from .send import MAX_TEXT_CHARS, sender_from_env
 
 
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None):
         self.profile = profile
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
         self.handoffs = handoffs if handoffs is not None else HandoffStore()
         self.notifier = notifier if notifier is not None else notifier_from_env()
+        self.sender = sender if sender is not None else sender_from_env()
+        # Dry run forces record-only even when a token is set, so a pilot
+        # can watch exactly what would be sent before anything leaves.
+        self.dry_run = dry_run if dry_run is not None else os.environ.get("WHATSAPP_DRY_RUN") == "1"
+        self.sending_disabled = False
+        self._send_threads = []
         self.verify_token = verify_token
         # Replies sit here in demo mode instead of going to Meta, so the owner can
         # read exactly what would have been sent before anything reaches a customer.
         self.outbox = []
-        self.live = bool(os.environ.get("WHATSAPP_TOKEN"))
 
-    def handle_message(self, phone, text, sender_name="", now=None):
+    @property
+    def live(self):
+        """True only when replies are actually being sent: a sender exists,
+        dry-run is off, and the kill switch has not been hit. A token
+        without a phone number id cannot send, so it is not live."""
+        return self.sender is not None and not self.dry_run and not self.sending_disabled
+
+    def sending_state(self):
+        if self.sender is None:
+            return "demo"
+        if self.dry_run:
+            return "dry-run"
+        if self.sending_disabled:
+            return "paused"
+        return "live"
+
+    def disable_sending(self):
+        """Kill switch: stop all sending instantly. Replies keep being
+        recorded, so the owner can see what would have gone out."""
+        self.sending_disabled = True
+
+    def enable_sending(self):
+        self.sending_disabled = False
+
+    def wait_for_sends(self, timeout=5):
+        """Block until in-flight sends finish. For tests and the demo;
+        the webhook never waits on this."""
+        deadline = time.time() + timeout
+        for thread in list(self._send_threads):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        self._send_threads = [t for t in self._send_threads if t.is_alive()]
+
+    def _valid_recipient(self, to):
+        """The reply goes only to the phone the message came from: digits
+        only, never the business's own number. Anything else is refused
+        and recorded, never sent."""
+        digits = to[1:] if to.startswith("+") else to
+        if not digits or not digits.isdigit():
+            return False
+        business = "".join(c for c in (self.profile.phone or "") if c.isdigit())
+        return not business or digits != business
+
+    def _dispatch(self, entry):
+        """Send a recorded reply, if live. Never raises, never blocks.
+
+        The outbox is the audit trail: the entry is already recorded
+        before this runs, and this only fills in what happened to it.
+        """
+        entry["send_status"] = "recorded"
+        entry["wamid"] = None
+        entry["send_error"] = None
+        body = entry.get("body")
+        if body is None or not self.live:
+            return
+        if not self._valid_recipient(entry["to"]):
+            entry["send_status"] = "failed"
+            entry["send_error"] = "invalid recipient"
+            return
+        if len(body) > MAX_TEXT_CHARS:
+            body = body[:MAX_TEXT_CHARS]
+            entry["body"] = body
+            entry["truncated"] = True
+        entry["send_status"] = "sending"
+        thread = threading.Thread(target=self._send_entry, args=(entry,), daemon=True)
+        thread.start()
+        self._send_threads.append(thread)
+
+    def _send_entry(self, entry):
+        try:
+            wamid = self.sender.send(entry["to"], entry["body"])
+        except Exception as exc:
+            entry["send_status"] = "failed"
+            entry["send_error"] = str(exc) or exc.__class__.__name__
+            return
+        entry["send_status"] = "sent"
+        entry["wamid"] = wamid
+
+    def handle_message(self, phone, text, sender_name="", now=None, wamid=None):
         intent = detect_intent(text)
         # A handoff is total: while one is open the message is recorded for
         # the owner to read, but the bot sends nothing — not even a booking.
         if self.handoffs.open_for(phone) is not None:
-            self.leads.record_message(phone, text, intent, sender_name)
+            self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
             return {"to": phone, "body": None, "intent": intent, "paused": True}
         reason = None
         if intent == HUMAN:
@@ -61,9 +148,10 @@ class Studio:
         if reason is not None:
             handoff = self.handoffs.open(phone, sender_name, reason, text)
             reply = handoff_confirmation(self.profile, reason, now)
-            self.leads.record_message(phone, text, intent, sender_name)
+            self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
             entry = {"to": phone, "body": reply, "intent": intent, "handoff": handoff["id"]}
             self.outbox.append(entry)
+            self._dispatch(entry)
             try:
                 self.notifier.notify(self.profile.name, handoff)
             except Exception:
@@ -83,9 +171,10 @@ class Studio:
             )
         else:
             reply = build_reply(self.profile, intent, text, service=service, now=now)
-        self.leads.record_message(phone, text, intent, sender_name)
+        self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
         entry = {"to": phone, "body": reply, "intent": intent}
         self.outbox.append(entry)
+        self._dispatch(entry)
         return entry
 
     def _fallback_streak(self, phone):
@@ -167,7 +256,15 @@ class Studio:
                     text = (msg.get("text") or {}).get("body", "")
                     if not phone:
                         continue
-                    self.handle_message(phone, text, contacts.get(phone, ""))
+                    # Meta redelivers when it does not get a 200 fast. The
+                    # dedup check runs here, synchronously, before any work:
+                    # a message id already in the lead record is answered
+                    # once, never twice. A payload with no id is processed
+                    # normally.
+                    wamid = msg.get("id")
+                    if wamid and self.leads.has_wamid(phone, wamid):
+                        continue
+                    self.handle_message(phone, text, contacts.get(phone, ""), wamid=wamid)
                     count += 1
         return count
 
@@ -259,10 +356,64 @@ class Studio:
         book_body = "".join(book_rows) or (
             '<tr><td colspan="5">No bookings today.</td></tr>'
         )
+        state = self.sending_state()
+        if state == "live":
+            sending_line = (
+                "<p><strong>Sending: LIVE</strong> — replies are being sent on WhatsApp.</p>"
+                "<form method='post' action='/sending/disable'>"
+                "<button type='submit'>Stop sending</button></form>"
+            )
+        elif state == "paused":
+            sending_line = (
+                "<p><strong>Sending: PAUSED</strong> — replies are recorded only.</p>"
+                "<form method='post' action='/sending/enable'>"
+                "<button type='submit'>Resume sending</button></form>"
+            )
+        elif state == "dry-run":
+            sending_line = (
+                "<p><strong>Sending: DRY RUN</strong> — replies are recorded only, "
+                "nothing is sent.</p>"
+            )
+        else:
+            sending_line = (
+                "<p><strong>Sending: DEMO</strong> — no WhatsApp token configured, "
+                "replies are recorded only.</p>"
+            )
+        out_rows = []
+        for entry in reversed(self.outbox[-10:]):
+            if entry.get("paused"):
+                status = "paused"
+            else:
+                status = entry.get("send_status") or "recorded"
+            detail = ""
+            if entry.get("wamid"):
+                detail = html.escape(entry["wamid"])
+            elif entry.get("send_error"):
+                detail = html.escape(entry["send_error"])
+            if entry.get("truncated"):
+                detail = (detail + " " if detail else "") + "truncated to 4096 chars"
+            marker = "SEND FAILED — " if status == "failed" else ""
+            out_rows.append(
+                "<tr><td>{}</td><td>{}</td><td>{}{}</td><td>{}</td><td>{}</td></tr>".format(
+                    html.escape(entry["to"]),
+                    html.escape(entry.get("intent") or "—"),
+                    marker,
+                    html.escape(status),
+                    html.escape((entry.get("body") or "")[:80]),
+                    detail,
+                )
+            )
+        out_body = "".join(out_rows) or '<tr><td colspan="5">No replies yet.</td></tr>'
         return (
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<title>{} — WhatsApp Studio</title></head><body>"
             "<h1>{}</h1><p>AI receptionist on WhatsApp. Replies generated: {}.</p>"
+            "{}"
+            "<h2>Recent replies</h2>"
+            "<table border='1' cellpadding='6'>"
+            "<tr><th>To</th><th>Intent</th><th>Send status</th><th>Reply</th><th>Detail</th></tr>"
+            "{}"
+            "</table>"
             "<h2>Handoffs (open)</h2>"
             "<table border='1' cellpadding='6'>"
             "<tr><th>Name</th><th>Phone</th><th>Reason</th><th>Trigger</th><th>Open for</th><th>Messages since</th><th></th></tr>"
@@ -287,6 +438,8 @@ class Studio:
             html.escape(self.profile.name),
             html.escape(self.profile.name),
             len(self.outbox),
+            sending_line,
+            out_body,
             hand_body,
             resolved_body,
             format_date(today),
@@ -319,7 +472,15 @@ def make_handler(studio):
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path == "/health":
-                self._send_json(200, {"status": "ok", "business": studio.profile.name})
+                self._send_json(
+                    200,
+                    {
+                        "status": "ok",
+                        "business": studio.profile.name,
+                        "live": studio.live,
+                        "sending": studio.sending_state(),
+                    },
+                )
             elif parsed.path == "/webhook":
                 qs = parse_qs(parsed.query)
                 mode = qs.get("hub.mode", [""])[0]
@@ -342,6 +503,20 @@ def make_handler(studio):
 
         def do_POST(self):
             parsed = urlparse(self.path)
+            if parsed.path == "/sending/disable":
+                studio.disable_sending()
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path == "/sending/enable":
+                studio.enable_sending()
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if parsed.path == "/handoffs/resolve":
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b""

@@ -28,7 +28,7 @@ class LeadStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self._leads, indent=2), encoding="utf-8")
 
-    def record_message(self, phone, text, intent, sender_name=""):
+    def record_message(self, phone, text, intent, sender_name="", wamid=None):
         now = int(time.time())
         lead = self._leads.get(phone)
         if lead is None:
@@ -48,12 +48,23 @@ class LeadStore:
             lead["name"] = sender_name
         if intent and intent not in lead["intents"]:
             lead["intents"].append(intent)
-        lead["messages"].append({"ts": now, "text": text, "intent": intent})
+        # The wamid is Meta's id for the incoming message. It is what
+        # lets the webhook skip a redelivery instead of answering it twice.
+        lead["messages"].append({"ts": now, "text": text, "intent": intent, "wamid": wamid})
         lead["messages"] = lead["messages"][-50:]
         # Save on every message, not in batches. A lost lead is lost business;
         # disk writes are cheap at this volume.
         self._save()
         return lead
+
+    def has_wamid(self, phone, wamid):
+        """True if this phone already sent a message with this Meta id."""
+        if not wamid:
+            return False
+        lead = self._leads.get(phone)
+        if lead is None:
+            return False
+        return any(m.get("wamid") == wamid for m in lead["messages"])
 
     def all_leads(self):
         return sorted(self._leads.values(), key=lambda l: l["last_seen"], reverse=True)
