@@ -1,1 +1,38 @@
-{"address":"Shop 12, Ground Floor, Sector 50, Gurgaon","category":"salon","city":"Gurgaon","greeting":"Hello! Welcome to Glow & Grace Salon, Gurgaon.","hours":{"daily":"10:00 AM - 8:00 PM"},"name":"Glow & Grace Salon","phone":"919999999999","services":[{"description":"Haircut and styling","duration_min":30,"name":"Haircut","price":499},{"description":"Signature glow facial","duration_min":60,"name":"Facial","price":1499},{"description":"Deep conditioning hair spa","duration_min":45,"name":"Hair Spa","price":999},{"description":"Complete bridal package","duration_min":120,"name":"Bridal Makeup","price":4999}]}
+{
+  "address": "Shop 12, Ground Floor, Sector 50, Gurgaon",
+  "category": "salon",
+  "city": "Gurgaon",
+  "greeting": "Hello! Welcome to Glow & Grace Salon, Gurgaon. I'm the assistant here.",
+  "hours": {
+    "daily": "10:00 AM - 8:00 PM"
+  },
+  "name": "Glow & Grace Salon",
+  "phone": "919999999999",
+  "services": [
+    {
+      "description": "Haircut and styling",
+      "duration_min": 30,
+      "name": "Haircut",
+      "price": 499
+    },
+    {
+      "description": "Signature glow facial",
+      "duration_min": 60,
+      "name": "Facial",
+      "price": 1499
+    },
+    {
+      "description": "Deep conditioning hair spa",
+      "duration_min": 45,
+      "name": "Hair Spa",
+      "price": 999
+    },
+    {
+      "description": "Complete bridal package",
+      "duration_min": 120,
+      "name": "Bridal Makeup",
+      "price": 4999
+    }
+  ],
+  "offers": "20% off on all facials this week"
+}
