@@ -365,6 +365,11 @@ class TestOwnerReply(unittest.TestCase):
             any(e.get("handoff") == 1 and e["body"].startswith("Hi Rahul")
                 for e in self.studio.outbox)
         )
+        owner_entry = next(
+            e for e in self.studio.outbox if e["body"].startswith("Hi Rahul")
+        )
+        self.assertIn("ts", owner_entry)
+        self.assertIsInstance(owner_entry["ts"], int)
 
     def test_reply_to_missing_handoff_is_404(self):
         sent_before = len(self.sender.calls)
@@ -375,7 +380,7 @@ class TestOwnerReply(unittest.TestCase):
     def test_reply_with_sending_off_is_recorded_not_sent(self):
         self.studio.sender = None  # demo mode: no sender configured
         html = self.studio.dashboard_html()
-        self.assertIn("Record reply — sending is off", html)
+        self.assertIn("Record reply, sending is off", html)
         self.assertIn("Sending is off", html)
         # One send already happened: the handoff confirmation from setUp.
         sent_before = len(self.sender.calls)
