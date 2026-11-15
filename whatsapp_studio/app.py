@@ -49,6 +49,7 @@ from .llm import (
     LLM_TOOLS,
     MAX_LLM_CHARS,
     MAX_TOOL_ROUNDS,
+    build_draft_prompt,
     build_system_prompt,
     openai_tool_calls,
 )
@@ -139,6 +140,12 @@ class Studio:
         # The handoff the hand_over tool opened during this reply, if
         # any, so the reply entry can carry its id.
         self._last_handoff = None
+        # Drafts the owner asked the brain for, one per open handoff.
+        # A draft is only a suggestion: it prefills the reply box and
+        # is never sent. The failed set remembers a draft the model
+        # could not produce, so the page says so instead of going quiet.
+        self._drafts = {}
+        self._draft_failed = set()
         # Dry run forces record-only even when a token is set, so a pilot
         # can watch exactly what would be sent before anything leaves.
         self.dry_run = dry_run if dry_run is not None else os.environ.get("WHATSAPP_DRY_RUN") == "1"
@@ -361,6 +368,28 @@ class Studio:
                 return content.strip()[:MAX_LLM_CHARS]
             return None
         return None
+
+    def draft_reply(self, phone):
+        """Ask the brain to draft a reply for the owner to review and
+        send. Returns the draft text, or None when there is no key or
+        the model could not draft one. The draft is never sent, and the
+        model gets no tools here, so drafting cannot book, cancel, or
+        change anything."""
+        if self.llm is None:
+            return None
+        lead = self.leads.get(phone)
+        if lead is None or not lead["messages"]:
+            return None
+        messages = [{"role": "system", "content": build_draft_prompt(self.profile)}]
+        messages.extend(self._llm_history(phone))
+        try:
+            result = self.llm.chat(messages)
+        except Exception:
+            return None
+        content = (result or {}).get("content")
+        if not content or not content.strip():
+            return None
+        return content.strip()[:MAX_LLM_CHARS]
 
     def _run_tool(self, name, args, phone, sender_name, now, trigger_text):
         """Run one tool the model asked for. Everything real happens
@@ -830,8 +859,10 @@ class Studio:
         bot switch) stays on every tab. Today is the default: the
         glance, the money, anything wrong, the people waiting. Bookings
         is the calendar of appointments. Customers is who messaged and
-        who asked and did not book. Replies is failures only. Conversation
-        is the full WhatsApp style thread for each waiting person.
+        who asked and did not book. Replies is where the owner writes
+        a reply, drafts one on request, and sees the replies that
+        failed. Conversation is the full WhatsApp style thread for each
+        waiting person.
 
         The look is bold, not soft: a deep warm charcoal page, a warm
         gold accent, the money huge up front, because that is what the
@@ -1041,29 +1072,80 @@ class Studio:
             card += "<a class='call' href='tel:+{}'>Call {}</a>".format(
                 digits, html.escape(display)
             )
-            reply_label = "Send reply" if self.live else "Record reply, sending is off"
-            card += (
-                "<div class='replybox'>"
-                "<p class='quiet'>Only if you want to step in. The bot is already talking to them.</p>"
-                "<form method='post' action='/handoffs/{}/reply'>"
-                "<input type='text' name='text' placeholder='Reply to {}…' required>"
-                "<button type='submit' class='soft'>{}</button></form>"
-            ).format(
-                handoff["id"],
-                html.escape(handoff.get("name") or "them"),
-                reply_label,
-            )
-            if not self.live:
-                card += (
-                    "<p class='quiet'>Sending is off. Your reply will be "
-                    "recorded here, not sent on WhatsApp.</p>"
-                )
-            card += "</div>"
             card += (
                 "<form method='post' action='/handoffs/resolve'>"
                 "<input type='hidden' name='handoff_id' value='{}'>"
                 "<button type='submit' class='resolve'>Resolve</button></form>"
             ).format(handoff["id"])
+            card += "</div>"
+            return card
+
+        def reply_box(handoff):
+            """The owner's reply form, with a draft on request. A draft
+            only prefills the box; nothing here sends by itself. With
+            no key the draft button is replaced by a plain note saying
+            so, and a failed draft says so instead of going quiet."""
+            reply_label = "Send reply" if self.live else "Record reply, sending is off"
+            draft = self._drafts.get(handoff["id"])
+            value = (
+                " value='{}'".format(html.escape(draft)) if draft else ""
+            )
+            box = (
+                "<div class='replybox'>"
+                "<p class='quiet'>Only if you want to step in. The bot is already talking to them.</p>"
+                "<form method='post' action='/handoffs/{}/reply'>"
+                "<input type='text' name='text' placeholder='Reply to {}…'{} required>"
+                "<button type='submit' class='soft'>{}</button></form>"
+            ).format(
+                handoff["id"],
+                html.escape(handoff.get("name") or "them"),
+                value,
+                reply_label,
+            )
+            if self.llm is None:
+                box += (
+                    "<p class='quiet'>Drafts need an LLM key. The bot cannot "
+                    "reply without one. Set LLM_API_KEY on the server and restart.</p>"
+                )
+            elif handoff["id"] in self._draft_failed:
+                box += (
+                    "<p class='quiet'>Could not draft a reply right now. "
+                    "Just write your own.</p>"
+                )
+            else:
+                box += (
+                    "<form method='post' action='/handoffs/{}/draft'>"
+                    "<button type='submit' class='ghost'>Draft a reply</button></form>"
+                ).format(handoff["id"])
+            if not self.live:
+                box += (
+                    "<p class='quiet'>Sending is off. Your reply will be "
+                    "recorded here, not sent on WhatsApp.</p>"
+                )
+            box += "</div>"
+            return box
+
+        def reply_card(handoff):
+            name = handoff.get("name")
+            display = name or handoff["phone"]
+            card = "<div class='card'>"
+            card += "<div class='who'>{}</div>".format(html.escape(display))
+            if name:
+                card += "<div class='phone'>{}</div>".format(
+                    html.escape(handoff["phone"])
+                )
+            card += "<p class='meta'>{} · waiting {}</p>".format(
+                html.escape(handoff["reason"]),
+                html.escape(age_text(handoff["opened_at"])),
+            )
+            lead = self.leads.get(handoff["phone"])
+            if lead is not None and lead["messages"]:
+                latest = lead["messages"][-1]["text"]
+                if latest:
+                    card += "<p class='latest'><span>Latest</span> &ldquo;{}&rdquo;</p>".format(
+                        html.escape(latest)
+                    )
+            card += reply_box(handoff)
             card += "</div>"
             return card
 
@@ -1227,6 +1309,13 @@ class Studio:
                 "for a person, their full chat shows up here.</p>"
             )
 
+        # The place to write a reply, one card per waiting person,
+        # kept apart from the conversation thread.
+        replies_body = "".join(reply_card(h) for h in open_handoffs) or (
+            "<p class='allclear'>Nobody is waiting. When someone asks "
+            "for a person, you can reply to them here.</p>"
+        )
+
         css = (
             "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',"
             "Roboto,Helvetica,Arial,sans-serif;font-size:17px;line-height:1.55;"
@@ -1301,6 +1390,8 @@ class Studio:
             "border-radius:8px;border:0;background:#1f6a44;color:#fff;cursor:pointer;font-family:inherit}"
             "button.primary{width:100%;margin-top:12px;background:#e8c96a;color:#211a13}"
             "button.soft{width:100%;min-height:44px;background:#e8dcc8;color:#5c4f42;font-size:15px;margin-top:8px}"
+            "button.ghost{width:100%;min-height:44px;background:transparent;color:#5c4f42;"
+            "border:1px solid #cbbfa8;font-size:15px;margin-top:8px}"
             "button.resolve{width:100%;min-height:46px;background:#f3ead9;color:#5c4f42;font-size:15px;margin-top:14px}"
             "input[type=text]{width:100%;box-sizing:border-box;min-height:46px;"
             "padding:11px 14px;font-size:16px;border:1px solid #e5d9c3;border-radius:8px;"
@@ -1378,9 +1469,11 @@ class Studio:
             ).format(most_html, nobook_html, lead_body)
         elif tab == "replies":
             body = (
+                "<h2>Reply to a customer</h2>"
+                "{}"
                 "<h2>Replies the bot sent</h2>"
                 "<ul class='list'>{}</ul>"
-            ).format(out_body)
+            ).format(replies_body, out_body)
         else:
             body = conversation_body
 
@@ -1563,8 +1656,42 @@ def make_handler(studio):
                 if handoff_id is None or studio.handoffs.resolve(handoff_id) is None:
                     self._send_json(404, {"error": "handoff not found"})
                     return
+                studio._drafts.pop(handoff_id, None)
+                studio._draft_failed.discard(handoff_id)
                 self.send_response(303)
                 self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path.startswith("/handoffs/") and parsed.path.endswith("/draft"):
+                # The owner asked the brain for a draft. It only prefills
+                # the reply box on the Replies tab; nothing is sent, and
+                # the handoff stays open until the owner sends or resolves.
+                try:
+                    handoff_id = int(parsed.path.strip("/").split("/")[1])
+                except (ValueError, IndexError):
+                    self._send_json(404, {"error": "handoff not found"})
+                    return
+                handoff = next(
+                    (
+                        h for h in studio.handoffs.all_handoffs()
+                        if h["id"] == handoff_id and h["status"] == "open"
+                    ),
+                    None,
+                )
+                if handoff is None:
+                    self._send_json(404, {"error": "handoff not found"})
+                    return
+                draft = studio.draft_reply(handoff["phone"])
+                if draft is None:
+                    if studio.llm is not None:
+                        studio._draft_failed.add(handoff_id)
+                    studio._drafts.pop(handoff_id, None)
+                else:
+                    studio._drafts[handoff_id] = draft
+                    studio._draft_failed.discard(handoff_id)
+                self.send_response(303)
+                self.send_header("Location", "/?tab=replies")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
@@ -1607,6 +1734,8 @@ def make_handler(studio):
                 studio._dispatch(entry)
                 studio._save_outbox()
                 studio.handoffs.resolve(handoff_id)
+                studio._drafts.pop(handoff_id, None)
+                studio._draft_failed.discard(handoff_id)
                 self.send_response(303)
                 self.send_header("Location", "/")
                 self.send_header("Content-Length", "0")

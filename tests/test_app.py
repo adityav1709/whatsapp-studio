@@ -392,7 +392,7 @@ class TestOwnerReply(unittest.TestCase):
 
     def test_reply_with_sending_off_is_recorded_not_sent(self):
         self.studio.sender = None  # demo mode: no sender configured
-        html = self.studio.dashboard_html()
+        html = self.studio.dashboard_html("replies")
         self.assertIn("Record reply, sending is off", html)
         self.assertIn("Sending is off", html)
         # One send already happened: the handoff confirmation from setUp.

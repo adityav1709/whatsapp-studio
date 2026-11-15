@@ -201,6 +201,21 @@ def build_system_prompt(profile, now=None):
     return "\n".join(lines)
 
 
+def build_draft_prompt(profile, now=None):
+    """The prompt for a draft the owner reviews and sends. Same
+    grounding as the receptionist, but the model writes a reply for
+    the owner instead of answering the customer: short, warm, in the
+    customer's own language, and it books, cancels, or promises
+    nothing, because a draft must never do anything real."""
+    return build_system_prompt(profile, now) + (
+        "\n\nThe owner asked you to draft a reply to the customer's "
+        "latest message. Write only the reply the owner should send. "
+        "Keep it short and warm, in the customer's own language. Do not "
+        "book, cancel, or reschedule anything, and do not promise a "
+        "booking. Only the reply itself, nothing else."
+    )
+
+
 LLM_TOOLS = [
     {
         "type": "function",
