@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlencode
 
+from test_llm import C, FixedLLM, ScriptedLLM, T
 from whatsapp_studio.app import Studio, make_server
 from whatsapp_studio.bookings import BookingStore
 from whatsapp_studio.config import BusinessProfile, Service
@@ -26,7 +27,12 @@ def make_studio(tmp):
         services=[],
         address="Sector 50, Gurgaon",
     )
-    return Studio(profile, LeadStore(Path(tmp) / "leads.json"), verify_token="test-token")
+    return Studio(
+        profile,
+        LeadStore(Path(tmp) / "leads.json"),
+        verify_token="test-token",
+        llm=FixedLLM("We are open 10:00 AM to 8:00 PM."),
+    )
 
 
 class FakeNotifier:
@@ -257,6 +263,7 @@ class TestExport(unittest.TestCase):
             bookings=BookingStore(),
             handoffs=HandoffStore(),
             dashboard_password="secret",
+            llm=FixedLLM("Hello! How can I help?"),
         )
         self.studio.handle_message("919810000001", "hi", "Rahul")
         self.httpd = make_server(self.studio, port=0)
@@ -320,6 +327,12 @@ class TestOwnerReply(unittest.TestCase):
             handoffs=HandoffStore(),
             notifier=self.notifier,
             sender=self.sender,
+            llm=ScriptedLLM(
+                [
+                    T("hand_over", {"reason": "asked for a person"}),
+                    C("I've passed this to the team. They will reply here within 30 minutes."),
+                ]
+            ),
         )
         self.studio.handle_message(
             "919810000001", "can I talk to a person please", "Rahul"

@@ -8,6 +8,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from test_llm import FixedLLM
 from whatsapp_studio.app import Studio, make_server
 from whatsapp_studio.config import BusinessProfile
 from whatsapp_studio.leads import LeadStore
@@ -61,7 +62,13 @@ def _make_studio(tmp, **kwargs):
         services=[],
         address="Sector 50, Gurgaon",
     )
-    return Studio(profile, LeadStore(Path(tmp) / "leads.json"), verify_token="test-token", **kwargs)
+    return Studio(
+        profile,
+        LeadStore(Path(tmp) / "leads.json"),
+        verify_token="test-token",
+        llm=FixedLLM("We are open 10:00 AM to 8:00 PM."),
+        **kwargs,
+    )
 
 
 class _ServerCase(unittest.TestCase):
