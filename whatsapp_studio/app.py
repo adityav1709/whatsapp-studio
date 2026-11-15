@@ -601,7 +601,9 @@ class Studio:
         ]
         leads = self.leads.all_leads()
         todays = self.bookings.bookings_on(today)
-        rupees_today = sum(b["price"] for b in todays)
+        # A booking with no published price contributes nothing here;
+        # the money line below only appears when something was priced.
+        rupees_today = sum(b.get("price") or 0 for b in todays)
         tomorrow = today + timedelta(days=1)
         tomorrows = self.bookings.bookings_on(tomorrow)
         monday = today - timedelta(days=today.weekday())
@@ -610,7 +612,7 @@ class Studio:
             b for b in self.bookings.all_bookings()
             if monday <= date.fromisoformat(b["date"]) <= sunday
         ]
-        week_rupees = sum(b["price"] for b in week_bookings)
+        week_rupees = sum(b.get("price") or 0 for b in week_bookings)
         messaged_today = sum(
             1 for lead in leads
             if datetime.fromtimestamp(lead["last_seen"], tz=IST).date() == today
@@ -631,7 +633,7 @@ class Studio:
                 f"Today: {messaged_today} {plural(messaged_today, 'person', 'people')} messaged, "
                 f"{len(todays)} booked, {waiting} waiting for you."
             )
-        if todays:
+        if todays and rupees_today > 0:
             sentence += f" Bookings today: Rs {rupees_today}."
 
         state = self.sending_state()
@@ -732,13 +734,18 @@ class Studio:
             rows = []
             for b in bookings:
                 digits = "".join(c for c in b["phone"] if c.isdigit())
+                price = (
+                    "Rs {}".format(b["price"])
+                    if b.get("price") is not None
+                    else "price to confirm"
+                )
                 rows.append(
-                    "<li><strong>{}</strong> — {} for {} — Rs {} · "
+                    "<li><strong>{}</strong> — {} for {} — {} · "
                     "<a href='tel:+{}'>{}</a></li>".format(
                         html.escape(format_time(b["start_min"])),
                         html.escape(b["service"]),
                         html.escape(b.get("name") or "—"),
-                        b["price"],
+                        price,
                         digits,
                         html.escape(b["phone"]),
                     )
@@ -832,6 +839,13 @@ class Studio:
             "a{color:#128c7e}"
             "@media (max-width:480px){.nums{flex-direction:column;gap:4px}.num{text-align:left}}"
         )
+        # With no priced bookings this week the money part would read
+        # "Rs 0" — a number nobody set. Leave it off instead.
+        week_line = "This week: {} bookings.".format(len(week_bookings))
+        if week_rupees > 0:
+            week_line = "This week: {} bookings, Rs {}.".format(
+                len(week_bookings), week_rupees
+            )
         return (
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -852,7 +866,7 @@ class Studio:
             "<ul class='list'>{}</ul>"
             "<h2>Tomorrow ({})</h2>"
             "<ul class='list'>{}</ul>"
-            "<p>This week: {} bookings, Rs {}.</p>"
+            "<p>{}</p>"
             "<h2>Replies the bot sent</h2>"
             "<ul class='list'>{}</ul>"
             "<h2>People who messaged</h2>"
@@ -876,8 +890,7 @@ class Studio:
             book_body,
             html.escape(format_date(tomorrow)),
             tomorrow_body,
-            len(week_bookings),
-            week_rupees,
+            week_line,
             out_body,
             lead_body,
         )

@@ -7,12 +7,20 @@ from .bookings import format_date, format_time, india_now, is_closed, parse_hour
 from .intents import BOOKING, CANCEL, GREETING, HOURS, HUMAN, LOCATION, OFFER, PRICE, THANKS
 
 
+def _price_part(booking_or_service_price, duration_min):
+    """"(60 min, Rs 1499)" — or, with no published price, say the salon
+    confirms it instead of quoting a number nobody set."""
+    if booking_or_service_price is None:
+        return f"({duration_min} min, price confirmed at the salon)"
+    return f"({duration_min} min, Rs {booking_or_service_price})"
+
+
 def booking_confirmed(profile, booking):
     return (
         f"Done! Your {booking['service']} at {profile.name} is booked for "
         f"{format_date(_date.fromisoformat(booking['date']))} "
         f"at {format_time(booking['start_min'])} "
-        f"({booking['duration_min']} min, Rs {booking['price']}). "
+        f"{_price_part(booking.get('price'), booking['duration_min'])}. "
         "We will see you then! Reply 'cancel my booking' if your plans change."
     )
 
@@ -128,7 +136,8 @@ def booking_none_to_reschedule(profile):
 
 def booking_ask_when(profile, service):
     return (
-        f"Great, {service.name} (Rs {service.price}, {service.duration_min} min). "
+        f"Great, {service.name} "
+        f"{_price_part(service.price, service.duration_min)}. "
         "Which day and time works for you? For example, 'tomorrow 11am'."
     )
 
@@ -206,13 +215,22 @@ def build_reply(profile, intent, text, service=None, now=None, returning=False, 
         )
     if intent == PRICE:
         if service is not None:
+            if service.price is None:
+                return (
+                    f"{service.name} at {name} — the price depends on "
+                    "the style, so the salon confirms it when you book. "
+                    "Want me to book a slot for you?"
+                )
             return (
                 f"{service.name} at {name} is Rs {service.price} "
                 f"({service.duration_min} min). Want me to book a slot for you?"
             )
         lines = [f"{name} price list:"]
         for s in profile.services:
-            lines.append(f"- {s.name}: Rs {s.price}")
+            if s.price is None:
+                lines.append(f"- {s.name}: price confirmed at the salon")
+            else:
+                lines.append(f"- {s.name}: Rs {s.price}")
         lines.append("Reply with the service name to book, or ask me anything else.")
         return "\n".join(lines)
     if intent == OFFER:

@@ -55,11 +55,16 @@ class TelegramNotifier:
 
     def notify_booking(self, business_name, booking):
         day = date.fromisoformat(booking["date"])
+        price = (
+            "Rs {}".format(booking["price"])
+            if booking.get("price") is not None
+            else "price to confirm"
+        )
         self._send(
             f"New booking — {business_name}\n"
             f"{booking.get('name') or 'Customer'} ({booking['phone']})\n"
             f"{booking['service']} — {format_date(day)}, "
-            f"{format_time(booking['start_min'])} · Rs {booking['price']}"
+            f"{format_time(booking['start_min'])} · {price}"
         )
 
     def notify_send_failed(self, business_name, entry):

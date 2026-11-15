@@ -15,7 +15,10 @@ from .bookings import india_today
 @dataclass
 class Service:
     name: str
-    price: int  # INR
+    # A service with no published price (the owner hasn't confirmed one
+    # yet) has price None: the bot says the salon will confirm it, and
+    # never quotes a number it made up.
+    price: int | None = None  # INR
     duration_min: int = 30
     description: str = ""
     # How many customers can be served at once (chairs, doctors, trainers).
@@ -52,13 +55,19 @@ class BusinessProfile:
         )
 
     def service_named(self, text):
-        """Find a service whose name (or a distinctive word of it) appears in text."""
+        """Find a service whose name (or a distinctive word of it) appears in text.
+
+        Full names win over single words: with "Hair Styling" and
+        "Hair Spa" both on the menu, "hair spa ka price" is about the
+        spa, not the styling — the shared word "hair" must not claim it
+        just because styling is listed first.
+        """
         lowered = text.lower()
         for service in self.services:
-            name = service.name.lower()
-            if name in lowered:
+            if service.name.lower() in lowered:
                 return service
-            for word in name.split():
+        for service in self.services:
+            for word in service.name.lower().split():
                 # Short words match everywhere ("cut" is in half of all messages),
                 # so only words long enough to mean something count on their own.
                 if len(word) >= 4 and word in lowered:

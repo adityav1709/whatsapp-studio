@@ -213,7 +213,12 @@ curl http://127.0.0.1:8000/leads
 Edit `demo/demo_business.json` (or set `PROFILE_PATH` to your own JSON file
 and restart): name, category, city, hours (a day's value may be "closed"),
 services with INR prices and an optional `capacity` (how many customers at
-once), address, `offers`, greeting. No code changes needed.
+once), address, `offers`, greeting. No code changes needed. A service
+with no published price yet leaves `price` out (or `null`): the bot says
+the salon confirms the price instead of quoting a number nobody set, and
+the booking still works. `profiles/` holds draft pilot profiles for real
+prospects — Snips Salon, Gurgaon is the first — with only verified facts
+in them; prices wait for the owner to confirm.
 
 **Going live**
 Sending replies through Meta for real needs a WhatsApp Business app and a
