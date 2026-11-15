@@ -4,7 +4,10 @@ Usage:  python3 run.py
 Env:    PORT (default 8000), HOST (default 127.0.0.1; set 0.0.0.0 when
         hosting so the platform can reach it), VERIFY_TOKEN (default
         "studio-demo"), PROFILE_PATH (default demo/demo_business.json —
-        point it at a prospect's own profile JSON to serve their shop)
+        point it at a prospect's own profile JSON to serve their shop),
+        LLM_API_KEY or OPENAI_API_KEY (required: without a key the bot
+        records messages and replies to nobody), LLM_MODEL (default
+        gpt-4o-mini)
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from whatsapp_studio.bookings import BookingStore
 from whatsapp_studio.config import BusinessProfile
 from whatsapp_studio.handoffs import HandoffStore
 from whatsapp_studio.leads import LeadStore
+from whatsapp_studio.llm import client_from_env
 
 BASE = Path(__file__).resolve().parent
 
@@ -32,11 +36,15 @@ def main():
     store = LeadStore(BASE / "data" / "leads.json")
     bookings = BookingStore(BASE / "data" / "bookings.json")
     handoffs = HandoffStore(BASE / "data" / "handoffs.json")
-    studio = Studio(profile, store, verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"), bookings=bookings, handoffs=handoffs, outbox_path=BASE / "data" / "outbox.json")
+    studio = Studio(profile, store, verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"), bookings=bookings, handoffs=handoffs, outbox_path=BASE / "data" / "outbox.json", llm=client_from_env())
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     httpd = make_server(studio, host=host, port=port)
     print(f"WhatsApp Studio running for {profile.name} on http://{host}:{port}")
+    if studio.llm is not None:
+        print(f"LLM: on (model {studio.llm.model}).")
+    else:
+        print("LLM: OFF, no LLM_API_KEY or OPENAI_API_KEY set. The bot cannot reply.")
     if studio.live:
         print("Live mode — replies will be sent on WhatsApp.")
     elif studio.dry_run:

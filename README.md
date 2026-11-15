@@ -55,8 +55,48 @@ customer as a lead, and lets the owner see everything on one simple dashboard.
   when the first owner pays. The owner ping is Telegram (or the dashboard)
   until Meta approves the WhatsApp template — the WhatsApp ping is not
   built in code and must not be pretended. The bot reads typed messages,
-  not voice notes; it holds a short conversation, not a free-form chat.
-  One install per shop, 3–4 shops, no scale work.
+  not voice notes; it holds a free-form conversation through the model,
+  but it can only do what its tools allow, so prices and bookings stay
+  exact. One install per shop, 3–4 shops, no scale work.
+
+**v2.0 — the LLM is the brain, tabs, and a dashboard with a point of view**
+- The bot is LLM key based only. The model (OpenAI, gpt-4o-mini by
+  default) understands the message and decides what to say and what to
+  do. The rule based intents and template replies are gone. The model
+  never invents a price and never creates a booking directly: it calls
+  a tool and the code validates and records it. Tools: get price, list
+  prices (the full catalogue), check availability, create booking,
+  cancel booking, reschedule booking, hand over to the owner, set the
+  customer's name. Slot validation, availability, and price lookup stay
+  as code, so prices and bookings stay exact
+- Negotiation and the catalogue run through the model now. It negotiates
+  naturally within the floor prices (a floor price per service in the
+  profile; no floor means a fixed price, never discounted), and it uses
+  the full catalogue as context. A booking at an agreed price records
+  the agreed price next to the list price
+- The key is required, not optional. Without `LLM_API_KEY` (or the
+  `OPENAI_API_KEY` alias) the bot cannot reply: the message is recorded
+  and nobody is answered, and the dashboard says plainly that a key is
+  needed. If the model call fails, the bot hands over to the owner
+  instead of going silent. The key comes from the environment at
+  runtime, never from the repo or a data file. The owner supplies their
+  own key or Aditya uses his. Set it on Render as an env var
+  (`LLM_API_KEY`); the model is `LLM_MODEL` (default `gpt-4o-mini`).
+  gpt-4o-mini is cheap: a few paise per message at most for a small shop
+- The dashboard has tabs now, server side, no JavaScript: Today (the
+  glance, the money, anything wrong, the people waiting), Bookings
+  (today, tomorrow, the week line), Customers (who messaged, who asked
+  and did not book, what people asked about most), Replies (failures
+  only), Conversation (the full WhatsApp style thread for each waiting
+  person). A tab is a link to the same page with `?tab=`. The shop name
+  and the bot on/off control stay on every tab
+- The look is bold, not soft: a deep warm charcoal page, a warm gold
+  accent, today's money huge up front, strong type, a greeting that
+  knows the time of day. The people waiting are real people: a big
+  name, their words as a quote, a call button that leads
+- When the bot is off because no WhatsApp number is connected, the page
+  says so plainly and says what to do next (ask Aditya to connect the
+  number), instead of a dead "Bot is OFF" with nowhere to go
 
 **v1.1 — dashboard redesign, owner booking ping, outbox on disk**
 - Webhook signature verification (`whatsapp_studio/security.py`): when
@@ -245,7 +285,6 @@ each is on at startup. `GET /webhook` (Meta's verification) and
 **Roadmap**
 - v0.4b: owner ping on WhatsApp when a handoff opens (needs a template
   message + Meta approval)
-- Optional LLM replies (pluggable, off by default — costs money, so opt-in)
 - Multi-business: one install serving many shops, each with its own profile
 - Admin onboarding: business fills a form, gets a working receptionist
 
