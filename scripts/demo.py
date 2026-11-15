@@ -35,6 +35,83 @@ class FakeSender:
         return f"wamid.demo.{len(self.calls)}"
 
 
+class DemoLLM:
+    """A canned model for the demo: it calls the booking and handoff
+    tools the way the real model would, then answers in words from
+    what the tool said. No key, no network, so the demo runs offline."""
+
+    def chat(self, messages, tools=None):
+        # The Studio feeds the tool result back as a "tool" message;
+        # answer from it, so a refused booking is refused in words too.
+        last = messages[-1]
+        if last["role"] == "tool":
+            result = json.loads(last["content"])
+            if result.get("ok"):
+                if "booking" in result:
+                    booking = result["booking"]
+                    return {
+                        "content": (
+                            f"Done! Your {booking['service']} is booked for "
+                            f"{booking['date']} at {booking['start']}."
+                        ),
+                        "tool_calls": [],
+                    }
+                if result.get("handoff"):
+                    return {
+                        "content": (
+                            "I've passed this to the team. They will reply "
+                            "here within 30 minutes."
+                        ),
+                        "tool_calls": [],
+                    }
+                return {"content": "Done!", "tool_calls": []}
+            error = result.get("error", "")
+            if error == "already taken":
+                alts = ", ".join(result.get("alternatives", [])[:3])
+                return {
+                    "content": (
+                        "Sorry, that time is already taken. "
+                        f"Free slots nearby: {alts}."
+                    ),
+                    "tool_calls": [],
+                }
+            return {
+                "content": f"Sorry, I could not do that ({error}).",
+                "tool_calls": [],
+            }
+        text = messages[-1]["content"].lower()
+        if "person" in text:
+            return {
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "name": "hand_over",
+                        "arguments": {"reason": "asked for a person"},
+                    }
+                ],
+            }
+        if "book" in text:
+            return {
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "name": "create_booking",
+                        "arguments": {
+                            "service": "Haircut",
+                            "day": "tomorrow",
+                            "time": "11am",
+                        },
+                    }
+                ],
+            }
+        return {
+            "content": "Facial is Rs 1499 for 60 minutes. How can I help?",
+            "tool_calls": [],
+        }
+
+
 def main():
     profile = BusinessProfile.from_json(ROOT / "demo" / "demo_business.json")
     with tempfile.TemporaryDirectory() as tmp:
@@ -42,7 +119,7 @@ def main():
         sender = FakeSender()
         studio = Studio(
             profile, store, bookings=BookingStore(), handoffs=HandoffStore(),
-            sender=sender,
+            sender=sender, llm=DemoLLM(),
         )
         print(f"sending state: {studio.sending_state()} (fake sender, no token)")
         httpd = make_server(studio, port=0)
@@ -60,22 +137,23 @@ def main():
             with urllib.request.urlopen(req) as resp:
                 print("webhook ->", resp.status, resp.read().decode())
             print()
-            # A booking, sent straight to the app: Priya books a haircut
-            # for tomorrow at 11am, then tries the same slot again.
+            # Priya already booked through the webhook above, so
+            # booking the same slot again says it is already hers.
+            # Asha tries the same slot and is refused with alternatives.
             reply = studio.handle_message(
                 "919810000002", "book haircut tomorrow 11am", "Priya"
             )
-            print(f"--- reply to {reply['to']} (intent: {reply['intent']}) ---")
+            print(f"--- reply to {reply['to']} ---")
             print(reply["body"])
             print()
             reply = studio.handle_message(
                 "919810000003", "book haircut tomorrow 11am", "Asha"
             )
-            print(f"--- reply to {reply['to']} (intent: {reply['intent']}) ---")
+            print(f"--- reply to {reply['to']} ---")
             print(reply["body"])
             print()
             for entry in studio.outbox[:2]:
-                print(f"--- reply to {entry['to']} (intent: {entry['intent']}) ---")
+                print(f"--- reply to {entry['to']} ---")
                 print(entry["body"])
                 print()
             # A handoff: Meera asks for a person, then a follow-up that
@@ -83,7 +161,7 @@ def main():
             reply = studio.handle_message(
                 "919810000004", "can I talk to a person please", "Meera"
             )
-            print(f"--- reply to {reply['to']} (intent: {reply['intent']}) ---")
+            print(f"--- reply to {reply['to']} ---")
             print(reply["body"])
             print()
             paused = studio.handle_message(
@@ -109,9 +187,10 @@ def main():
                 leads = json.loads(resp.read())["leads"]
             print(f"leads captured: {len(leads)}")
             for lead in leads:
+                last = lead["messages"][-1]["text"] if lead["messages"] else ""
                 print(
                     f"  {lead['phone']} ({lead.get('name') or 'unknown'}): "
-                    f"{lead['message_count']} msg, intents={lead['intents']}"
+                    f"{lead['message_count']} msg, last: {last[:60]}"
                 )
             # Live sending, with the fake sender: every reply above was
             # "sent" on a daemon thread, so wait for the outcomes and
@@ -121,10 +200,7 @@ def main():
             for entry in studio.outbox:
                 outcome = entry.get("send_status") or "recorded"
                 detail = entry.get("wamid") or entry.get("send_error") or ""
-                print(
-                    f"  to {entry['to']} ({entry.get('intent') or '—'}): "
-                    f"{outcome} {detail}"
-                )
+                print(f"  to {entry['to']}: {outcome} {detail}")
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as resp:
                 health = json.loads(resp.read())
             print(f"health: live={health['live']} sending={health['sending']}")
