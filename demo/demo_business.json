@@ -13,7 +13,8 @@
       "description": "Haircut and styling",
       "duration_min": 30,
       "name": "Haircut",
-      "price": 499
+      "price": 499,
+      "floor_price": 400
     },
     {
       "description": "Signature glow facial",
