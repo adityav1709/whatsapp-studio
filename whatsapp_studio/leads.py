@@ -51,8 +51,10 @@ class LeadStore:
         with self._save_lock:
             _atomic_write(self.path, json.dumps(self._leads, indent=2))
 
-    def record_message(self, phone, text, intent, sender_name="", wamid=None):
-        now = int(time.time())
+    def record_message(self, phone, text, intent, sender_name="", wamid=None, ts=None):
+        # The demo seeder passes ts so the sample day lands at the right
+        # times; a real message always stamps now.
+        now = ts if ts is not None else int(time.time())
         lead = self._leads.get(phone)
         if lead is None:
             lead = {

@@ -44,6 +44,7 @@ from .bookings import (
     parse_time,
     validate_slot,
 )
+from .demo_data import seed_demo_data
 from .handoffs import HandoffStore, age_text
 from .llm import (
     LLM_TOOLS,
@@ -127,7 +128,7 @@ def handoff_confirmation(profile, reason, now=None):
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, llm=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, llm=None, demo_mode=None):
         self.profile = profile
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
@@ -137,6 +138,11 @@ class Studio:
         # The brain. None means no key is set and the bot cannot reply;
         # run.py builds it from the environment, tests pass a fake.
         self.llm = llm
+        # Demo showcase: off by default. With DEMO_MODE=1 the page
+        # shows the bot on with sample customers, so a visitor sees
+        # the product at work instead of an empty page. A real install
+        # keeps saying plainly when it has no key or number.
+        self.demo_mode = demo_mode if demo_mode is not None else os.environ.get("DEMO_MODE") == "1"
         # The handoff the hand_over tool opened during this reply, if
         # any, so the reply entry can carry its id.
         self._last_handoff = None
@@ -163,6 +169,12 @@ class Studio:
         self._outbox_path = Path(outbox_path) if outbox_path else None
         self._outbox_lock = threading.Lock()
         self.outbox = self._load_outbox()
+        # A dead empty page attracts nobody. In demo mode, and only
+        # when the stores are empty, seed the sample day at boot so
+        # the dashboard shows the bot at work. Real data is never
+        # touched: the seeder refuses when anything is already there.
+        if self.demo_mode:
+            seed_demo_data(self)
 
     def _load_outbox(self):
         if self._outbox_path is None or not self._outbox_path.exists():
@@ -864,11 +876,17 @@ class Studio:
         failed. Conversation is the full WhatsApp style thread for each
         waiting person.
 
-        The look is bold, not soft: a deep warm charcoal page, a warm
-        gold accent, the money huge up front, because that is what the
-        owner cares about most. Type does the work, weight and size,
-        not a row of identical cards. The labels the tests assert on
-        are kept verbatim. No dash of any kind in the copy here."""
+        The look follows the Ellipsus standard: paper and ink, charcoal
+        and warm off white fields, one gold accent, Fraunces serif
+        headlines at weight 400 with Inter for body and UI, pill
+        buttons, flat cards, tall quiet spacing. The money stays huge
+        up front, because that is what the owner cares about most.
+        Motion is CSS only, the page carries no script: a soft fade
+        on load, sections fading in as they enter where the browser
+        supports it, the greeting typing itself out, near invisible
+        hovers, and nothing moves for reduced motion. The labels the
+        tests assert on are kept verbatim. No dash of any kind in the
+        copy here."""
         from .bookings import format_date, format_time
 
         tabs = ("today", "bookings", "customers", "replies", "conversation")
@@ -950,6 +968,19 @@ class Studio:
                 "<button type='submit' class='primary'>Stop sending</button></form>"
             )
             bot_class = "bot"
+        elif self.demo_mode:
+            # The showcase: the bot reads as on, with a clear Demo
+            # label and a sample data note, so a visitor sees the
+            # product alive and nobody mistakes samples for real
+            # customers. Nothing here is sent to a real phone.
+            bot_block = (
+                "<p><span class='pill on'>Bot is ON</span> "
+                "<span class='pill idle'>Demo</span> "
+                "Bot is ON. This is a demo with sample customers, so "
+                "replies are shown here and nothing is sent to a real phone.</p>"
+                "<p class='quiet'>Sample data. These people are not real customers.</p>"
+            )
+            bot_class = "bot"
         elif state == "paused":
             bot_block = (
                 "<p><span class='pill off'>Sending: PAUSED</span> "
@@ -980,9 +1011,14 @@ class Studio:
 
         # No key, no brain: say so plainly at the top, so the owner
         # never thinks the bot is answering when it cannot reply.
+        # Demo mode hides this on purpose: the showcase runs on
+        # sample data with the bot reading as on, and a real install
+        # without a key still says so.
         key_notice = ""
         warmline = "The bot is answering your customers. You only step in when you want to."
-        if self.llm is None:
+        if self.demo_mode:
+            warmline = "Take a look around. These are sample chats, so you can see how the bot talks to customers."
+        elif self.llm is None:
             key_notice = (
                 "<section class='alerts'><p class='alerttitle'>The bot needs an LLM key</p>"
                 "<p class='alertline'>No key is set, so the bot cannot reply to customers. "
@@ -1028,7 +1064,7 @@ class Studio:
                 "</section>"
             ).format("".join(alert_lines))
 
-        avatar_colors = ["#1f6a44", "#c05f33", "#a67c2e", "#7a5a3a"]
+        avatar_colors = ["#292A2E", "#4a4a44", "#6b6558", "#8a7f6a"]
 
         def handoff_card(handoff):
             digits = "".join(c for c in handoff["phone"] if c.isdigit())
@@ -1316,92 +1352,101 @@ class Studio:
             "for a person, you can reply to them here.</p>"
         )
 
-        css = (
-            "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',"
-            "Roboto,Helvetica,Arial,sans-serif;font-size:17px;line-height:1.55;"
-            "color:#f5efe6;background:#211a13}"
-            ".wrap{max-width:720px;margin:0 auto;padding:0 0 64px}"
-            "header{padding:30px 20px 8px}"
-            "h1{font-size:34px;line-height:1.08;margin:0;font-weight:800;"
-            "letter-spacing:-.02em;color:#fdf8ef}"
-            ".dateline{color:#a89880;font-size:15px;margin:10px 0 0}"
-            ".greeting{color:#e8c96a;font-size:20px;font-weight:700;margin:16px 0 0}"
-            ".warmline{font-size:17px;color:#d8cbb6;margin:10px 0 0;line-height:1.5}"
-            ".tabs{display:flex;gap:8px;overflow-x:auto;padding:20px 20px 4px}"
-            ".tabs a{flex-shrink:0;padding:10px 18px;border-radius:999px;"
-            "background:#2e251b;color:#cbbfa8;text-decoration:none;font-weight:700;font-size:15px}"
-            ".tabs a.active{background:#e8c96a;color:#211a13}"
-            ".hero{margin:18px 20px 22px;padding:26px 24px;background:#2a2118;"
-            "border-left:5px solid #e8c96a;border-radius:6px}"
-            ".hero .today{font-size:18px;line-height:1.5;color:#f5efe6;margin:0 0 18px}"
-            ".hero .money{font-size:68px;line-height:1;font-weight:800;"
-            "letter-spacing:-.03em;color:#e8c96a;margin:0}"
-            ".hero .moneylbl{color:#cbbfa8;font-size:16px;margin:12px 0 0}"
-            ".nums{display:flex;gap:22px;margin:0 20px 22px}"
-            ".num .big{display:block;font-size:36px;font-weight:800;color:#fdf8ef;line-height:1.1}"
-            ".num .lbl{font-size:13px;color:#a89880}"
-            ".bot{background:#fdf8ef;border-radius:8px;padding:20px 22px;margin:0 20px 22px;color:#3a2f26}"
-            ".bot p{margin:0 0 10px;color:#3a2f26}.bot p:last-child{margin-bottom:0}"
-            ".bot.loud p{font-size:18px;font-weight:700;color:#a34a24}"
-            ".pill{display:inline-block;padding:5px 14px;border-radius:999px;font-weight:700;font-size:14px}"
-            ".pill.on{background:#d9ecdf;color:#1f6a44}"
-            ".pill.off{background:#fbe4da;color:#a34a24}"
-            ".pill.idle{background:#f0e8d8;color:#7a6a58}"
-            ".alerts{background:#4a2318;border-radius:8px;padding:18px 20px;margin:0 20px 22px}"
-            ".alerttitle{font-size:19px;font-weight:800;color:#f5d5c8;margin:0 0 8px}"
-            ".alertline{color:#f5d5c8;font-weight:600;font-size:17px;margin:10px 0}"
-            ".alertline a{color:#ffd9a8;font-weight:700}"
-            "h2{font-size:22px;margin:28px 20px 12px;color:#fdf8ef;font-weight:800;letter-spacing:-.01em}"
-            ".tag{font-size:13px;color:#a89880;font-weight:400}"
-            ".card{background:#fdf8ef;border-radius:8px;padding:22px;margin:14px 20px;color:#3a2f26;"
-            "border-left:5px solid #e8c96a;box-shadow:0 2px 12px rgba(0,0,0,.25)}"
-            ".card.urgent{border-left-color:#c05f33}"
-            ".whorow{display:flex;align-items:center;gap:14px}"
-            ".avatar{width:54px;height:54px;border-radius:50%;display:inline-flex;"
-            "align-items:center;justify-content:center;font-size:26px;font-weight:800;color:#fff;flex-shrink:0}"
-            ".who{font-size:23px;font-weight:800;color:#2c2118;line-height:1.2}"
-            ".phone{color:#96836c;font-size:14px;margin-top:2px}"
-            ".meta{color:#96836c;font-size:14px;margin:8px 0}"
-            ".quote{font-size:19px;line-height:1.45;font-style:italic;color:#2c2118;margin:12px 0}"
-            ".latest{font-size:16px;color:#5c4f42;margin:8px 0}"
-            ".latest span{font-weight:700;color:#a34a24}"
-            ".urgent{color:#a34a24;font-weight:700;margin:8px 0}"
-            ".call{display:block;text-align:center;background:#1f6a44;color:#fff;"
-            "padding:14px 20px;border-radius:8px;font-weight:700;font-size:17px;"
-            "text-decoration:none;margin:18px 0 0}"
-            ".thread{background:#f3ecdd;border-radius:8px;padding:14px;margin:14px 20px;"
-            "display:flex;flex-direction:column;gap:6px}"
-            ".threadtitle{font-size:16px;font-weight:800;color:#5c4f42;margin:0 0 6px}"
-            ".msg{max-width:82%;border-radius:12px;padding:10px 12px}"
-            ".msg p{margin:0;font-size:16px;line-height:1.45;overflow-wrap:break-word;color:#3a2f26}"
-            ".msg.in{align-self:flex-start;background:#fffdf8;border-bottom-left-radius:4px}"
-            ".msg.out{align-self:flex-end;background:#d9ecdf;border-bottom-right-radius:4px}"
-            ".mtime{display:block;text-align:right;font-size:12px;color:#96836c;margin-top:4px}"
-            ".allclear{font-size:20px;color:#e8c96a;font-weight:800;margin:0 20px}"
-            ".quiet{color:#a89880;font-size:14px}"
-            ".insight{font-size:17px;color:#f5efe6;margin:12px 20px}"
-            ".list{list-style:none;padding:0;margin:0 20px}"
-            ".list li{background:#fdf8ef;border-radius:8px;padding:14px 16px;margin:10px 0;color:#3a2f26}"
-            ".list li.failed{background:#fdf3ee}"
-            ".err{color:#a34a24}"
-            ".replybox{background:#f8f1e3;border-radius:8px;padding:14px 16px;margin-top:16px}"
-            ".replybox .quiet{margin:0 0 4px;color:#96836c}"
-            "button{min-height:48px;padding:12px 22px;font-size:16px;font-weight:700;"
-            "border-radius:8px;border:0;background:#1f6a44;color:#fff;cursor:pointer;font-family:inherit}"
-            "button.primary{width:100%;margin-top:12px;background:#e8c96a;color:#211a13}"
-            "button.soft{width:100%;min-height:44px;background:#e8dcc8;color:#5c4f42;font-size:15px;margin-top:8px}"
-            "button.ghost{width:100%;min-height:44px;background:transparent;color:#5c4f42;"
-            "border:1px solid #cbbfa8;font-size:15px;margin-top:8px}"
-            "button.resolve{width:100%;min-height:46px;background:#f3ead9;color:#5c4f42;font-size:15px;margin-top:14px}"
-            "input[type=text]{width:100%;box-sizing:border-box;min-height:46px;"
-            "padding:11px 14px;font-size:16px;border:1px solid #e5d9c3;border-radius:8px;"
-            "margin:8px 0;background:#fffdf8;color:#3a2f26}"
-            "a{color:#e8c96a}"
-            ".card a,.list a,.bot a{color:#1f6a44}"
-            ".foot{margin:32px 20px 0;color:#a89880;font-size:14px}"
-            ".foot a{color:#e8c96a}"
-            "@media (max-width:480px){.hero .money{font-size:54px}.num .big{font-size:30px}}"
-        )
+        css = """
+        :root{--ink:#292A2E;--paper:#F4F4F2;--sage:#E5E5E1;--gold:#E8C96A;
+        --goldpale:#F5EBCB;--grey:#6b6b66;--serif:'Fraunces',Georgia,'Times New Roman',serif;
+        --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+        body{margin:0;font-family:var(--sans);font-size:18px;line-height:1.6;color:var(--ink);background:var(--paper)}
+        .wrap{max-width:960px;margin:0 auto;padding:0 0 80px}
+        header{padding:56px 24px 24px;animation:fadeUp .6s ease both}
+        h1{font-family:var(--serif);font-size:56px;line-height:1.05;margin:0;font-weight:400;letter-spacing:-.01em;color:var(--ink)}
+        .dateline{color:var(--grey);font-size:15px;margin:12px 0 0}
+        .greeting{font-family:var(--serif);font-style:italic;font-size:28px;font-weight:400;margin:20px 0 0;color:var(--ink)}
+        .greeting .type{display:inline-block;overflow:hidden;white-space:nowrap;vertical-align:bottom;max-width:0;animation:typeIn 1.1s steps(16) .35s forwards}
+        .greeting .type::after{content:"";display:inline-block;width:2px;height:1em;background:var(--gold);margin-left:3px;vertical-align:-.1em;animation:caret 2.4s steps(1) .35s forwards}
+        .warmline{font-size:18px;color:#4a4a44;margin:12px 0 0;line-height:1.6;max-width:700px}
+        .tabs{display:flex;gap:10px;overflow-x:auto;padding:28px 24px 8px;animation:fadeUp .6s ease .08s both}
+        .tabs a{flex-shrink:0;padding:11px 20px;border-radius:999px;border:1px solid var(--ink);background:transparent;color:var(--ink);text-decoration:none;font-weight:500;font-size:15px;transition:background .18s ease}
+        .tabs a.active{background:var(--ink);color:var(--paper)}
+        .tabs a:hover{background:var(--sage)}
+        .tabs a.active:hover{background:var(--ink)}
+        .hero{margin:24px;padding:56px 32px;background:var(--ink);border-radius:20px;color:var(--paper);animation:fadeUp .6s ease .14s both}
+        .hero .today{font-family:var(--serif);font-size:24px;line-height:1.4;color:var(--paper);margin:0 0 20px}
+        .hero .money{font-family:var(--serif);font-size:88px;line-height:1;font-weight:400;letter-spacing:-.02em;color:var(--gold);margin:0}
+        .hero .moneylbl{color:#C9C9C2;font-size:15px;margin:14px 0 0}
+        .nums{display:flex;gap:32px;margin:0 24px 32px}
+        .num .big{display:block;font-family:var(--serif);font-size:40px;font-weight:400;color:var(--ink);line-height:1.1}
+        .num .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--grey)}
+        .bot{background:#fff;border:1px solid var(--sage);border-radius:20px;padding:28px 32px;margin:0 24px 32px;color:var(--ink);animation:fadeUp .6s ease .2s both}
+        .bot p{margin:0 0 10px;color:var(--ink);max-width:700px}
+        .bot p:last-child{margin-bottom:0}
+        .bot.loud p{font-size:20px;font-weight:500}
+        .pill{display:inline-block;padding:6px 14px;border-radius:999px;font-weight:500;font-size:14px}
+        .pill.on{background:var(--gold);color:var(--ink)}
+        .pill.off{background:var(--sage);color:var(--ink)}
+        .pill.idle{background:transparent;border:1px solid #C9C9C2;color:var(--grey)}
+        .alerts{background:var(--ink);border-radius:20px;padding:28px 32px;margin:0 24px 32px}
+        .alerttitle{font-family:var(--serif);font-size:28px;font-weight:400;color:var(--paper);margin:0 0 8px}
+        .alertline{color:#E5E5E1;font-weight:500;font-size:17px;margin:10px 0;max-width:700px}
+        .alertline a{color:var(--gold);font-weight:500}
+        h2{font-family:var(--serif);font-size:34px;margin:48px 24px 16px;color:var(--ink);font-weight:400;letter-spacing:-.01em;line-height:1.1}
+        h2::after{content:"";display:block;width:56px;height:3px;background:var(--gold);border-radius:3px;margin-top:10px;transform:rotate(-1deg)}
+        .tag{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--grey);font-weight:500}
+        .card{background:#fff;border:1px solid var(--sage);border-radius:18px;padding:28px;margin:16px 24px;color:var(--ink);transition:border-color .18s ease}
+        .card:hover{border-color:#C9C9C2}
+        .card.urgent{border-color:var(--gold)}
+        .whorow{display:flex;align-items:center;gap:14px}
+        .avatar{width:54px;height:54px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:26px;font-weight:500;color:#fff;flex-shrink:0}
+        .who{font-family:var(--serif);font-size:24px;font-weight:400;color:var(--ink);line-height:1.2}
+        .phone{color:var(--grey);font-size:14px;margin-top:2px}
+        .meta{color:var(--grey);font-size:14px;margin:8px 0}
+        .quote{font-family:var(--serif);font-style:italic;font-size:20px;line-height:1.5;color:var(--ink);margin:12px 0;max-width:700px}
+        .latest{font-size:16px;color:#4a4a44;margin:8px 0;max-width:700px}
+        .latest span{font-weight:500;text-transform:uppercase;font-size:12px;letter-spacing:.08em;color:var(--ink)}
+        .urgent{color:var(--ink);font-weight:500;margin:8px 0;text-decoration:underline wavy var(--gold) 2px;text-underline-offset:4px}
+        .call{display:block;text-align:center;background:var(--ink);color:var(--paper);padding:14px 20px;border-radius:999px;font-weight:500;font-size:17px;text-decoration:none;margin:18px 0 0;transition:background .18s ease}
+        .call:hover{background:#3a3a3e}
+        .thread{background:var(--sage);border-radius:18px;padding:16px;margin:16px 24px;display:flex;flex-direction:column;gap:8px;max-width:760px}
+        .threadtitle{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:500;color:var(--grey);margin:0 0 6px}
+        .msg{max-width:82%;border-radius:16px;padding:12px 14px}
+        .msg p{margin:0;font-size:16px;line-height:1.5;overflow-wrap:break-word;color:var(--ink)}
+        .msg.in{align-self:flex-start;background:#fff;border-bottom-left-radius:4px}
+        .msg.out{align-self:flex-end;background:var(--goldpale);border-bottom-right-radius:4px}
+        .mtime{display:block;text-align:right;font-size:12px;color:var(--grey);margin-top:4px}
+        .allclear{font-family:var(--serif);font-size:24px;font-weight:400;color:var(--ink);margin:0 24px}
+        .quiet{color:var(--grey);font-size:14px}
+        .insight{font-size:17px;color:var(--ink);margin:16px 24px;max-width:700px}
+        .list{list-style:none;padding:0;margin:0 24px}
+        .list li{background:#fff;border:1px solid var(--sage);border-radius:14px;padding:16px 18px;margin:10px 0;color:var(--ink)}
+        .list li.failed{background:var(--goldpale)}
+        .err{color:var(--ink);font-weight:500}
+        .replybox{background:var(--paper);border-radius:14px;padding:16px;margin-top:16px}
+        .replybox .quiet{margin:0 0 4px;color:var(--grey)}
+        button{min-height:44px;padding:12px 24px;font-size:16px;font-weight:500;border-radius:999px;border:0;background:var(--ink);color:var(--paper);cursor:pointer;font-family:inherit;transition:background .18s ease,border-color .18s ease}
+        button:hover{background:#3a3a3e}
+        button.primary{width:100%;margin-top:12px;background:var(--gold);color:var(--ink)}
+        button.primary:hover{background:#DDBB55}
+        button.soft{width:100%;min-height:44px;background:var(--sage);color:var(--ink);font-size:15px;margin-top:8px}
+        button.soft:hover{background:#DCDCD4}
+        button.ghost{width:100%;min-height:44px;background:transparent;color:var(--ink);border:1px solid var(--ink);font-size:15px;margin-top:8px}
+        button.ghost:hover{background:var(--paper)}
+        button.resolve{width:100%;min-height:44px;background:var(--paper);color:var(--ink);font-size:15px;margin-top:14px;border:1px solid var(--sage)}
+        button.resolve:hover{border-color:#C9C9C2}
+        input[type=text]{width:100%;box-sizing:border-box;min-height:46px;padding:11px 14px;font-size:16px;border:1px solid #D8D8D2;border-radius:14px;margin:8px 0;background:#fff;color:var(--ink)}
+        a{color:var(--ink);text-decoration:underline;text-decoration-color:var(--gold);text-underline-offset:3px}
+        a:hover{text-decoration-thickness:2px}
+        .hero a,.alerts a{color:var(--gold)}
+        .card a,.list a,.bot a{color:var(--ink)}
+        .foot{margin:40px 24px 0;color:var(--grey);font-size:14px}
+        .foot a{color:var(--ink)}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+        @keyframes typeIn{to{max-width:24ch}}
+        @keyframes caret{0%{opacity:1}40%{opacity:0}55%{opacity:1}90%{opacity:0}100%{opacity:0}}
+        @supports (animation-timeline:view()){.card,.list li,.thread,h2,.nums,.alerts,.insight,.allclear{animation:fadeUp .6s ease both;animation-timeline:view();animation-range:entry 0% entry 50%}}
+        @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}.greeting .type{max-width:none!important}.greeting .type::after{display:none}}
+        @media (max-width:480px){h1{font-size:40px}header{padding:40px 20px 16px}.hero{padding:40px 24px;margin:16px}.hero .money{font-size:64px}.hero .today{font-size:20px}.num .big{font-size:32px}.nums{gap:20px}.card{padding:22px}.bot{padding:22px 24px}h2{font-size:28px}}
+        """
+
         # With no priced bookings this week the money part would read
         # "Rs 0", a number nobody set. Leave it off instead.
         week_line = "This week: {} bookings.".format(len(week_bookings))
@@ -1480,11 +1525,14 @@ class Studio:
         return (
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<link rel='preconnect' href='https://fonts.googleapis.com'>"
+            "<link rel='preconnect' href='https://fonts.gstatic.com' crossorigin>"
+            "<link href='https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;1,9..144,400&family=Inter:wght@400;500&display=swap' rel='stylesheet'>"
             "<title>{} | WhatsApp Studio</title><style>{}</style></head><body>"
             "<div class='wrap'>"
             "<header><h1>{}</h1>"
             "<p class='dateline'>{}</p>"
-            "<p class='greeting'>{}</p>"
+            "<p class='greeting'><span class='type'>{}</span></p>"
             "<p class='warmline'>{}</p></header>"
             "{}"
             "{}"

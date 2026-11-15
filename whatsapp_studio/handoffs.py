@@ -69,7 +69,7 @@ class HandoffStore:
         with self._save_lock:
             _atomic_write(self.path, json.dumps(self._handoffs, indent=2))
 
-    def open(self, phone, name, reason, trigger_message):
+    def open(self, phone, name, reason, trigger_message, opened_at=None):
         """Open a handoff, or return the open one if there already is one."""
         existing = self.open_for(phone)
         if existing is not None:
@@ -80,7 +80,7 @@ class HandoffStore:
             "name": name or "",
             "reason": reason,
             "trigger": trigger_message,
-            "opened_at": int(time.time()),
+            "opened_at": opened_at if opened_at is not None else int(time.time()),
             "resolved_at": None,
             "status": "open",
         }

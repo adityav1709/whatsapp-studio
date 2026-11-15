@@ -7,7 +7,9 @@ Env:    PORT (default 8000), HOST (default 127.0.0.1; set 0.0.0.0 when
         point it at a prospect's own profile JSON to serve their shop),
         LLM_API_KEY or OPENAI_API_KEY (required: without a key the bot
         records messages and replies to nobody), LLM_MODEL (default
-        gpt-4o-mini)
+        gpt-4o-mini), DEMO_MODE=1 (showcase: the bot reads as on with
+        sample customers on empty stores; off by default, a real
+        install with no key still says so plainly)
 """
 from __future__ import annotations
 
@@ -45,6 +47,8 @@ def main():
         print(f"LLM: on (model {studio.llm.model}).")
     else:
         print("LLM: OFF, no LLM_API_KEY or OPENAI_API_KEY set. The bot cannot reply.")
+    if studio.demo_mode:
+        print("DEMO_MODE=1: sample customers seeded on empty stores, bot shows ON.")
     if studio.live:
         print("Live mode — replies will be sent on WhatsApp.")
     elif studio.dry_run:
