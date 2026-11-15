@@ -8,11 +8,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from whatsapp_studio.app import Studio
+from test_llm import C, ScriptedLLM, T
+from whatsapp_studio.app import Studio, handoff_confirmation
 from whatsapp_studio.bookings import IST, BookingStore, india_now, india_today
 from whatsapp_studio.config import BusinessProfile, Service
 from whatsapp_studio.leads import LeadStore
-from whatsapp_studio.replies import handoff_confirmation
 
 
 def _profile():
@@ -27,6 +27,23 @@ def _profile():
     )
 
 
+def _studio(tmp):
+    return Studio(
+        _profile(),
+        LeadStore(Path(tmp) / "leads.json"),
+        bookings=BookingStore(),
+        llm=ScriptedLLM(
+            [
+                T(
+                    "create_booking",
+                    {"service": "Haircut", "day": "tomorrow", "time": "11am"},
+                ),
+                C("Done! Your Haircut is booked for tomorrow at 11:00 AM."),
+            ]
+        ),
+    )
+
+
 class TestIndiaTime(unittest.TestCase):
     def test_ist_is_fixed_plus_530(self):
         self.assertEqual(india_now().utcoffset(), timedelta(hours=5, minutes=30))
@@ -37,11 +54,7 @@ class TestIndiaTime(unittest.TestCase):
         # server-clock "tomorrow" would be the wrong day.
         tmp = tempfile.TemporaryDirectory()
         try:
-            studio = Studio(
-                _profile(),
-                LeadStore(Path(tmp.name) / "leads.json"),
-                bookings=BookingStore(),
-            )
+            studio = _studio(tmp.name)
             now = datetime(2026, 11, 16, 0, 30, tzinfo=IST)
             reply = studio.handle_message(
                 "919810000001", "book haircut tomorrow 11am", "Rahul", now=now
@@ -56,11 +69,7 @@ class TestIndiaTime(unittest.TestCase):
         # 23:30 IST on Sun 15 Nov: "tomorrow" is Mon 16 Nov, not Tue.
         tmp = tempfile.TemporaryDirectory()
         try:
-            studio = Studio(
-                _profile(),
-                LeadStore(Path(tmp.name) / "leads.json"),
-                bookings=BookingStore(),
-            )
+            studio = _studio(tmp.name)
             now = datetime(2026, 11, 15, 23, 30, tzinfo=IST)
             studio.handle_message(
                 "919810000001", "book haircut tomorrow 11am", "Rahul", now=now

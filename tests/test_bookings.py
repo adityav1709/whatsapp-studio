@@ -3,6 +3,7 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 
+from test_llm import C, ScriptedLLM, T
 from whatsapp_studio.app import Studio
 from whatsapp_studio.bookings import (
     BookingStore,
@@ -202,6 +203,12 @@ class TestValidateSlot(unittest.TestCase):
 
 
 class TestBookingFlow(unittest.TestCase):
+    """Booking through the model: it calls the create_booking tool,
+    the tool validates the slot in code, and the model's words are
+    what the customer reads. The refusal tests script the model
+    echoing the tool's refusal, so the assertion that matters is
+    the booking count: the tool, not the words, decides."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         profile = _profile()
@@ -209,12 +216,26 @@ class TestBookingFlow(unittest.TestCase):
             profile,
             LeadStore(Path(self.tmp.name) / "leads.json"),
             bookings=BookingStore(),
+            llm=ScriptedLLM([]),
         )
 
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _script(self, *turns):
+        self.studio.llm = ScriptedLLM(list(turns))
+
+    def _book(self, service, day, time, reply_text):
+        return [
+            T("create_booking", {"service": service, "day": day, "time": time}),
+            C(reply_text),
+        ]
+
     def test_book_with_day_and_time(self):
+        self._script(*self._book(
+            "Haircut", "tomorrow", "11am",
+            "Done! Your Haircut is booked for tomorrow at 11:00 AM.",
+        ))
         reply = self.studio.handle_message(
             "919810000001", "book haircut tomorrow 11am", "Rahul"
         )["body"]
@@ -224,6 +245,17 @@ class TestBookingFlow(unittest.TestCase):
         self.assertEqual(len(self.studio.bookings.all_bookings()), 1)
 
     def test_book_same_slot_twice_offers_alternatives(self):
+        self._script(
+            *self._book(
+                "Haircut", "tomorrow", "11am",
+                "Done! Your Haircut is booked for tomorrow at 11:00 AM.",
+            ),
+            *self._book(
+                "Haircut", "tomorrow", "11am",
+                "Sorry, 11:00 AM tomorrow is already taken. "
+                "Free slots nearby: 10:30 AM, 11:30 AM.",
+            ),
+        )
         self.studio.handle_message("919810000001", "book haircut tomorrow 11am", "Rahul")
         reply = self.studio.handle_message(
             "919810000002", "book haircut tomorrow 11am", "Priya"
@@ -234,6 +266,10 @@ class TestBookingFlow(unittest.TestCase):
         self.assertEqual(len(self.studio.bookings.all_bookings()), 1)
 
     def test_book_without_time_lists_slots(self):
+        self._script(
+            T("check_availability", {"service": "Haircut", "day": "tomorrow"}),
+            C("Free slots tomorrow: 10:00 AM, 10:30 AM, 11:00 AM, 11:30 AM."),
+        )
         reply = self.studio.handle_message(
             "919810000001", "book haircut tomorrow", "Rahul"
         )["body"]
@@ -241,10 +277,15 @@ class TestBookingFlow(unittest.TestCase):
         self.assertIn("10:00 AM", reply)
 
     def test_book_without_service_asks_which(self):
+        self._script(C("Which service would you like?"))
         reply = self.studio.handle_message("919810000001", "i want to book")["body"]
         self.assertIn("Which service", reply)
 
     def test_3am_booking_refused(self):
+        self._script(*self._book(
+            "Haircut", "tomorrow", "3am",
+            "Sorry, 3:00 AM is outside our hours. We are open 10:00 AM to 8:00 PM.",
+        ))
         reply = self.studio.handle_message(
             "919810000001", "book haircut tomorrow 3am", "Rahul"
         )["body"]
@@ -252,6 +293,10 @@ class TestBookingFlow(unittest.TestCase):
         self.assertEqual(len(self.studio.bookings.all_bookings()), 0)
 
     def test_9am_booking_refused(self):
+        self._script(*self._book(
+            "Haircut", "tomorrow", "9am",
+            "Sorry, 9:00 AM is outside our hours. We open at 10:00 AM.",
+        ))
         reply = self.studio.handle_message(
             "919810000001", "book haircut tomorrow 9am", "Rahul"
         )["body"]
@@ -259,6 +304,11 @@ class TestBookingFlow(unittest.TestCase):
         self.assertEqual(len(self.studio.bookings.all_bookings()), 0)
 
     def test_8pm_facial_refused(self):
+        self._script(*self._book(
+            "Facial", "tomorrow", "8pm",
+            "Sorry, 8:00 PM is outside our hours for a Facial. "
+            "We are open 10:00 AM to 8:00 PM.",
+        ))
         reply = self.studio.handle_message(
             "919810000001", "book facial tomorrow 8pm", "Rahul"
         )["body"]
@@ -266,6 +316,11 @@ class TestBookingFlow(unittest.TestCase):
         self.assertEqual(len(self.studio.bookings.all_bookings()), 0)
 
     def test_off_grid_booking_refused(self):
+        self._script(*self._book(
+            "Haircut", "tomorrow", "11:15am",
+            "Sorry, 11:15 AM is not a slot we offer. "
+            "Free slots nearby: 11:00 AM, 11:30 AM.",
+        ))
         reply = self.studio.handle_message(
             "919810000001", "book haircut tomorrow 11:15am", "Rahul"
         )["body"]
@@ -273,6 +328,10 @@ class TestBookingFlow(unittest.TestCase):
         self.assertEqual(len(self.studio.bookings.all_bookings()), 0)
 
     def test_12_baje_books_noon(self):
+        self._script(*self._book(
+            "Haircut", "tomorrow", "12 baje",
+            "Done! Your Haircut is booked for tomorrow at 12:00 PM.",
+        ))
         reply = self.studio.handle_message(
             "919810000001", "book haircut tomorrow 12 baje", "Rahul"
         )["body"]
@@ -280,6 +339,16 @@ class TestBookingFlow(unittest.TestCase):
         self.assertIn("12:00 PM", reply)
 
     def test_rebooking_your_own_slot_says_so(self):
+        self._script(
+            *self._book(
+                "Haircut", "tomorrow", "11am",
+                "Done! Your Haircut is booked for tomorrow at 11:00 AM.",
+            ),
+            *self._book(
+                "Haircut", "tomorrow", "11am",
+                "You already have a booking at that time.",
+            ),
+        )
         self.studio.handle_message("919810000001", "book haircut tomorrow 11am", "Rahul")
         reply = self.studio.handle_message(
             "919810000001", "book haircut tomorrow 11am", "Rahul"
@@ -289,6 +358,14 @@ class TestBookingFlow(unittest.TestCase):
 
     def test_closed_day_says_closed(self):
         self.studio.profile.hours = {"sun": "closed", "daily": "10:00 AM - 8:00 PM"}
+        self._script(
+            T("check_availability", {"service": "Haircut", "day": "sunday"}),
+            C("We are closed on Sunday."),
+            *self._book(
+                "Haircut", "sunday", "11am",
+                "Sorry, we are closed on Sunday.",
+            ),
+        )
         reply = self.studio.handle_message(
             "919810000001", "book haircut sunday", "Rahul"
         )["body"]
@@ -300,6 +377,14 @@ class TestBookingFlow(unittest.TestCase):
         self.assertEqual(len(self.studio.bookings.all_bookings()), 0)
 
     def test_cancel_flow(self):
+        self._script(
+            *self._book(
+                "Haircut", "tomorrow", "11am",
+                "Done! Your Haircut is booked for tomorrow at 11:00 AM.",
+            ),
+            T("cancel_booking", {}),
+            C("Your booking is cancelled."),
+        )
         self.studio.handle_message("919810000001", "book haircut tomorrow 11am", "Rahul")
         reply = self.studio.handle_message(
             "919810000001", "cancel my booking"
@@ -308,6 +393,10 @@ class TestBookingFlow(unittest.TestCase):
         self.assertEqual(len(self.studio.bookings.all_bookings()), 0)
 
     def test_cancel_with_nothing_booked(self):
+        self._script(
+            T("cancel_booking", {}),
+            C("I could not find a booking to cancel."),
+        )
         reply = self.studio.handle_message(
             "919810000001", "cancel my booking"
         )["body"]
@@ -319,7 +408,7 @@ class TestBookingFlow(unittest.TestCase):
         self.studio.bookings.book(
             "919810000001", "Rahul", _profile().services[0], india_today(), 16 * 60
         )
-        html = self.studio.dashboard_html()
+        html = self.studio.dashboard_html("bookings")
         self.assertIn("Bookings today", html)
         self.assertIn("Haircut", html)
         self.assertIn("4:00 PM", html)

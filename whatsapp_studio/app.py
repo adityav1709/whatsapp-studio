@@ -2,6 +2,12 @@
 
 Runs on the Python standard library only — no dependencies to install.
 
+The brain is an OpenAI language model, reached through
+whatsapp_studio/llm.py. The model talks to customers; the deterministic
+code here is the hands it calls as tools (price lookup, availability,
+booking). A key is required: without LLM_API_KEY or OPENAI_API_KEY the
+bot records the message and replies to nobody, and the dashboard says so.
+
 Demo mode: replies are generated and recorded in the outbox, NOT sent to
 Meta. Sending for real needs WHATSAPP_TOKEN and PHONE_NUMBER_ID set and
 the Meta WhatsApp Cloud API; see README.md.
@@ -27,30 +33,26 @@ from urllib.parse import parse_qs, urlparse
 from .bookings import (
     IST,
     BookingStore,
+    format_date,
+    format_time,
     has_relative_time,
     india_now,
     india_today,
+    is_closed,
     parse_day,
+    parse_hours_range,
     parse_time,
     validate_slot,
 )
 from .handoffs import HandoffStore, age_text
-from .intents import BOOKING, CANCEL, FALLBACK, HUMAN, PRICE, RESCHEDULE, detect_intent
-from .notify import notifier_from_env
-from .replies import (
-    booking_already_yours,
-    booking_ask_when,
-    booking_cancelled,
-    booking_confirmed,
-    booking_invalid_slot,
-    booking_none_to_cancel,
-    booking_none_to_reschedule,
-    booking_reschedule_ask,
-    booking_taken,
-    build_reply,
-    handoff_confirmation,
-    slots_available,
+from .llm import (
+    LLM_TOOLS,
+    MAX_LLM_CHARS,
+    MAX_TOOL_ROUNDS,
+    build_system_prompt,
+    openai_tool_calls,
 )
+from .notify import notifier_from_env
 from .security import check_basic_auth, verify_webhook_signature
 from .send import MAX_TEXT_CHARS, sender_from_env
 
@@ -74,16 +76,69 @@ def _atomic_write(path, text):
         raise
 
 
+def _is_open_now(profile, now):
+    hours_text = profile.hours_today(now.weekday())
+    if is_closed(hours_text):
+        return False
+    span = parse_hours_range(hours_text)
+    if span is None:
+        return True
+    open_min, close_min = span
+    current = now.hour * 60 + now.minute
+    return open_min <= current < close_min
+
+
+def handoff_confirmation(profile, reason, now=None):
+    """The one fixed message sent when a handoff opens and there is no
+    model to write it: the model failed, so the owner steps in.
+
+    During open hours it says who will reply and gives a real wait.
+    After hours it says plainly that the shop is closed and exactly
+    when they will hear back. Never a quick-reply promise."""
+    now = now or india_now()
+    if _is_open_now(profile, now):
+        lead = (
+            "I couldn't quite get that, so I've passed this to the team"
+            if reason == "couldn't reply"
+            else "I've passed this to the team"
+        )
+        return (
+            f"{lead} at {profile.name}. They will reply here within "
+            "30 minutes during working hours, and I've shared our chat "
+            "with them so you don't need to explain again."
+        )
+    span = parse_hours_range(profile.hours_today(now.weekday()))
+    if span is None:
+        return (
+            "We're closed right now. I've passed your message to the team at "
+            f"{profile.name} and they'll reply here when we open. "
+            "You don't need to message again."
+        )
+    open_min, _ = span
+    return (
+        f"We're closed right now, {profile.name} opens at "
+        f"{format_time(open_min)}. I've passed your message to the team "
+        f"and you'll hear back here by {format_time(open_min + 60)}. "
+        "You don't need to message again."
+    )
+
+
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, llm=None):
         self.profile = profile
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
         self.handoffs = handoffs if handoffs is not None else HandoffStore()
         self.notifier = notifier if notifier is not None else notifier_from_env()
         self.sender = sender if sender is not None else sender_from_env()
+        # The brain. None means no key is set and the bot cannot reply;
+        # run.py builds it from the environment, tests pass a fake.
+        self.llm = llm
+        # The handoff the hand_over tool opened during this reply, if
+        # any, so the reply entry can carry its id.
+        self._last_handoff = None
         # Dry run forces record-only even when a token is set, so a pilot
         # can watch exactly what would be sent before anything leaves.
         self.dry_run = dry_run if dry_run is not None else os.environ.get("WHATSAPP_DRY_RUN") == "1"
@@ -101,12 +156,6 @@ class Studio:
         self._outbox_path = Path(outbox_path) if outbox_path else None
         self._outbox_lock = threading.Lock()
         self.outbox = self._load_outbox()
-        # What the bot is waiting for from each phone: the question it
-        # asked last ("which day and time?", "which service?", a slot
-        # list). The next message from that phone is read in that
-        # context, so a customer can book in two or three messages.
-        # Transient by nature: a restart mid-conversation drops it.
-        self._pending = {}
 
     def _load_outbox(self):
         if self._outbox_path is None or not self._outbox_path.exists():
@@ -216,111 +265,31 @@ class Studio:
     def _record_reply(self, phone, text, intent, sender_name, reply, wamid=None):
         """Record the incoming message, queue the reply, and send it if live."""
         self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
-        entry = {"to": phone, "body": reply, "intent": intent}
+        entry = {"to": phone, "body": reply, "intent": intent, "ts": int(time.time())}
         self.outbox.append(entry)
         self._dispatch(entry)
         self._save_outbox()
         return entry
 
-    def _resolve_pending(self, phone, text, sender_name, intent, now):
-        """Read a message in the context of the question the bot last
-        asked this phone. Returns the reply, or None when the message is
-        not an answer to that question — then normal handling takes over.
-        Only a plain answer counts: a price question, a greeting, or a
-        new topic is answered on its own merits, not as a booking answer."""
-        pending = self._pending.get(phone)
-        if pending is None:
-            return None
-        kind = pending.get("kind")
-        if kind == "booking_ask_service":
-            if intent not in (FALLBACK, BOOKING):
-                return None
-            service = self.profile.service_named(text)
-            if service is None:
-                return None
-            return self._handle_booking(phone, text, sender_name, service, now)
-        if kind == "booking_ask_when":
-            if intent not in (FALLBACK, BOOKING):
-                return None
-            service = self.profile.service_named(pending.get("service") or "")
-            if service is None:
-                return None
-            return self._handle_booking(phone, text, sender_name, service, now)
-        if kind == "slots_available":
-            if intent not in (FALLBACK, BOOKING):
-                return None
-            service = self.profile.service_named(pending.get("service") or "")
-            if service is None:
-                return None
-            # The message's own day wins over the pending day: "parso
-            # 11am" after a slot list for tomorrow is the day after
-            # tomorrow, not tomorrow.
-            today = (now or india_now()).date()
-            day = parse_day(text, today)
-            if day is None:
-                day = (
-                    date.fromisoformat(pending["day"])
-                    if pending.get("day")
-                    else today
-                )
-            if text.strip().lower() in (
-                "yes", "yeah", "yep", "ok", "okay", "first", "first one",
-                "book it", "haan", "ha",
-            ):
-                slots = pending.get("slots") or []
-                if not slots:
-                    return None
-                return self._confirm_booking(phone, sender_name, service, day, slots[0])
-            start = parse_time(text)
-            if start is None:
-                return None
-            return self._confirm_booking(phone, sender_name, service, day, start)
-        if kind == "ask_name":
-            if intent != FALLBACK:
-                return None
-            name = text.strip()
-            words = name.split()
-            if not (1 <= len(words) <= 3) or not all(w.isalpha() for w in words):
-                return None
-            if parse_day(text) is not None or parse_time(text) is not None:
-                return None
-            updated = self.bookings.update_latest_name(phone, name)
-            self._pending.pop(phone, None)
-            if updated is None:
-                return None
-            return f"Thanks, {name}! I've noted that down. See you then."
-        return None
-
     def handle_message(self, phone, text, sender_name="", now=None, wamid=None):
-        intent = detect_intent(text)
         # A handoff is total: while one is open the message is recorded for
-        # the owner to read, but the bot sends nothing — not even a booking.
+        # the owner to read, but the bot sends nothing.
         if self.handoffs.open_for(phone) is not None:
-            self._pending.pop(phone, None)
-            self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
-            return {"to": phone, "body": None, "intent": intent, "paused": True}
-        # An explicit cancel, human request, or reschedule is always a
-        # fresh intent — never an answer to the question the bot asked.
-        # So is a fresh booking that names its own service: the message
-        # is self-contained, and the pending question is abandoned.
-        if intent not in (CANCEL, HUMAN, RESCHEDULE) and phone in self._pending:
-            if intent == BOOKING and self.profile.service_named(text) is not None:
-                self._pending.pop(phone, None)
-            else:
-                reply = self._resolve_pending(phone, text, sender_name, intent, now)
-                if reply is not None:
-                    return self._record_reply(phone, text, intent, sender_name, reply, wamid)
-        reason = None
-        if intent == HUMAN:
-            reason = "asked for a person"
-        elif intent == FALLBACK and self._fallback_streak(phone) >= 2:
-            reason = "couldn't help"
-        if reason is not None:
-            self._pending.pop(phone, None)
-            handoff = self.handoffs.open(phone, sender_name, reason, text)
-            reply = handoff_confirmation(self.profile, reason, now)
-            self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
-            entry = {"to": phone, "body": reply, "intent": intent, "handoff": handoff["id"]}
+            self.leads.record_message(phone, text, None, sender_name, wamid=wamid)
+            return {"to": phone, "body": None, "paused": True}
+        # No key, no brain: the bot cannot reply. Record the lead and
+        # send nothing; the dashboard says a key is needed.
+        if self.llm is None:
+            self.leads.record_message(phone, text, None, sender_name, wamid=wamid)
+            return {"to": phone, "body": None, "no_llm": True}
+        reply = self._llm_reply(phone, text, sender_name, now)
+        if reply is None:
+            # The model failed: hand over so the owner knows and the
+            # customer hears back, instead of silence.
+            handoff = self.handoffs.open(phone, sender_name, "couldn't reply", text)
+            confirmation = handoff_confirmation(self.profile, "couldn't reply", now)
+            self.leads.record_message(phone, text, None, sender_name, wamid=wamid)
+            entry = {"to": phone, "body": confirmation, "intent": "handoff", "handoff": handoff["id"], "ts": int(time.time())}
             self.outbox.append(entry)
             self._dispatch(entry)
             self._save_outbox()
@@ -329,181 +298,388 @@ class Studio:
             except Exception:
                 pass
             return entry
-        service = None
-        if intent in (PRICE, BOOKING):
-            service = self.profile.service_named(text)
-        if intent == BOOKING and service is not None:
-            reply = self._handle_booking(phone, text, sender_name, service, now)
-        elif intent == BOOKING:
-            self._pending[phone] = {"kind": "booking_ask_service"}
-            reply = build_reply(self.profile, intent, text, service=service, now=now)
-        elif intent == CANCEL:
-            self._pending.pop(phone, None)
-            cancelled = self.bookings.cancel_latest(phone)
-            reply = (
-                booking_cancelled(self.profile, cancelled)
-                if cancelled
-                else booking_none_to_cancel(self.profile)
-            )
-        elif intent == RESCHEDULE:
-            reply = self._handle_reschedule(phone, sender_name, now)
-        else:
-            lead = self.leads.get(phone)
-            returning = lead is not None and lead["message_count"] > 0
-            reply = build_reply(
-                self.profile, intent, text, service=service, now=now,
-                returning=returning,
-                customer_name=(lead or {}).get("name", ""),
-            )
-        return self._record_reply(phone, text, intent, sender_name, reply, wamid)
+        entry = self._record_reply(phone, text, None, sender_name, reply, wamid)
+        if self._last_handoff is not None:
+            entry["handoff"] = self._last_handoff["id"]
+            self._last_handoff = None
+        return entry
 
-    def _fallback_streak(self, phone):
-        """Trailing fallback intents for this phone, counting the message in flight.
+    def _llm_history(self, phone, limit=10):
+        """The recent thread as chat messages, so the model remembers
+        what was said: the customer's messages and the business's
+        replies, oldest first, last few only."""
+        thread = self._conversation_thread(phone)[-limit:]
+        return [
+            {
+                "role": "user" if m["side"] == "in" else "assistant",
+                "content": m["text"],
+            }
+            for m in thread
+        ]
 
-        Only messages since the last resolved handoff count: once the owner
-        resolves one, a customer who is still confused starts a fresh streak.
-        """
-        count = 1
+    def _llm_reply(self, phone, text, sender_name, now):
+        """One model turn: system prompt, thread, the new message, then
+        tool calls until the model answers in words. Returns the reply
+        text, or None when the model could not produce one."""
+        messages = [{"role": "system", "content": build_system_prompt(self.profile, now)}]
+        messages.extend(self._llm_history(phone))
+        messages.append({"role": "user", "content": text})
+        for _ in range(MAX_TOOL_ROUNDS):
+            try:
+                result = self.llm.chat(messages, tools=LLM_TOOLS)
+            except Exception:
+                return None
+            content = (result or {}).get("content")
+            tool_calls = (result or {}).get("tool_calls") or []
+            if tool_calls:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": openai_tool_calls(tool_calls),
+                    }
+                )
+                for i, call in enumerate(tool_calls):
+                    call_id = call.get("id") or f"call-{i}"
+                    outcome = self._run_tool(
+                        call.get("name") or "",
+                        call.get("arguments") or {},
+                        phone,
+                        sender_name,
+                        now,
+                        text,
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps(outcome),
+                        }
+                    )
+                continue
+            if content and content.strip():
+                return content.strip()[:MAX_LLM_CHARS]
+            return None
+        return None
+
+    def _run_tool(self, name, args, phone, sender_name, now, trigger_text):
+        """Run one tool the model asked for. Everything real happens
+        here, in code: prices come from the catalogue, slots are
+        validated, bookings are recorded. Returns a plain dict the
+        model reads; a refusal says why and what is free instead."""
+        today = (now or india_now()).date()
+        now_min = (now or india_now()).hour * 60 + (now or india_now()).minute
         lead = self.leads.get(phone)
-        if lead is None:
-            return count
-        resolved_at = 0
-        for handoff in self.handoffs.all_handoffs():
-            if handoff["phone"] == phone and handoff["status"] == "resolved":
-                resolved_at = max(resolved_at, handoff["resolved_at"] or 0)
-        for message in reversed(lead["messages"]):
-            if message["ts"] <= resolved_at:
-                break
-            if message["intent"] == FALLBACK:
-                count += 1
-            else:
-                break
-        return count
+        name = name or ""
+        args = args or {}
 
+        def _service():
+            service = self.profile.service_named(args.get("service") or "")
+            if service is None:
+                return None, {
+                    "ok": False,
+                    "error": "no such service",
+                    "services": [s.name for s in self.profile.services],
+                }
+            return service, None
+
+        def _alternatives(day, service, start):
+            return [format_time(s) for s in self._nearest_slots(day, service, start)]
+
+        if name == "get_price":
+            service, error = _service()
+            if error is not None:
+                return error
+            return {
+                "ok": True,
+                "service": service.name,
+                "price": service.price,
+                "duration_min": service.duration_min,
+                "note": (
+                    "price confirmed at the shop"
+                    if service.price is None
+                    else ""
+                ),
+            }
+        if name == "list_prices":
+            return {
+                "ok": True,
+                "services": [
+                    {
+                        "name": s.name,
+                        "price": s.price,
+                        "duration_min": s.duration_min,
+                    }
+                    for s in self.profile.services
+                ],
+                "offers": self.profile.offers or "",
+            }
+        if name == "check_availability":
+            service, error = _service()
+            if error is not None:
+                return error
+            day = parse_day(args.get("day") or "", today) or today
+            hours = self.profile.hours_today(day.weekday())
+            if is_closed(hours):
+                return {"ok": True, "closed": True, "date": day.isoformat()}
+            slots = self.bookings.free_slots(day, service, hours)
+            start = parse_time(args.get("time") or "") if args.get("time") else None
+            if start is not None:
+                slots = sorted(slots, key=lambda s: abs(s - start))[:4]
+            else:
+                slots = slots[:8]
+            return {
+                "ok": True,
+                "service": service.name,
+                "date": day.isoformat(),
+                "slots": [format_time(s) for s in slots],
+            }
+        if name == "create_booking":
+            service, error = _service()
+            if error is not None:
+                return error
+            day = parse_day(args.get("day") or "", today) or today
+            start = parse_time(args.get("time") or "")
+            if start is None:
+                return {"ok": False, "error": "could not understand the time"}
+            # A time of day ("subah") with no day means the next such
+            # time: if it has already passed today, it is tomorrow's.
+            if (
+                not args.get("day")
+                and has_relative_time(args.get("time") or "")
+                and day == today
+                and start <= now_min
+            ):
+                day = today + timedelta(days=1)
+            hours = self.profile.hours_today(day.weekday())
+            if is_closed(hours):
+                return {"ok": False, "error": "closed", "date": day.isoformat()}
+            if day == today and start <= now_min:
+                future = [
+                    s
+                    for s in self.bookings.free_slots(day, service, hours)
+                    if s > now_min
+                ]
+                return {
+                    "ok": False,
+                    "error": "time passed",
+                    "alternatives": [format_time(s) for s in future[:4]],
+                }
+            if not validate_slot(day, start, service, hours):
+                return {
+                    "ok": False,
+                    "error": "invalid slot",
+                    "hours": hours,
+                    "alternatives": _alternatives(day, service, start),
+                }
+            agreed = args.get("price")
+            if service.price is None:
+                price = None
+            elif agreed is None:
+                price = service.price
+            else:
+                try:
+                    price = int(agreed)
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "bad price"}
+                if service.floor_price is not None:
+                    if price < service.floor_price:
+                        return {
+                            "ok": False,
+                            "error": "below the lowest price",
+                            "lowest": service.floor_price,
+                        }
+                    if price > service.price:
+                        return {
+                            "ok": False,
+                            "error": "above the list price",
+                            "price": service.price,
+                        }
+                elif price != service.price:
+                    return {
+                        "ok": False,
+                        "error": "fixed price",
+                        "price": service.price,
+                    }
+            customer_name = (
+                args.get("customer_name")
+                or sender_name
+                or (lead or {}).get("name", "")
+                or ""
+            )
+            booking = self.bookings.book(
+                phone, customer_name, service, day, start, price=price
+            )
+            if booking is None:
+                mine = [
+                    b
+                    for b in self.bookings.overlapping(
+                        day, start, service.duration_min
+                    )
+                    if b["phone"] == phone
+                ]
+                if mine:
+                    return {
+                        "ok": False,
+                        "error": "already yours",
+                        "alternatives": _alternatives(day, service, start),
+                    }
+                return {
+                    "ok": False,
+                    "error": "already taken",
+                    "alternatives": _alternatives(day, service, start),
+                }
+            try:
+                self.notifier.notify_booking(self.profile.name, booking)
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "booking": {
+                    "service": booking["service"],
+                    "date": booking["date"],
+                    "start": format_time(booking["start_min"]),
+                    "price": booking["price"],
+                    "duration_min": booking["duration_min"],
+                },
+                "customer_name_known": bool(customer_name),
+            }
+        if name == "cancel_booking":
+            cancelled = self.bookings.cancel_latest(phone)
+            if cancelled is None:
+                return {"ok": False, "error": "no booking to cancel"}
+            return {
+                "ok": True,
+                "booking": {
+                    "service": cancelled["service"],
+                    "date": cancelled["date"],
+                    "start": format_time(cancelled["start_min"]),
+                },
+            }
+        if name == "reschedule_booking":
+            today_iso = india_today().isoformat()
+            mine = [
+                b
+                for b in self.bookings.all_bookings()
+                if b["phone"] == phone and b["date"] >= today_iso
+            ]
+            if not mine:
+                return {"ok": False, "error": "no booking to move"}
+            latest = sorted(mine, key=lambda b: (b["date"], b["start_min"]))[-1]
+            service = self.profile.service_named(args.get("service") or "")
+            if service is None:
+                service = self.profile.service_named(latest["service"])
+            if service is None:
+                return {"ok": False, "error": "no such service"}
+            day = parse_day(args.get("day") or "", today) or today
+            start = parse_time(args.get("time") or "")
+            if start is None:
+                return {"ok": False, "error": "could not understand the time"}
+            if (
+                not args.get("day")
+                and has_relative_time(args.get("time") or "")
+                and day == today
+                and start <= now_min
+            ):
+                day = today + timedelta(days=1)
+            hours = self.profile.hours_today(day.weekday())
+            if is_closed(hours):
+                return {"ok": False, "error": "closed", "date": day.isoformat()}
+            if day == today and start <= now_min:
+                future = [
+                    s
+                    for s in self.bookings.free_slots(day, service, hours)
+                    if s > now_min
+                ]
+                return {
+                    "ok": False,
+                    "error": "time passed",
+                    "alternatives": [format_time(s) for s in future[:4]],
+                }
+            if not validate_slot(day, start, service, hours):
+                return {
+                    "ok": False,
+                    "error": "invalid slot",
+                    "hours": hours,
+                    "alternatives": _alternatives(day, service, start),
+                }
+            # The old booking is only cancelled once the new slot is
+            # valid and free; a failed move never destroys a booking.
+            others = [
+                b
+                for b in self.bookings.overlapping(day, start, service.duration_min)
+                if not (
+                    b["phone"] == phone
+                    and b["date"] == latest["date"]
+                    and b["start_min"] == latest["start_min"]
+                )
+            ]
+            if len(others) >= service.capacity:
+                return {
+                    "ok": False,
+                    "error": "already taken",
+                    "alternatives": _alternatives(day, service, start),
+                }
+            cancelled = self.bookings.cancel_latest(phone)
+            keep_price = (
+                latest.get("price")
+                if service.name == latest["service"]
+                else None
+            )
+            booking = self.bookings.book(
+                phone,
+                latest.get("name") or sender_name,
+                service,
+                day,
+                start,
+                price=keep_price,
+            )
+            if booking is None:
+                return {"ok": False, "error": "already taken"}
+            return {
+                "ok": True,
+                "cancelled": {
+                    "service": cancelled["service"],
+                    "date": cancelled["date"],
+                    "start": format_time(cancelled["start_min"]),
+                },
+                "booking": {
+                    "service": booking["service"],
+                    "date": booking["date"],
+                    "start": format_time(booking["start_min"]),
+                    "price": booking["price"],
+                    "duration_min": booking["duration_min"],
+                },
+            }
+        if name == "hand_over":
+            reason = (args.get("reason") or "asked for a person").strip()
+            handoff = self.handoffs.open(phone, sender_name, reason, trigger_text)
+            # Remember it so the reply entry carries the handoff id,
+            # the way the LLM-failure path already does.
+            self._last_handoff = handoff
+            try:
+                self.notifier.notify(self.profile.name, handoff)
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "handoff": True,
+                "note": "the owner will reply within 30 minutes during working hours",
+            }
+        if name == "set_customer_name":
+            customer_name = (args.get("name") or "").strip()
+            if not customer_name:
+                return {"ok": False, "error": "no name given"}
+            self.leads.set_name(phone, customer_name)
+            self.bookings.update_latest_name(phone, customer_name)
+            return {"ok": True, "name": customer_name}
+        return {"ok": False, "error": f"unknown tool: {name}"}
     def _nearest_slots(self, day, service, start, limit=4):
         """Free slots nearest to a requested time, for offering alternatives."""
         free = self.bookings.free_slots(
             day, service, self.profile.hours_today(day.weekday())
         )
         return sorted(free, key=lambda s: abs(s - start))[:limit]
-
-    def _confirm_booking(self, phone, sender_name, service, day, start):
-        """Validate a slot, book it, and ping the owner. A slot the shop
-        cannot keep is never confirmed — the bot says why and offers the
-        nearest real ones instead."""
-        hours_text = self.profile.hours_today(day.weekday())
-        if not validate_slot(day, start, service, hours_text):
-            alternatives = self._nearest_slots(day, service, start)
-            self._pending[phone] = {
-                "kind": "slots_available",
-                "service": service.name,
-                "day": day.isoformat(),
-                "slots": alternatives,
-            }
-            return booking_invalid_slot(
-                self.profile, service, day, start, hours_text, alternatives
-            )
-        booking = self.bookings.book(phone, sender_name, service, day, start)
-        if booking is None:
-            alternatives = self._nearest_slots(day, service, start)
-            self._pending[phone] = {
-                "kind": "slots_available",
-                "service": service.name,
-                "day": day.isoformat(),
-                "slots": alternatives,
-            }
-            mine = [
-                b for b in self.bookings.overlapping(
-                    day, start, service.duration_min
-                )
-                if b["phone"] == phone
-            ]
-            if mine:
-                return booking_already_yours(
-                    self.profile, service, day, start, alternatives
-                )
-            return booking_taken(self.profile, service, day, start, alternatives)
-        self._pending.pop(phone, None)
-        # A confirmed booking pings the owner the same way a handoff
-        # does: best-effort, never a reason for the booking to fail.
-        try:
-            self.notifier.notify_booking(self.profile.name, booking)
-        except Exception:
-            pass
-        reply = booking_confirmed(self.profile, booking)
-        lead = self.leads.get(phone)
-        if not sender_name and not (lead and lead.get("name")):
-            self._pending[phone] = {"kind": "ask_name"}
-            reply += " May I have your name?"
-        return reply
-
-    def _handle_booking(self, phone, text, sender_name, service, now=None):
-        """Book a slot, or show free slots, from a booking message."""
-        now = now or india_now()
-        today = now.date()
-        now_min = now.hour * 60 + now.minute
-        day = parse_day(text, today) or today
-        start = parse_time(text)
-        hours_text = self.profile.hours_today(day.weekday())
-        if start is None:
-            if parse_day(text, today) is None:
-                # No day and no time: ask which day and time, and wait
-                # for the answer instead of guessing.
-                self._pending[phone] = {
-                    "kind": "booking_ask_when",
-                    "service": service.name,
-                }
-                return booking_ask_when(self.profile, service)
-            slots = self.bookings.free_slots(day, service, hours_text)
-            self._pending[phone] = {
-                "kind": "slots_available",
-                "service": service.name,
-                "day": day.isoformat(),
-                "slots": slots,
-            }
-            return slots_available(self.profile, service, day, slots)
-        # A time of day ("subah") with no day means the next such time:
-        # if it has already passed today, it is tomorrow's.
-        if (
-            parse_day(text, today) is None
-            and has_relative_time(text)
-            and day == today
-            and start <= now_min
-        ):
-            day = today + timedelta(days=1)
-            hours_text = self.profile.hours_today(day.weekday())
-        if day == today and start <= now_min:
-            slots = self.bookings.free_slots(day, service, hours_text)
-            future = [s for s in slots if s > now_min]
-            if not future:
-                return slots_available(self.profile, service, day, [])
-            self._pending[phone] = {
-                "kind": "slots_available",
-                "service": service.name,
-                "day": day.isoformat(),
-                "slots": future,
-            }
-            return (
-                "That time has already passed today. "
-                + slots_available(self.profile, service, day, future)
-            )
-        return self._confirm_booking(phone, sender_name, service, day, start)
-
-    def _handle_reschedule(self, phone, sender_name, now):
-        """Move a booking: cancel the latest one, then ask for the new
-        day and time. Never silently destroy a booking the customer
-        wanted to keep — if there is nothing to move, say so."""
-        cancelled = self.bookings.cancel_latest(phone)
-        if cancelled is None:
-            return booking_none_to_reschedule(self.profile)
-        self._pending.pop(phone, None)
-        service = self.profile.service_named(cancelled["service"])
-        if service is not None:
-            self._pending[phone] = {
-                "kind": "booking_ask_when",
-                "service": service.name,
-            }
-        return booking_reschedule_ask(self.profile, cancelled)
 
     def handle_non_text_message(self, phone, msg_type, sender_name="", wamid=None):
         """A voice note, photo, or anything else that is not typed text
@@ -523,7 +699,7 @@ class Studio:
         # still recorded for the owner to read.
         if self.handoffs.open_for(phone) is not None:
             self.leads.record_message(
-                phone, f"[sent a {label}]", HUMAN, sender_name, wamid=wamid
+                phone, f"[sent a {label}]", None, sender_name, wamid=wamid
             )
             return None
         reason = f"sent a {label}"
@@ -533,9 +709,9 @@ class Studio:
             "and I will help right away."
         )
         self.leads.record_message(
-            phone, f"[sent a {label}]", HUMAN, sender_name, wamid=wamid
+            phone, f"[sent a {label}]", None, sender_name, wamid=wamid
         )
-        entry = {"to": phone, "body": reply, "intent": HUMAN, "handoff": handoff["id"]}
+        entry = {"to": phone, "body": reply, "intent": "handoff", "handoff": handoff["id"], "ts": int(time.time())}
         self.outbox.append(entry)
         self._dispatch(entry)
         self._save_outbox()
@@ -581,20 +757,95 @@ class Studio:
                     count += 1
         return count
 
-    def dashboard_html(self):
-        """The owner's page: who needs them, how today went, did anything
-        go wrong. One column, phone first, warm words. The labels the
-        tests assert on are kept verbatim. Warm cream, soft shadows,
-        serif headings, no photo: this is a work tool, not a landing
-        page. The bot does the talking; the owner only steps in when
-        he wants to, so the reply box is a small quiet option and the
-        call link leads. Order: glance, anything wrong, people waiting,
-        bookings and money, what people asked about most, who asked and
-        did not book, failed replies only, last few people, export.
-        No dash of any kind in the copy here."""
+    def _conversation_thread(self, phone):
+        """The full chat thread for one phone, oldest first: the
+        customer's messages from the lead record plus every reply the
+        business sent, bot or owner, from the outbox. A reply answers
+        one customer message, so it goes right after it; an owner reply
+        goes after every message that was there when the owner sent
+        it. Replies recorded before timestamps were added carry no ts;
+        those fall back to the handoff they belong to (the confirmation
+        went out with the trigger, an owner reply when it was resolved),
+        and anything else keeps the last timestamp seen."""
+        lead = self.leads.get(phone)
+        customers = []
+        if lead is not None:
+            for m in lead["messages"]:
+                customers.append({"side": "in", "text": m["text"], "ts": m["ts"]})
+        handoffs = {h["id"]: h for h in self.handoffs.all_handoffs()}
+        replies = []
+        last_ts = 0
+        for entry in self.outbox:
+            if entry.get("to") != phone:
+                continue
+            body = entry.get("body") or ""
+            if not body:
+                continue
+            ts = entry.get("ts")
+            if not isinstance(ts, (int, float)):
+                handoff = handoffs.get(entry.get("handoff") or 0)
+                if handoff is not None:
+                    if entry.get("intent") == "handoff_reply":
+                        ts = handoff.get("resolved_at") or handoff["opened_at"]
+                    else:
+                        ts = handoff["opened_at"]
+                        if lead is not None:
+                            for m in lead["messages"]:
+                                if m["text"] == handoff["trigger"] and m["ts"] >= ts:
+                                    ts = m["ts"]
+                                    break
+                else:
+                    ts = last_ts
+            if ts > last_ts:
+                last_ts = ts
+            replies.append(
+                {
+                    "side": "out",
+                    "text": body,
+                    "ts": ts,
+                    "owner": entry.get("intent") == "handoff_reply",
+                }
+            )
+        thread = []
+        i = 0
+        for reply in replies:
+            while i < len(customers) and customers[i]["ts"] < reply["ts"]:
+                thread.append(customers[i])
+                i += 1
+            if reply["owner"]:
+                while i < len(customers) and customers[i]["ts"] <= reply["ts"]:
+                    thread.append(customers[i])
+                    i += 1
+            elif i < len(customers) and customers[i]["ts"] <= reply["ts"]:
+                thread.append(customers[i])
+                i += 1
+            thread.append(reply)
+        thread.extend(customers[i:])
+        return thread
+
+    def dashboard_html(self, tab="today"):
+        """The owner's page, in tabs. Server side, no JavaScript: a tab
+        is a link to the same page with ?tab=, and the server renders
+        only that tab's section. The header (shop name, the day, the
+        bot switch) stays on every tab. Today is the default: the
+        glance, the money, anything wrong, the people waiting. Bookings
+        is the calendar of appointments. Customers is who messaged and
+        who asked and did not book. Replies is failures only. Conversation
+        is the full WhatsApp style thread for each waiting person.
+
+        The look is bold, not soft: a deep warm charcoal page, a warm
+        gold accent, the money huge up front, because that is what the
+        owner cares about most. Type does the work, weight and size,
+        not a row of identical cards. The labels the tests assert on
+        are kept verbatim. No dash of any kind in the copy here."""
         from .bookings import format_date, format_time
 
+        tabs = ("today", "bookings", "customers", "replies", "conversation")
+        if tab not in tabs:
+            tab = "today"
+
         today = india_today()
+        now = india_now()
         open_handoffs = [
             h for h in self.handoffs.all_handoffs() if h["status"] == "open"
         ]
@@ -646,10 +897,18 @@ class Studio:
         money_html = ""
         if todays and rupees_today > 0:
             money_html = (
-                "<p class='money'>Rs {}<span>booked today</span></p>".format(
-                    rupees_today
-                )
-            )
+                "<p class='money'>Rs {}</p>"
+                "<p class='moneylbl'>booked today</p>"
+            ).format(rupees_today)
+
+        # A greeting that knows what time it is. Small, human, and it
+        # makes the page feel like it was opened today, not generated.
+        if now.hour < 12:
+            greeting = "Good morning."
+        elif now.hour < 17:
+            greeting = "Good afternoon."
+        else:
+            greeting = "Good evening."
 
         state = self.sending_state()
         if state == "live":
@@ -675,12 +934,30 @@ class Studio:
             )
             bot_class = "bot loud"
         else:
+            # No WhatsApp number is connected, so the bot cannot send
+            # anything. Say so plainly and say what to do next, instead
+            # of leaving a dead "Bot is OFF" with nowhere to go.
             bot_block = (
                 "<p><span class='pill idle'>Bot is OFF</span> "
-                "The bot is watching and drafting replies. Nothing is sent yet.</p>"
+                "No WhatsApp number is connected yet, so the bot is "
+                "watching and drafting replies but nothing reaches a "
+                "customer. Ask Aditya to connect your WhatsApp number "
+                "and the bot will start answering for real.</p>"
             )
             bot_class = "bot loud"
         bot_section = "<section class='{}'>{}</section>".format(bot_class, bot_block)
+
+        # No key, no brain: say so plainly at the top, so the owner
+        # never thinks the bot is answering when it cannot reply.
+        key_notice = ""
+        warmline = "The bot is answering your customers. You only step in when you want to."
+        if self.llm is None:
+            key_notice = (
+                "<section class='alerts'><p class='alerttitle'>The bot needs an LLM key</p>"
+                "<p class='alertline'>No key is set, so the bot cannot reply to customers. "
+                "Set LLM_API_KEY on the server and restart.</p></section>"
+            )
+            warmline = "The bot cannot reply yet. It needs an LLM key first."
 
         entries = list(reversed(self.outbox))
         failed = [e for e in entries if (e.get("send_status") or "") == "failed"]
@@ -721,23 +998,8 @@ class Studio:
             ).format("".join(alert_lines))
 
         avatar_colors = ["#1f6a44", "#c05f33", "#a67c2e", "#7a5a3a"]
-        bot_replies = {}
-        for entry in self.outbox:
-            hid = entry.get("handoff")
-            if hid is not None:
-                bot_replies[hid] = entry.get("body") or ""
-        cards = []
-        for handoff in open_handoffs:
-            lead = self.leads.get(handoff["phone"])
-            since = []
-            if lead is not None:
-                since = [
-                    m["text"]
-                    for m in lead["messages"]
-                    if m["ts"] >= handoff["opened_at"]
-                ]
-            if since and since[0] == handoff["trigger"]:
-                since = since[1:]
+
+        def handoff_card(handoff):
             digits = "".join(c for c in handoff["phone"] if c.isdigit())
             urgent = int(time.time()) - handoff["opened_at"] > 4 * 3600
             name = handoff.get("name")
@@ -757,22 +1019,25 @@ class Studio:
                     html.escape(handoff["phone"])
                 )
             card += "</div></div>"
-            card += "<p class='said'>“{}”</p>".format(html.escape(handoff["trigger"]))
             card += "<p class='meta'>{} · waiting {}</p>".format(
                 html.escape(handoff["reason"]),
                 html.escape(age_text(handoff["opened_at"])),
             )
             if urgent:
                 card += "<p class='urgent'>Waiting a long time. Call them soon.</p>"
-            told = bot_replies.get(handoff["id"])
-            if told:
-                card += "<p class='told'>The bot told them: “{}”</p>".format(
-                    html.escape(told[:200])
-                )
-            if since:
-                card += "<p class='since'>Since then:</p><p class='said'>“{}”</p>".format(
-                    "<br>".join(html.escape(m[:200]) for m in since[-5:])
-                )
+            card += "<p class='quote'>&ldquo;{}&rdquo;</p>".format(
+                html.escape(handoff["trigger"])
+            )
+            # What they said most recently, if it is not the message
+            # that opened the handoff. The owner sees it here without
+            # opening the full thread.
+            lead = self.leads.get(handoff["phone"])
+            if lead is not None and lead["messages"]:
+                latest = lead["messages"][-1]["text"]
+                if latest and latest != handoff["trigger"]:
+                    card += "<p class='latest'><span>Latest</span> &ldquo;{}&rdquo;</p>".format(
+                        html.escape(latest)
+                    )
             card += "<a class='call' href='tel:+{}'>Call {}</a>".format(
                 digits, html.escape(display)
             )
@@ -800,8 +1065,32 @@ class Studio:
                 "<button type='submit' class='resolve'>Resolve</button></form>"
             ).format(handoff["id"])
             card += "</div>"
-            cards.append(card)
-        waiting_body = "".join(cards) or (
+            return card
+
+        def thread_html(phone):
+            thread = self._conversation_thread(phone)
+            if not thread:
+                return ""
+            bubbles = []
+            for msg in thread:
+                when = ""
+                if msg["ts"]:
+                    when = datetime.fromtimestamp(msg["ts"], tz=IST).strftime(
+                        "%I:%M %p"
+                    ).lstrip("0").lower()
+                time_html = (
+                    "<span class='mtime'>{}</span>".format(when) if when else ""
+                )
+                bubbles.append(
+                    "<div class='msg {}'><p>{}</p>{}</div>".format(
+                        msg["side"], html.escape(msg["text"]), time_html
+                    )
+                )
+            return "<div class='thread'><p class='threadtitle'>Conversation</p>{}</div>".format(
+                "".join(bubbles)
+            )
+
+        waiting_body = "".join(handoff_card(h) for h in open_handoffs) or (
             "<p class='allclear'>All clear, nobody is waiting for you.</p>"
         )
 
@@ -852,17 +1141,28 @@ class Studio:
             )
 
         # Who asked about a price or a booking today and has no booking
-        # at all. A warm lead list, kept to one line.
+        # at all. A warm lead list, kept to one line. Derived from the
+        # words they used, not a routed intent: a message names a
+        # service, or asks about a price or a booking in plain words.
         booked_phones = {b["phone"] for b in self.bookings.all_bookings()}
         asked = []
         for lead in leads:
             if datetime.fromtimestamp(lead["last_seen"], tz=IST).date() != today:
                 continue
-            asked_today = any(
-                m.get("intent") in ("price", "booking")
-                for m in lead["messages"]
-                if datetime.fromtimestamp(m["ts"], tz=IST).date() == today
-            )
+            asked_today = False
+            for m in lead["messages"]:
+                if datetime.fromtimestamp(m["ts"], tz=IST).date() != today:
+                    continue
+                text = (m.get("text") or "").lower()
+                if self.profile.service_named(text) is not None:
+                    asked_today = True
+                    break
+                if any(
+                    word in text
+                    for word in ("price", "rate", "cost", "book", "appointment", "slot", "charge")
+                ):
+                    asked_today = True
+                    break
             if asked_today and lead["phone"] not in booked_phones:
                 asked.append(lead.get("name") or lead["phone"])
         nobook_html = ""
@@ -912,91 +1212,104 @@ class Studio:
         if len(leads) > 5:
             lead_body += "<li class='quiet'>Showing the latest 5.</li>"
 
+        # The full thread for each waiting person, WhatsApp style:
+        # the customer on one side, the business on the other, in
+        # order, with the time on each message.
+        conversation_body = ""
+        for handoff in open_handoffs:
+            name = handoff.get("name") or handoff["phone"]
+            conversation_body += "<h2>{}</h2>{}".format(
+                html.escape(name), thread_html(handoff["phone"])
+            )
+        if not conversation_body:
+            conversation_body = (
+                "<p class='allclear'>Nobody is waiting. When someone asks "
+                "for a person, their full chat shows up here.</p>"
+            )
+
         css = (
             "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',"
-            "Roboto,Helvetica,Arial,sans-serif;font-size:17px;line-height:1.6;"
-            "color:#3a2f26;background:#faf5ec}"
-            ".wrap{max-width:680px;margin:0 auto;padding:28px 20px 48px}"
-            "h1{font-family:Georgia,'Times New Roman',serif;font-size:36px;"
-            "line-height:1.15;margin:0;color:#2c2118}"
-            "h2{font-family:Georgia,'Times New Roman',serif;font-size:24px;"
-            "margin:36px 0 10px;color:#2c2118}"
-            ".dateline{color:#96836c;font-size:15px;margin:8px 0 0}"
-            ".warmline{font-family:Georgia,'Times New Roman',serif;font-style:italic;"
-            "font-size:18px;color:#6b5a48;margin:12px 0 28px;line-height:1.5}"
-            ".glance{background:#fffdf8;border-radius:16px;padding:22px;"
-            "box-shadow:0 2px 16px rgba(90,60,25,.08);margin-bottom:20px}"
-            ".today{font-size:19px;line-height:1.5;margin:0 0 16px}"
-            ".nums{display:flex;gap:16px}.num{flex:1;text-align:center}"
-            ".big{display:block;font-family:Georgia,'Times New Roman',serif;"
-            "font-size:42px;font-weight:700;color:#1f6a44;line-height:1.1}"
-            ".lbl{font-size:14px;color:#8a7a68}"
-            ".money{font-family:Georgia,'Times New Roman',serif;font-size:34px;"
-            "font-weight:700;color:#1f6a44;margin:18px 0 0;text-align:center;line-height:1.2}"
-            ".money span{display:block;font-family:-apple-system,BlinkMacSystemFont,"
-            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:14px;"
-            "font-weight:400;color:#8a7a68}"
-            ".bot{background:#fffdf8;border-radius:16px;padding:20px 22px;"
-            "box-shadow:0 2px 16px rgba(90,60,25,.08);margin:0 0 20px}"
-            ".bot p{margin:0 0 10px}.bot p:last-child{margin-bottom:0}"
-            ".bot.loud{background:#fdf3ee}"
-            ".bot.loud p{font-size:19px;font-weight:600;color:#a34a24}"
-            ".pill{display:inline-block;padding:5px 14px;border-radius:999px;"
-            "font-weight:700;font-size:14px}"
+            "Roboto,Helvetica,Arial,sans-serif;font-size:17px;line-height:1.55;"
+            "color:#f5efe6;background:#211a13}"
+            ".wrap{max-width:720px;margin:0 auto;padding:0 0 64px}"
+            "header{padding:30px 20px 8px}"
+            "h1{font-size:34px;line-height:1.08;margin:0;font-weight:800;"
+            "letter-spacing:-.02em;color:#fdf8ef}"
+            ".dateline{color:#a89880;font-size:15px;margin:10px 0 0}"
+            ".greeting{color:#e8c96a;font-size:20px;font-weight:700;margin:16px 0 0}"
+            ".warmline{font-size:17px;color:#d8cbb6;margin:10px 0 0;line-height:1.5}"
+            ".tabs{display:flex;gap:8px;overflow-x:auto;padding:20px 20px 4px}"
+            ".tabs a{flex-shrink:0;padding:10px 18px;border-radius:999px;"
+            "background:#2e251b;color:#cbbfa8;text-decoration:none;font-weight:700;font-size:15px}"
+            ".tabs a.active{background:#e8c96a;color:#211a13}"
+            ".hero{margin:18px 20px 22px;padding:26px 24px;background:#2a2118;"
+            "border-left:5px solid #e8c96a;border-radius:6px}"
+            ".hero .today{font-size:18px;line-height:1.5;color:#f5efe6;margin:0 0 18px}"
+            ".hero .money{font-size:68px;line-height:1;font-weight:800;"
+            "letter-spacing:-.03em;color:#e8c96a;margin:0}"
+            ".hero .moneylbl{color:#cbbfa8;font-size:16px;margin:12px 0 0}"
+            ".nums{display:flex;gap:22px;margin:0 20px 22px}"
+            ".num .big{display:block;font-size:36px;font-weight:800;color:#fdf8ef;line-height:1.1}"
+            ".num .lbl{font-size:13px;color:#a89880}"
+            ".bot{background:#fdf8ef;border-radius:8px;padding:20px 22px;margin:0 20px 22px;color:#3a2f26}"
+            ".bot p{margin:0 0 10px;color:#3a2f26}.bot p:last-child{margin-bottom:0}"
+            ".bot.loud p{font-size:18px;font-weight:700;color:#a34a24}"
+            ".pill{display:inline-block;padding:5px 14px;border-radius:999px;font-weight:700;font-size:14px}"
             ".pill.on{background:#d9ecdf;color:#1f6a44}"
             ".pill.off{background:#fbe4da;color:#a34a24}"
             ".pill.idle{background:#f0e8d8;color:#7a6a58}"
-            ".alerts{background:#fdf3ee;border-radius:16px;padding:18px 20px;"
-            "box-shadow:0 2px 16px rgba(90,60,25,.08);margin:0 0 20px}"
-            ".alerttitle{font-family:Georgia,'Times New Roman',serif;font-size:19px;"
-            "font-weight:700;color:#a34a24;margin:0 0 8px}"
-            ".alertline{color:#a34a24;font-weight:600;font-size:17px;margin:10px 0}"
-            ".alertline a{color:#a34a24;font-weight:700}"
-            ".tag{font-size:13px;color:#a08a70;font-weight:400}"
-            ".card{background:#fffdf8;border-radius:16px;padding:22px;margin:16px 0;"
-            "box-shadow:0 2px 16px rgba(90,60,25,.08)}"
-            ".card.urgent{background:#fdf6f0}"
+            ".alerts{background:#4a2318;border-radius:8px;padding:18px 20px;margin:0 20px 22px}"
+            ".alerttitle{font-size:19px;font-weight:800;color:#f5d5c8;margin:0 0 8px}"
+            ".alertline{color:#f5d5c8;font-weight:600;font-size:17px;margin:10px 0}"
+            ".alertline a{color:#ffd9a8;font-weight:700}"
+            "h2{font-size:22px;margin:28px 20px 12px;color:#fdf8ef;font-weight:800;letter-spacing:-.01em}"
+            ".tag{font-size:13px;color:#a89880;font-weight:400}"
+            ".card{background:#fdf8ef;border-radius:8px;padding:22px;margin:14px 20px;color:#3a2f26;"
+            "border-left:5px solid #e8c96a;box-shadow:0 2px 12px rgba(0,0,0,.25)}"
+            ".card.urgent{border-left-color:#c05f33}"
             ".whorow{display:flex;align-items:center;gap:14px}"
             ".avatar{width:54px;height:54px;border-radius:50%;display:inline-flex;"
-            "align-items:center;justify-content:center;font-family:Georgia,"
-            "'Times New Roman',serif;font-size:26px;font-weight:700;color:#fff;flex-shrink:0}"
-            ".who{font-family:Georgia,'Times New Roman',serif;font-size:23px;"
-            "font-weight:700;color:#2c2118;line-height:1.2}"
+            "align-items:center;justify-content:center;font-size:26px;font-weight:800;color:#fff;flex-shrink:0}"
+            ".who{font-size:23px;font-weight:800;color:#2c2118;line-height:1.2}"
             ".phone{color:#96836c;font-size:14px;margin-top:2px}"
-            ".call{display:block;text-align:center;background:#1f6a44;color:#fff;"
-            "padding:14px 20px;border-radius:12px;font-weight:700;font-size:17px;"
-            "text-decoration:none;margin:18px 0 0}"
-            ".said{font-family:Georgia,'Times New Roman',serif;font-style:italic;"
-            "font-size:18px;line-height:1.5;margin:16px 0 8px}"
-            ".meta{color:#96836c;font-size:14px;margin:6px 0}"
-            ".told{background:#f6efe0;border-radius:10px;padding:12px 14px;"
-            "font-size:15px;color:#5c4f42;margin:12px 0}"
-            ".since{color:#96836c;font-size:14px;margin:16px 0 4px}"
+            ".meta{color:#96836c;font-size:14px;margin:8px 0}"
+            ".quote{font-size:19px;line-height:1.45;font-style:italic;color:#2c2118;margin:12px 0}"
+            ".latest{font-size:16px;color:#5c4f42;margin:8px 0}"
+            ".latest span{font-weight:700;color:#a34a24}"
             ".urgent{color:#a34a24;font-weight:700;margin:8px 0}"
-            ".allclear{font-family:Georgia,'Times New Roman',serif;font-size:20px;"
-            "color:#1f6a44;font-weight:700;margin:0}"
-            ".quiet{color:#96836c;font-size:14px}"
-            ".insight{font-size:16px;color:#5c4f42;margin:10px 0}"
-            ".list{list-style:none;padding:0;margin:0}"
-            ".list li{background:#fffdf8;border-radius:12px;padding:14px 16px;"
-            "margin:10px 0;box-shadow:0 1px 8px rgba(90,60,25,.06)}"
+            ".call{display:block;text-align:center;background:#1f6a44;color:#fff;"
+            "padding:14px 20px;border-radius:8px;font-weight:700;font-size:17px;"
+            "text-decoration:none;margin:18px 0 0}"
+            ".thread{background:#f3ecdd;border-radius:8px;padding:14px;margin:14px 20px;"
+            "display:flex;flex-direction:column;gap:6px}"
+            ".threadtitle{font-size:16px;font-weight:800;color:#5c4f42;margin:0 0 6px}"
+            ".msg{max-width:82%;border-radius:12px;padding:10px 12px}"
+            ".msg p{margin:0;font-size:16px;line-height:1.45;overflow-wrap:break-word;color:#3a2f26}"
+            ".msg.in{align-self:flex-start;background:#fffdf8;border-bottom-left-radius:4px}"
+            ".msg.out{align-self:flex-end;background:#d9ecdf;border-bottom-right-radius:4px}"
+            ".mtime{display:block;text-align:right;font-size:12px;color:#96836c;margin-top:4px}"
+            ".allclear{font-size:20px;color:#e8c96a;font-weight:800;margin:0 20px}"
+            ".quiet{color:#a89880;font-size:14px}"
+            ".insight{font-size:17px;color:#f5efe6;margin:12px 20px}"
+            ".list{list-style:none;padding:0;margin:0 20px}"
+            ".list li{background:#fdf8ef;border-radius:8px;padding:14px 16px;margin:10px 0;color:#3a2f26}"
             ".list li.failed{background:#fdf3ee}"
             ".err{color:#a34a24}"
-            ".replybox{background:#f8f1e3;border-radius:12px;padding:14px 16px;margin-top:16px}"
-            ".replybox .quiet{margin:0 0 4px}"
-            "button{min-height:48px;padding:12px 22px;font-size:16px;font-weight:600;"
-            "border-radius:12px;border:0;background:#1f6a44;color:#fff;cursor:pointer;"
-            "font-family:inherit}"
-            "button.primary{width:100%;margin-top:12px}"
-            "button.soft{width:100%;min-height:44px;background:#e8dcc8;color:#5c4f42;"
-            "font-size:15px;margin-top:8px}"
-            "button.resolve{width:100%;min-height:46px;background:#f3ead9;color:#5c4f42;"
-            "font-size:15px;margin-top:14px}"
+            ".replybox{background:#f8f1e3;border-radius:8px;padding:14px 16px;margin-top:16px}"
+            ".replybox .quiet{margin:0 0 4px;color:#96836c}"
+            "button{min-height:48px;padding:12px 22px;font-size:16px;font-weight:700;"
+            "border-radius:8px;border:0;background:#1f6a44;color:#fff;cursor:pointer;font-family:inherit}"
+            "button.primary{width:100%;margin-top:12px;background:#e8c96a;color:#211a13}"
+            "button.soft{width:100%;min-height:44px;background:#e8dcc8;color:#5c4f42;font-size:15px;margin-top:8px}"
+            "button.resolve{width:100%;min-height:46px;background:#f3ead9;color:#5c4f42;font-size:15px;margin-top:14px}"
             "input[type=text]{width:100%;box-sizing:border-box;min-height:46px;"
-            "padding:11px 14px;font-size:16px;border:1px solid #e5d9c3;border-radius:12px;"
+            "padding:11px 14px;font-size:16px;border:1px solid #e5d9c3;border-radius:8px;"
             "margin:8px 0;background:#fffdf8;color:#3a2f26}"
-            "a{color:#1f6a44}"
-            "@media (max-width:480px){.nums{flex-direction:column;gap:8px}.num{text-align:left}.big{font-size:36px}}"
+            "a{color:#e8c96a}"
+            ".card a,.list a,.bot a{color:#1f6a44}"
+            ".foot{margin:32px 20px 0;color:#a89880;font-size:14px}"
+            ".foot a{color:#e8c96a}"
+            "@media (max-width:480px){.hero .money{font-size:54px}.num .big{font-size:30px}}"
         )
         # With no priced bookings this week the money part would read
         # "Rs 0", a number nobody set. Leave it off instead.
@@ -1005,38 +1318,88 @@ class Studio:
             week_line = "This week: {} bookings, Rs {}.".format(
                 len(week_bookings), week_rupees
             )
+
+        tab_labels = [
+            ("today", "Today"),
+            ("bookings", "Bookings"),
+            ("customers", "Customers"),
+            ("replies", "Replies"),
+            ("conversation", "Conversation"),
+        ]
+        nav = "<nav class='tabs'>" + "".join(
+            "<a href='/?tab={}'{}>{}</a>".format(
+                name, " class='active'" if name == tab else "", label
+            )
+            for name, label in tab_labels
+        ) + "</nav>"
+
+        if tab == "today":
+            hero = (
+                "<section class='hero'><p class='today'>{}</p>{}</section>"
+            ).format(html.escape(sentence), money_html)
+            nums = (
+                "<div class='nums'>"
+                "<div class='num'><span class='big'>{}</span><span class='lbl'>waiting for you</span></div>"
+                "<div class='num'><span class='big'>{}</span><span class='lbl'>bookings today</span></div>"
+                "<div class='num'><span class='big'>{}</span><span class='lbl'>people messaged today</span></div>"
+                "</div>"
+            ).format(waiting, len(todays), messaged_today)
+            body = (
+                hero + nums + alerts_section
+                + "<h2>People waiting for you <span class='tag'>Handoffs</span></h2>"
+                + waiting_body
+                + "<p class='quiet' style='margin:14px 20px'>{} handled today.</p>".format(
+                    len(resolved_today)
+                )
+            )
+        elif tab == "bookings":
+            body = (
+                "<section class='hero'>{}</section>".format(money_html)
+                if money_html
+                else ""
+            ) + (
+                "<h2>Bookings today ({})</h2>"
+                "<ul class='list'>{}</ul>"
+                "<h2>Tomorrow ({})</h2>"
+                "<ul class='list'>{}</ul>"
+                "<p class='insight'>{}</p>"
+            ).format(
+                html.escape(format_date(today)),
+                book_body,
+                html.escape(format_date(tomorrow)),
+                tomorrow_body,
+                week_line,
+            )
+        elif tab == "customers":
+            body = (
+                "{}{}"
+                "<h2>People who messaged</h2>"
+                "<ul class='list'>{}</ul>"
+            ).format(most_html, nobook_html, lead_body)
+        elif tab == "replies":
+            body = (
+                "<h2>Replies the bot sent</h2>"
+                "<ul class='list'>{}</ul>"
+            ).format(out_body)
+        else:
+            body = conversation_body
+
         return (
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
             "<title>{} | WhatsApp Studio</title><style>{}</style></head><body>"
             "<div class='wrap'>"
-            "<h1>{}</h1>"
+            "<header><h1>{}</h1>"
             "<p class='dateline'>{}</p>"
-            "<p class='warmline'>The bot is answering your customers. You only step in when you want to.</p>"
-            "<section class='glance'><p class='today'>{}</p>"
-            "<div class='nums'>"
-            "<div class='num'><span class='big'>{}</span><span class='lbl'>waiting for you</span></div>"
-            "<div class='num'><span class='big'>{}</span><span class='lbl'>bookings today</span></div>"
-            "<div class='num'><span class='big'>{}</span><span class='lbl'>people messaged today</span></div>"
-            "</div>{}</section>"
+            "<p class='greeting'>{}</p>"
+            "<p class='warmline'>{}</p></header>"
             "{}"
             "{}"
-            "<h2>People waiting for you <span class='tag'>Handoffs</span></h2>"
             "{}"
-            "<p class='quiet'>{} handled today.</p>"
-            "<h2>Bookings today ({})</h2>"
-            "<ul class='list'>{}</ul>"
-            "<h2>Tomorrow ({})</h2>"
-            "<ul class='list'>{}</ul>"
-            "<p>{}</p>"
-            "{}{}"
-            "<h2>Replies the bot sent</h2>"
-            "<ul class='list'>{}</ul>"
-            "<h2>People who messaged</h2>"
-            "<ul class='list'>{}</ul>"
-            "<p class='quiet'><a href='/export'>Export my data</a>. Download "
+            "{}"
+            "<p class='foot'><a href='/export'>Export my data</a>. Download "
             "all leads, bookings and handoffs as one file.</p>"
-            "<p class='quiet'>New customers can sign up here: "
+            "<p class='foot'>New customers can sign up here: "
             "<a href='https://forms.gle/VbdEaEdXioxzUGGh8'>WhatsApp Studio signup</a></p>"
             "</div></body></html>"
         ).format(
@@ -1044,24 +1407,12 @@ class Studio:
             css,
             html.escape(self.profile.name),
             html.escape(format_date(today)),
-            html.escape(sentence),
-            waiting,
-            len(todays),
-            messaged_today,
-            money_html,
+            html.escape(greeting),
+            html.escape(warmline),
+            nav,
             bot_section,
-            alerts_section,
-            waiting_body,
-            len(resolved_today),
-            html.escape(format_date(today)),
-            book_body,
-            html.escape(format_date(tomorrow)),
-            tomorrow_body,
-            week_line,
-            most_html,
-            nobook_html,
-            out_body,
-            lead_body,
+            key_notice,
+            body,
         )
 
 def make_handler(studio):
@@ -1154,7 +1505,9 @@ def make_handler(studio):
                 self.end_headers()
                 self.wfile.write(data)
             elif parsed.path == "/":
-                self._send_text(200, studio.dashboard_html(), "text/html")
+                qs = parse_qs(parsed.query)
+                tab = qs.get("tab", ["today"])[0]
+                self._send_text(200, studio.dashboard_html(tab), "text/html")
             else:
                 self._send_json(404, {"error": "not found"})
 
@@ -1248,6 +1601,7 @@ def make_handler(studio):
                     "body": text,
                     "intent": "handoff_reply",
                     "handoff": handoff_id,
+                    "ts": int(time.time()),
                 }
                 studio.outbox.append(entry)
                 studio._dispatch(entry)

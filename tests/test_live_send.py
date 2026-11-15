@@ -8,6 +8,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
+from test_llm import FixedLLM
 from whatsapp_studio.app import Studio, make_server
 from whatsapp_studio.config import BusinessProfile, Service
 from whatsapp_studio.handoffs import HandoffStore
@@ -65,6 +66,7 @@ def make_studio(tmp, sender=None, dry_run=False):
         notifier=FakeNotifier(),
         sender=sender,
         dry_run=dry_run,
+        llm=FixedLLM("Facial is Rs 1499 for 60 minutes."),
     )
 
 
@@ -215,6 +217,7 @@ class TestLiveSend(unittest.TestCase):
                 LeadStore(Path(self.tmp.name) / "leads.json"),
                 handoffs=HandoffStore(),
                 notifier=FakeNotifier(),
+                llm=FixedLLM("Facial is Rs 1499 for 60 minutes."),
             )
         self.assertIsNone(studio.sender)
         self.assertFalse(studio.live)
@@ -452,6 +455,9 @@ class TestLiveSendHttp(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("Sending: LIVE", body)
         self.assertIn("Stop sending", body)
+        self.assertIn("did not get the reply", body)
+        status, body = self._get("/?tab=replies")
+        self.assertEqual(status, 200)
         self.assertIn("SEND FAILED", body)
         self.assertIn("meta down", body)
         self._post_form("/sending/disable")

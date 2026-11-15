@@ -8,12 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-from whatsapp_studio.app import Studio, make_server
+from test_llm import C, FixedLLM, RaisingLLM, ScriptedLLM, T
+from whatsapp_studio.app import Studio, handoff_confirmation, make_server
 from whatsapp_studio.config import BusinessProfile, Service
 from whatsapp_studio.handoffs import HandoffStore
 from whatsapp_studio.leads import LeadStore
 from whatsapp_studio.notify import TelegramNotifier
-from whatsapp_studio.replies import handoff_confirmation
 
 
 def make_profile():
@@ -38,15 +38,23 @@ class FakeNotifier:
         self.calls.append((business_name, handoff))
 
 
-def make_studio(tmp):
+def make_studio(tmp, llm=None):
     notifier = FakeNotifier()
     studio = Studio(
         make_profile(),
         LeadStore(Path(tmp) / "leads.json"),
         handoffs=HandoffStore(),
         notifier=notifier,
+        llm=llm if llm is not None else ScriptedLLM([]),
     )
     return studio, notifier
+
+
+def _hand_over_turns():
+    return [
+        T("hand_over", {"reason": "asked for a person"}),
+        C("I've passed this to the team. They will reply here within 30 minutes."),
+    ]
 
 
 class TestHandoffFlow(unittest.TestCase):
@@ -58,6 +66,7 @@ class TestHandoffFlow(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_explicit_ask_opens_handoff(self):
+        self.studio.llm = ScriptedLLM(_hand_over_turns())
         reply = self.studio.handle_message(
             "919810000001",
             "can I talk to a person please",
@@ -73,24 +82,27 @@ class TestHandoffFlow(unittest.TestCase):
         self.assertEqual(handoff["status"], "open")
         self.assertEqual(len(self.notifier.calls), 1)
 
-    def test_two_fallbacks_open_handoff(self):
-        # Fixed open-hours time: the confirmation wording depends on it,
+    def test_llm_failure_opens_handoff(self):
+        # The model is down: the customer still hears back, the owner
+        # is pinged, and the handoff says why it opened. Fixed
+        # open-hours time: the confirmation wording depends on it,
         # and the suite must pass whatever hour it runs in.
+        self.studio.llm = RaisingLLM()
         now = datetime(2026, 11, 15, 11, 0)
-        self.studio.handle_message("919810000001", "asdfgh", "Rahul", now=now)
-        self.assertIsNone(self.studio.handoffs.open_for("919810000001"))
-        reply = self.studio.handle_message("919810000001", "zxcvbn", "Rahul", now=now)
+        reply = self.studio.handle_message("919810000001", "asdfgh", "Rahul", now=now)
         handoff = self.studio.handoffs.open_for("919810000001")
         self.assertIsNotNone(handoff)
-        self.assertEqual(handoff["reason"], "couldn't help")
+        self.assertEqual(handoff["reason"], "couldn't reply")
         self.assertIn("couldn't quite get that", reply["body"])
 
-    def test_one_fallback_does_not(self):
+    def test_one_normal_message_does_not_open_handoff(self):
+        self.studio.llm = FixedLLM("Hello! How can I help?")
         self.studio.handle_message("919810000001", "asdfgh", "Rahul")
         self.assertIsNone(self.studio.handoffs.open_for("919810000001"))
         self.assertEqual(len(self.studio.outbox), 1)
 
     def test_no_replies_while_open(self):
+        self.studio.llm = ScriptedLLM(_hand_over_turns())
         self.studio.handle_message(
             "919810000001", "can I talk to a person please", "Rahul"
         )
@@ -107,6 +119,7 @@ class TestHandoffFlow(unittest.TestCase):
         self.assertEqual(lead["message_count"], 3)
 
     def test_second_ask_does_not_duplicate(self):
+        self.studio.llm = ScriptedLLM(_hand_over_turns())
         self.studio.handle_message(
             "919810000001", "can I talk to a person please", "Rahul"
         )
@@ -117,6 +130,9 @@ class TestHandoffFlow(unittest.TestCase):
         self.assertEqual(len(handoffs), 1)
 
     def test_resolve_resumes_replies(self):
+        self.studio.llm = ScriptedLLM(
+            _hand_over_turns() + [C("We are open 10:00 AM to 8:00 PM.")]
+        )
         self.studio.handle_message(
             "919810000001", "can I talk to a person please", "Rahul"
         )
@@ -226,6 +242,7 @@ class TestHandoffHttp(unittest.TestCase):
             return resp.status, resp.read().decode()
 
     def test_handoffs_endpoint_and_dashboard(self):
+        self.studio.llm = ScriptedLLM(_hand_over_turns())
         entry = self.studio.handle_message(
             "919810000001", "can I talk to a person please", "Rahul"
         )
@@ -245,6 +262,7 @@ class TestHandoffHttp(unittest.TestCase):
         self.assertIn("Resolve", body)
 
     def test_resolve_via_form(self):
+        self.studio.llm = ScriptedLLM(_hand_over_turns())
         entry = self.studio.handle_message(
             "919810000001", "can I talk to a person please", "Rahul"
         )

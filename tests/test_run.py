@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 import run as run_module
+from whatsapp_studio.llm import OpenAIClient, client_from_env
 
 
 class TestProfilePath(unittest.TestCase):
@@ -36,6 +37,42 @@ class TestProfilePath(unittest.TestCase):
         self.assertEqual(profile.name, "Snips Salon")
         self.assertEqual(profile.services[0].name, "Trim")
         self.assertEqual(profile.services[0].price, 299)
+
+
+class TestLlmFromEnv(unittest.TestCase):
+    """run.py builds the Studio's LLM client from the environment:
+    LLM_API_KEY first, OPENAI_API_KEY as the alias, LLM_MODEL for
+    the model. No key means no client, and the bot cannot reply."""
+
+    def test_llm_api_key_wins(self):
+        with mock.patch.dict(
+            os.environ,
+            {"LLM_API_KEY": "sk-llm", "OPENAI_API_KEY": "sk-openai"},
+        ):
+            client = client_from_env()
+        self.assertIsInstance(client, OpenAIClient)
+        self.assertEqual(client.api_key, "sk-llm")
+        self.assertEqual(client.model, "gpt-4o-mini")
+
+    def test_openai_api_key_is_the_alias(self):
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-openai"}):
+            os.environ.pop("LLM_API_KEY", None)
+            client = client_from_env()
+        self.assertIsInstance(client, OpenAIClient)
+        self.assertEqual(client.api_key, "sk-openai")
+
+    def test_model_from_env(self):
+        with mock.patch.dict(
+            os.environ, {"LLM_API_KEY": "sk-llm", "LLM_MODEL": "gpt-4o"}
+        ):
+            client = client_from_env()
+        self.assertEqual(client.model, "gpt-4o")
+
+    def test_no_key_means_no_client(self):
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("LLM_API_KEY", None)
+            os.environ.pop("OPENAI_API_KEY", None)
+            self.assertIsNone(client_from_env())
 
 
 if __name__ == "__main__":

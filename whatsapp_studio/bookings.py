@@ -294,15 +294,19 @@ class BookingStore:
             start += service.duration_min
         return slots
 
-    def book(self, phone, name, service, day, start_min):
-        """Confirm a booking if the slot is free; returns it, else None."""
+    def book(self, phone, name, service, day, start_min, price=None):
+        """Confirm a booking if the slot is free; returns it, else None.
+
+        The price is the list price unless the caller passes an agreed
+        price (a negotiation the LLM settled); the caller validates it
+        against the floor before calling."""
         if not self.is_free(day, start_min, service.duration_min, service.capacity):
             return None
         booking = {
             "phone": phone,
             "name": name or "",
             "service": service.name,
-            "price": service.price,
+            "price": service.price if price is None else price,
             "date": day.isoformat(),
             "start_min": start_min,
             "duration_min": service.duration_min,

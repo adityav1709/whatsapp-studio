@@ -14,6 +14,7 @@ import unittest
 from html import escape
 from pathlib import Path
 
+from test_llm import C, FixedLLM, ScriptedLLM, T
 from whatsapp_studio.app import Studio
 from whatsapp_studio.bookings import BookingStore
 from whatsapp_studio.config import BusinessProfile, Service
@@ -76,7 +77,7 @@ class FakeSender:
         return f"wamid.sent.{len(self.calls)}"
 
 
-def make_studio(tmp, notifier=None, sender=None, outbox_path=None):
+def make_studio(tmp, notifier=None, sender=None, outbox_path=None, llm=None):
     return Studio(
         make_profile(),
         LeadStore(Path(tmp) / "leads.json"),
@@ -85,7 +86,15 @@ def make_studio(tmp, notifier=None, sender=None, outbox_path=None):
         notifier=notifier if notifier is not None else FakeNotifier(),
         sender=sender,
         outbox_path=outbox_path,
+        llm=llm if llm is not None else FixedLLM("Thanks for messaging! We will help you shortly."),
     )
+
+
+def _hand_over_turns():
+    return [
+        T("hand_over", {"reason": "asked for a person"}),
+        C("I've passed this to the team. They will reply here within 30 minutes."),
+    ]
 
 
 class TestDashboardRedesign(unittest.TestCase):
@@ -104,6 +113,12 @@ class TestDashboardRedesign(unittest.TestCase):
     def test_glance_numbers_match_data(self):
         from whatsapp_studio.bookings import india_today
 
+        self.studio.llm = ScriptedLLM(
+            [
+                C("Facial is Rs 1499 for 60 minutes."),
+                *_hand_over_turns(),
+            ]
+        )
         self.studio.handle_message("919810000001", "facial ka price kya hai?", "Rahul")
         self.studio.handle_message(
             "919810000002", "can I talk to a person please", "Priya"
@@ -123,6 +138,7 @@ class TestDashboardRedesign(unittest.TestCase):
         self.assertIn("nobody is waiting for you", html)
 
     def test_open_handoff_renders_card_with_tel_and_resolve(self):
+        self.studio.llm = ScriptedLLM(_hand_over_turns())
         self.studio.handle_message(
             "919810000001", "can I talk to a person please", "Rahul"
         )
@@ -134,14 +150,20 @@ class TestDashboardRedesign(unittest.TestCase):
         self.assertIn("can I talk to a person please", html)
         self.assertIn("my booking is wrong", html)
         self.assertIn("Resolve", html)
-        self.assertIn("Conversation", html)
-        self.assertIn("class='msg in'", html)
-        self.assertIn("class='msg out'", html)
+        # The full thread lives on the Conversation tab.
+        thread_html = self.studio.dashboard_html("conversation")
+        self.assertIn("Conversation", thread_html)
+        self.assertIn("class='msg in'", thread_html)
+        self.assertIn("class='msg out'", thread_html)
         confirmation = escape(self.studio.outbox[0]["body"])
         self.assertLess(
-            html.index("can I talk to a person please"), html.index(confirmation)
+            thread_html.index("can I talk to a person please"),
+            thread_html.index(confirmation),
         )
-        self.assertLess(html.index(confirmation), html.index("my booking is wrong"))
+        self.assertLess(
+            thread_html.index(confirmation),
+            thread_html.index("my booking is wrong"),
+        )
 
     def test_no_unescaped_customer_text(self):
         self.studio.handle_message(
@@ -150,23 +172,26 @@ class TestDashboardRedesign(unittest.TestCase):
             "<script>alert(1)</script>",
         )
         html = self.studio.dashboard_html()
-        # No raw markup from the crafted name/message survives: escaping
-        # turns it into inert text (the word "onerror" may still appear
-        # inside that escaped text, which is harmless).
+        # No raw markup anywhere on the Today tab.
         self.assertNotIn("<script>", html)
         self.assertNotIn("<img", html)
-        self.assertIn("&lt;script&gt;", html)
-        self.assertIn("&lt;img", html)
+        # The crafted name and message show on the Customers tab,
+        # escaped, never as live markup.
+        customers = self.studio.dashboard_html("customers")
+        self.assertNotIn("<script>", customers)
+        self.assertNotIn("<img", customers)
+        self.assertIn("&lt;script&gt;", customers)
+        self.assertIn("&lt;img", customers)
 
     def test_page_stays_small_row_caps(self):
         base = 1780000000
         for i in range(60):
             lead = self.studio.leads.record_message(
-                f"91981000{i:04d}", f"hello {i}", "price", f"Person {i}"
+                f"91981000{i:04d}", f"hello {i}", None, f"Person {i}"
             )
             lead["last_seen"] = base + i
         self.studio.leads._save()
-        html = self.studio.dashboard_html()
+        html = self.studio.dashboard_html("customers")
         self.assertNotIn("919810000000", html)
         self.assertIn("919810000059", html)
         self.assertIn("Showing the latest 5.", html)
@@ -179,9 +204,14 @@ class TestDashboardRedesign(unittest.TestCase):
         html = studio.dashboard_html()
         self.assertIn("Sending: LIVE", html)
         self.assertIn("Stop sending", html)
-        self.assertIn("SEND FAILED", html)
-        self.assertIn("did not reach the customer", html)
-        self.assertIn("meta down", html)
+        # The Today tab says it plainly and points at the phone.
+        self.assertIn("did not get the reply", html)
+        # The Replies tab carries the full failure, pinned label and
+        # the error the send came back with.
+        replies = studio.dashboard_html("replies")
+        self.assertIn("SEND FAILED", replies)
+        self.assertIn("did not reach the customer", replies)
+        self.assertIn("meta down", replies)
 
 
 class TestConversationThread(unittest.TestCase):
@@ -196,6 +226,12 @@ class TestConversationThread(unittest.TestCase):
     def _drive_thread(self):
         """A customer asks a price, gets an answer, asks for a person,
         gets the handoff confirmation, then writes again while waiting."""
+        self.studio.llm = ScriptedLLM(
+            [
+                C("Facial is Rs 1499 for 60 minutes."),
+                *_hand_over_turns(),
+            ]
+        )
         self.studio.handle_message(
             "919810000001", "facial ka price kya hai?", "Rahul"
         )
@@ -206,7 +242,7 @@ class TestConversationThread(unittest.TestCase):
 
     def test_thread_shows_full_history_in_order(self):
         self._drive_thread()
-        html = self.studio.dashboard_html()
+        html = self.studio.dashboard_html("conversation")
         price_reply = self.studio.outbox[0]["body"]
         confirmation = self.studio.outbox[1]["body"]
         texts = [
@@ -224,7 +260,7 @@ class TestConversationThread(unittest.TestCase):
 
     def test_thread_marks_customer_and_business_sides_and_times(self):
         self._drive_thread()
-        html = self.studio.dashboard_html()
+        html = self.studio.dashboard_html("conversation")
         self.assertEqual(html.count("class='msg in'"), 3)
         self.assertEqual(html.count("class='msg out'"), 2)
         self.assertEqual(html.count("class='mtime'"), 5)
@@ -251,6 +287,7 @@ class TestConversationThread(unittest.TestCase):
         self.assertIsInstance(entry["ts"], int)
 
     def test_thread_without_timestamps_uses_handoff_time(self):
+        self.studio.llm = ScriptedLLM(_hand_over_turns())
         self.studio.handle_message(
             "919810000001", "can I talk to a person please", "Rahul"
         )
@@ -265,6 +302,7 @@ class TestConversationThread(unittest.TestCase):
         )
 
     def test_thread_without_timestamps_keeps_outbox_order(self):
+        self.studio.llm = ScriptedLLM(_hand_over_turns())
         self.studio.handle_message(
             "919810000001", "can I talk to a person please", "Rahul"
         )
@@ -338,7 +376,7 @@ class TestMoneyTomorrowWeek(unittest.TestCase):
         self.studio.bookings.book("919810000001", "Rahul", haircut, today, 10 * 60)
         self.studio.bookings.book("919810000002", "Priya", facial, today, 11 * 60)
         self.studio.bookings.book("919810000003", "Asha", facial, tomorrow, 10 * 60)
-        html = self.studio.dashboard_html()
+        html = self.studio.dashboard_html("bookings")
         self.assertIn("Rs 1998", html)
         self.assertIn("Facial", html)
         self.assertIn("Tomorrow", html)
@@ -362,6 +400,15 @@ class TestBookingPing(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_confirmed_booking_pings_owner_once(self):
+        self.studio.llm = ScriptedLLM(
+            [
+                T(
+                    "create_booking",
+                    {"service": "Haircut", "day": "tomorrow", "time": "11am"},
+                ),
+                C("Done! Your Haircut is booked for tomorrow at 11:00 AM."),
+            ]
+        )
         reply = self.studio.handle_message(
             "919810000001", "book haircut tomorrow 11am", "Rahul"
         )["body"]
@@ -374,6 +421,22 @@ class TestBookingPing(unittest.TestCase):
         self.assertEqual(booking["phone"], "919810000001")
 
     def test_double_booking_and_cancel_do_not_ping(self):
+        self.studio.llm = ScriptedLLM(
+            [
+                T(
+                    "create_booking",
+                    {"service": "Haircut", "day": "tomorrow", "time": "11am"},
+                ),
+                C("Done! Your Haircut is booked for tomorrow at 11:00 AM."),
+                T(
+                    "create_booking",
+                    {"service": "Haircut", "day": "tomorrow", "time": "11am"},
+                ),
+                C("Sorry, 11:00 AM tomorrow is already taken."),
+                T("cancel_booking", {}),
+                C("Your booking is cancelled."),
+            ]
+        )
         self.studio.handle_message("919810000001", "book haircut tomorrow 11am", "Rahul")
         self.assertEqual(len(self.notifier.booking_calls), 1)
         reply = self.studio.handle_message(
@@ -385,7 +448,19 @@ class TestBookingPing(unittest.TestCase):
         self.assertEqual(len(self.notifier.booking_calls), 1)
 
     def test_booking_ping_failure_never_breaks_booking(self):
-        studio = make_studio(self.tmp.name, notifier=RaisingNotifier())
+        studio = make_studio(
+            self.tmp.name,
+            notifier=RaisingNotifier(),
+            llm=ScriptedLLM(
+                [
+                    T(
+                        "create_booking",
+                        {"service": "Haircut", "day": "tomorrow", "time": "11am"},
+                    ),
+                    C("Done! Your Haircut is booked for tomorrow at 11:00 AM."),
+                ]
+            ),
+        )
         reply = studio.handle_message(
             "919810000001", "book haircut tomorrow 11am", "Rahul"
         )["body"]
