@@ -11,6 +11,7 @@ use "tomorrow", never the current hour.
 import json
 import tempfile
 import unittest
+from html import escape
 from pathlib import Path
 
 from whatsapp_studio.app import Studio
@@ -133,7 +134,14 @@ class TestDashboardRedesign(unittest.TestCase):
         self.assertIn("can I talk to a person please", html)
         self.assertIn("my booking is wrong", html)
         self.assertIn("Resolve", html)
-        self.assertIn("The bot told them", html)
+        self.assertIn("Conversation", html)
+        self.assertIn("class='msg in'", html)
+        self.assertIn("class='msg out'", html)
+        confirmation = escape(self.studio.outbox[0]["body"])
+        self.assertLess(
+            html.index("can I talk to a person please"), html.index(confirmation)
+        )
+        self.assertLess(html.index(confirmation), html.index("my booking is wrong"))
 
     def test_no_unescaped_customer_text(self):
         self.studio.handle_message(
@@ -161,7 +169,7 @@ class TestDashboardRedesign(unittest.TestCase):
         html = self.studio.dashboard_html()
         self.assertNotIn("919810000000", html)
         self.assertIn("919810000059", html)
-        self.assertIn("Showing the latest 50.", html)
+        self.assertIn("Showing the latest 5.", html)
 
     def test_failed_send_is_loud_in_plain_words(self):
         sender = FakeSender(fail_with=RuntimeError("meta down"))
@@ -174,6 +182,108 @@ class TestDashboardRedesign(unittest.TestCase):
         self.assertIn("SEND FAILED", html)
         self.assertIn("did not reach the customer", html)
         self.assertIn("meta down", html)
+
+
+class TestConversationThread(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.notifier = FakeNotifier()
+        self.studio = make_studio(self.tmp.name, notifier=self.notifier)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _drive_thread(self):
+        """A customer asks a price, gets an answer, asks for a person,
+        gets the handoff confirmation, then writes again while waiting."""
+        self.studio.handle_message(
+            "919810000001", "facial ka price kya hai?", "Rahul"
+        )
+        self.studio.handle_message(
+            "919810000001", "can I talk to a person please", "Rahul"
+        )
+        self.studio.handle_message("919810000001", "my booking is wrong", "Rahul")
+
+    def test_thread_shows_full_history_in_order(self):
+        self._drive_thread()
+        html = self.studio.dashboard_html()
+        price_reply = self.studio.outbox[0]["body"]
+        confirmation = self.studio.outbox[1]["body"]
+        texts = [
+            escape(t)
+            for t in [
+                "facial ka price kya hai?",
+                price_reply,
+                "can I talk to a person please",
+                confirmation,
+                "my booking is wrong",
+            ]
+        ]
+        positions = [html.index(t) for t in texts]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_thread_marks_customer_and_business_sides_and_times(self):
+        self._drive_thread()
+        html = self.studio.dashboard_html()
+        self.assertEqual(html.count("class='msg in'"), 3)
+        self.assertEqual(html.count("class='msg out'"), 2)
+        self.assertEqual(html.count("class='mtime'"), 5)
+
+    def test_outbox_entries_carry_a_timestamp(self):
+        import time
+
+        before = int(time.time())
+        self.studio.handle_message(
+            "919810000001", "facial ka price kya hai?", "Rahul"
+        )
+        after = int(time.time())
+        entry = self.studio.outbox[0]
+        self.assertIn("ts", entry)
+        self.assertIsInstance(entry["ts"], int)
+        self.assertGreaterEqual(entry["ts"], before)
+        self.assertLessEqual(entry["ts"], after)
+
+    def test_voice_note_reply_carries_a_timestamp(self):
+        entry = self.studio.handle_non_text_message(
+            "919810000001", "audio", "Rahul"
+        )
+        self.assertIn("ts", entry)
+        self.assertIsInstance(entry["ts"], int)
+
+    def test_thread_without_timestamps_uses_handoff_time(self):
+        self.studio.handle_message(
+            "919810000001", "can I talk to a person please", "Rahul"
+        )
+        self.studio.outbox[0].pop("ts")
+        thread = self.studio._conversation_thread("919810000001")
+        self.assertEqual(
+            [(m["side"], m["text"]) for m in thread],
+            [
+                ("in", "can I talk to a person please"),
+                ("out", self.studio.outbox[0]["body"]),
+            ],
+        )
+
+    def test_thread_without_timestamps_keeps_outbox_order(self):
+        self.studio.handle_message(
+            "919810000001", "can I talk to a person please", "Rahul"
+        )
+        self.studio.outbox[0].pop("ts")
+        self.studio.outbox.append(
+            {"to": "919810000001", "body": "first follow up", "intent": "price"}
+        )
+        self.studio.outbox.append(
+            {"to": "919810000001", "body": "second follow up", "intent": "price"}
+        )
+        thread = self.studio._conversation_thread("919810000001")
+        self.assertEqual(
+            [m["text"] for m in thread if m["side"] == "out"],
+            [
+                self.studio.outbox[0]["body"],
+                "first follow up",
+                "second follow up",
+            ],
+        )
 
 
 class TestSendFailedPing(unittest.TestCase):

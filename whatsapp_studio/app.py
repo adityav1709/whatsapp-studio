@@ -583,8 +583,15 @@ class Studio:
 
     def dashboard_html(self):
         """The owner's page: who needs them, how today went, did anything
-        go wrong. One column, phone first, plain words. The labels the
-        tests assert on are kept verbatim."""
+        go wrong. One column, phone first, warm words. The labels the
+        tests assert on are kept verbatim. Warm cream, soft shadows,
+        serif headings, no photo: this is a work tool, not a landing
+        page. The bot does the talking; the owner only steps in when
+        he wants to, so the reply box is a small quiet option and the
+        call link leads. Order: glance, anything wrong, people waiting,
+        bookings and money, what people asked about most, who asked and
+        did not book, failed replies only, last few people, export.
+        No dash of any kind in the copy here."""
         from .bookings import format_date, format_time
 
         today = india_today()
@@ -624,7 +631,7 @@ class Studio:
 
         if waiting == 0:
             sentence = (
-                "All clear — nobody is waiting for you. Today: "
+                "All clear, nobody is waiting for you. Today: "
                 f"{messaged_today} {plural(messaged_today, 'person', 'people')} messaged, "
                 f"{len(todays)} booked."
             )
@@ -636,32 +643,84 @@ class Studio:
         if todays and rupees_today > 0:
             sentence += f" Bookings today: Rs {rupees_today}."
 
+        money_html = ""
+        if todays and rupees_today > 0:
+            money_html = (
+                "<p class='money'>Rs {}<span>booked today</span></p>".format(
+                    rupees_today
+                )
+            )
+
         state = self.sending_state()
         if state == "live":
             bot_block = (
                 "<p><span class='pill on'>Sending: LIVE</span> "
-                "Bot is ON — replies are being sent on WhatsApp.</p>"
+                "Bot is ON. Replies are being sent on WhatsApp.</p>"
                 "<form method='post' action='/sending/disable'>"
-                "<button type='submit' class='big'>Stop sending</button></form>"
+                "<button type='submit' class='primary'>Stop sending</button></form>"
             )
+            bot_class = "bot"
         elif state == "paused":
             bot_block = (
                 "<p><span class='pill off'>Sending: PAUSED</span> "
-                "The bot is stopped — it will not reply to anyone.</p>"
+                "The bot is stopped. It will not reply to anyone.</p>"
                 "<form method='post' action='/sending/enable'>"
-                "<button type='submit' class='big'>Resume sending</button></form>"
+                "<button type='submit' class='primary'>Resume sending</button></form>"
             )
+            bot_class = "bot loud"
         elif state == "dry-run":
             bot_block = (
                 "<p><span class='pill idle'>Bot is OFF</span> "
-                "Replies are recorded only — nothing is sent.</p>"
+                "Replies are recorded only. Nothing is sent.</p>"
             )
+            bot_class = "bot loud"
         else:
             bot_block = (
                 "<p><span class='pill idle'>Bot is OFF</span> "
-                "The bot is watching and drafting replies — nothing is sent yet.</p>"
+                "The bot is watching and drafting replies. Nothing is sent yet.</p>"
             )
+            bot_class = "bot loud"
+        bot_section = "<section class='{}'>{}</section>".format(bot_class, bot_block)
 
+        entries = list(reversed(self.outbox))
+        failed = [e for e in entries if (e.get("send_status") or "") == "failed"]
+
+        # Anything wrong, first and loud: failed sends and handoffs open
+        # more than 4 hours. The bot being off is the loud bot block.
+        alert_lines = []
+        for entry in failed:
+            phone = entry.get("to", "")
+            lead = self.leads.get(phone)
+            name = (lead.get("name") if lead else None) or phone
+            digits = "".join(c for c in phone if c.isdigit())
+            alert_lines.append(
+                "<p class='alertline'><strong>{}</strong> did not get the reply. "
+                "<a href='tel:+{}'>Call {}</a></p>".format(
+                    html.escape(name), digits, html.escape(name)
+                )
+            )
+        for handoff in open_handoffs:
+            if int(time.time()) - handoff["opened_at"] > 4 * 3600:
+                digits = "".join(c for c in handoff["phone"] if c.isdigit())
+                name = handoff.get("name") or handoff["phone"]
+                alert_lines.append(
+                    "<p class='alertline'><strong>{}</strong> has waited {}. "
+                    "<a href='tel:+{}'>Call {}</a></p>".format(
+                        html.escape(name),
+                        html.escape(age_text(handoff["opened_at"])),
+                        digits,
+                        html.escape(name),
+                    )
+                )
+        alerts_section = ""
+        if alert_lines:
+            alerts_section = (
+                "<section class='alerts'><p class='alerttitle'>Needs you now</p>"
+                "{}"
+                "</section>"
+            ).format("".join(alert_lines))
+
+        avatar_colors = ["#1f6a44", "#c05f33", "#a67c2e", "#7a5a3a"]
         bot_replies = {}
         for entry in self.outbox:
             hid = entry.get("handoff")
@@ -681,34 +740,49 @@ class Studio:
                 since = since[1:]
             digits = "".join(c for c in handoff["phone"] if c.isdigit())
             urgent = int(time.time()) - handoff["opened_at"] > 4 * 3600
+            name = handoff.get("name")
+            display = name or handoff["phone"]
+            initial = (name or "?")[:1].upper()
+            color = avatar_colors[
+                sum(ord(c) for c in handoff["phone"]) % len(avatar_colors)
+            ]
             card = "<div class='card{}'>".format(" urgent" if urgent else "")
-            card += "<div class='who'>{}</div>".format(
-                html.escape(handoff.get("name") or "—")
+            card += "<div class='whorow'>"
+            card += "<span class='avatar' style='background:{}'>{}</span>".format(
+                color, html.escape(initial)
             )
-            card += "<a class='call' href='tel:+{}'>{}</a>".format(
-                digits, html.escape(handoff["phone"])
-            )
+            card += "<div><div class='who'>{}</div>".format(html.escape(display))
+            if name:
+                card += "<div class='phone'>{}</div>".format(
+                    html.escape(handoff["phone"])
+                )
+            card += "</div></div>"
             card += "<p class='said'>“{}”</p>".format(html.escape(handoff["trigger"]))
             card += "<p class='meta'>{} · waiting {}</p>".format(
                 html.escape(handoff["reason"]),
                 html.escape(age_text(handoff["opened_at"])),
             )
             if urgent:
-                card += "<p class='urgent'>Waiting a long time — call them soon.</p>"
+                card += "<p class='urgent'>Waiting a long time. Call them soon.</p>"
             told = bot_replies.get(handoff["id"])
             if told:
-                card += "<p class='bot'>The bot told them: “{}”</p>".format(
+                card += "<p class='told'>The bot told them: “{}”</p>".format(
                     html.escape(told[:200])
                 )
             if since:
                 card += "<p class='since'>Since then:</p><p class='said'>“{}”</p>".format(
                     "<br>".join(html.escape(m[:200]) for m in since[-5:])
                 )
-            reply_label = "Send reply" if self.live else "Record reply — sending is off"
+            card += "<a class='call' href='tel:+{}'>Call {}</a>".format(
+                digits, html.escape(display)
+            )
+            reply_label = "Send reply" if self.live else "Record reply, sending is off"
             card += (
+                "<div class='replybox'>"
+                "<p class='quiet'>Only if you want to step in. The bot is already talking to them.</p>"
                 "<form method='post' action='/handoffs/{}/reply'>"
                 "<input type='text' name='text' placeholder='Reply to {}…' required>"
-                "<button type='submit' class='big'>{}</button></form>"
+                "<button type='submit' class='soft'>{}</button></form>"
             ).format(
                 handoff["id"],
                 html.escape(handoff.get("name") or "them"),
@@ -716,18 +790,19 @@ class Studio:
             )
             if not self.live:
                 card += (
-                    "<p class='quiet'>Sending is off — your reply will be "
+                    "<p class='quiet'>Sending is off. Your reply will be "
                     "recorded here, not sent on WhatsApp.</p>"
                 )
+            card += "</div>"
             card += (
                 "<form method='post' action='/handoffs/resolve'>"
                 "<input type='hidden' name='handoff_id' value='{}'>"
-                "<button type='submit' class='big'>Resolve</button></form>"
+                "<button type='submit' class='resolve'>Resolve</button></form>"
             ).format(handoff["id"])
             card += "</div>"
             cards.append(card)
         waiting_body = "".join(cards) or (
-            "<p class='allclear'>All clear — nobody is waiting for you.</p>"
+            "<p class='allclear'>All clear, nobody is waiting for you.</p>"
         )
 
         def booking_rows(bookings):
@@ -740,11 +815,11 @@ class Studio:
                     else "price to confirm"
                 )
                 rows.append(
-                    "<li><strong>{}</strong> — {} for {} — {} · "
+                    "<li><strong>{}</strong> · {} for {} · {} · "
                     "<a href='tel:+{}'>{}</a></li>".format(
                         html.escape(format_time(b["start_min"])),
                         html.escape(b["service"]),
-                        html.escape(b.get("name") or "—"),
+                        html.escape(b.get("name") or b["phone"]),
                         price,
                         digits,
                         html.escape(b["phone"]),
@@ -755,92 +830,176 @@ class Studio:
         book_body = "".join(booking_rows(todays)) or "<li>No bookings today.</li>"
         tomorrow_body = "".join(booking_rows(tomorrows)) or "<li>No bookings tomorrow.</li>"
 
-        entries = list(reversed(self.outbox))
-        failed = [e for e in entries if (e.get("send_status") or "") == "failed"]
-        rest = [e for e in entries if (e.get("send_status") or "") != "failed"]
+        # What people asked about most today, from the messages the bot
+        # answered. Count distinct people per service, not messages, so
+        # one chatty customer cannot win it alone. If nothing is clear,
+        # the line stays off.
+        counts = {s.name: set() for s in self.profile.services}
+        for lead in leads:
+            for m in lead["messages"]:
+                if datetime.fromtimestamp(m["ts"], tz=IST).date() != today:
+                    continue
+                text = (m.get("text") or "").lower()
+                for service in self.profile.services:
+                    if service.name.lower() in text:
+                        counts[service.name].add(lead["phone"])
+        best = max(counts.values(), key=len) if counts else set()
+        leaders = [name for name, phones in counts.items() if len(phones) == len(best)]
+        most_html = ""
+        if best and len(leaders) == 1:
+            most_html = "<p class='insight'>Today most people asked about {}.</p>".format(
+                html.escape(leaders[0].lower())
+            )
+
+        # Who asked about a price or a booking today and has no booking
+        # at all. A warm lead list, kept to one line.
+        booked_phones = {b["phone"] for b in self.bookings.all_bookings()}
+        asked = []
+        for lead in leads:
+            if datetime.fromtimestamp(lead["last_seen"], tz=IST).date() != today:
+                continue
+            asked_today = any(
+                m.get("intent") in ("price", "booking")
+                for m in lead["messages"]
+                if datetime.fromtimestamp(m["ts"], tz=IST).date() == today
+            )
+            if asked_today and lead["phone"] not in booked_phones:
+                asked.append(lead.get("name") or lead["phone"])
+        nobook_html = ""
+        if asked:
+            shown = asked[:3]
+            extra = len(asked) - len(shown)
+            names = ", ".join(shown)
+            if extra > 0:
+                names += " and {} more".format(extra)
+            nobook_html = (
+                "<p class='insight'>{} {} asked about a price or a booking "
+                "today and did not book: {}.</p>"
+            ).format(
+                len(asked), plural(len(asked), "person", "people"), html.escape(names)
+            )
+
+        # Replies the bot sent, cut to failures only. The owner only
+        # cares when a reply failed.
         out_items = []
-        for entry in (failed + rest)[:10]:
-            status = entry.get("send_status") or "recorded"
+        for entry in failed[:10]:
             digits = "".join(c for c in entry["to"] if c.isdigit())
             phone_link = "<a href='tel:+{}'>{}</a>".format(
                 digits, html.escape(entry["to"])
             )
             body = html.escape((entry.get("body") or "")[:120])
-            if status == "failed":
-                inner = (
-                    "<strong>SEND FAILED</strong> — did not reach the customer, "
-                    "call them. {}<br>{}<br><span class='err'>{}</span>"
-                ).format(phone_link, body, html.escape(entry.get("send_error") or ""))
-                out_items.append("<li class='failed'>{}</li>".format(inner))
-            else:
-                label = {"sent": "Sent", "sending": "Sending…"}.get(status, "Not sent")
-                inner = "<strong>{}</strong> {}<br>{}".format(label, phone_link, body)
-                if entry.get("truncated"):
-                    inner += " <span class='quiet'>cut short — too long to send</span>"
-                out_items.append("<li>{}</li>".format(inner))
-        out_body = "".join(out_items) or "<li>No replies yet.</li>"
+            inner = (
+                "<strong>SEND FAILED</strong>. It did not reach the customer, "
+                "please call them. {}<br>{}<br><span class='err'>{}</span>"
+            ).format(phone_link, body, html.escape(entry.get("send_error") or ""))
+            out_items.append("<li class='failed'>{}</li>".format(inner))
+        out_body = "".join(out_items) or "<li>All replies went through.</li>"
 
+        # People who messaged, cut to the last few at the very bottom.
         lead_items = []
-        for lead in leads[:50]:
+        for lead in leads[:5]:
             last = lead["messages"][-1]["text"] if lead["messages"] else ""
             digits = "".join(c for c in lead["phone"] if c.isdigit())
             lead_items.append(
                 "<li><strong>{}</strong> · <a href='tel:+{}'>{}</a><br>{}</li>".format(
-                    html.escape(lead.get("name") or "—"),
+                    html.escape(lead.get("name") or lead["phone"]),
                     digits,
                     html.escape(lead["phone"]),
                     html.escape(last[:120]),
                 )
             )
         lead_body = "".join(lead_items) or "<li>No one has messaged yet.</li>"
-        if len(leads) > 50:
-            lead_body += "<li class='quiet'>Showing the latest 50.</li>"
+        if len(leads) > 5:
+            lead_body += "<li class='quiet'>Showing the latest 5.</li>"
 
         css = (
             "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',"
-            "Roboto,Helvetica,Arial,sans-serif;font-size:16px;line-height:1.5;"
-            "color:#1a1a1a;background:#f7f7f5}"
-            ".wrap{max-width:640px;margin:0 auto;padding:16px}"
-            "h1{font-size:28px;margin:8px 0 0}h2{font-size:20px;margin:28px 0 8px}"
-            ".sub{color:#555;margin:4px 0 16px}"
-            ".glance{background:#fff;border:1px solid #e3e3e0;border-radius:12px;padding:16px}"
-            ".today{font-size:18px;margin:0 0 12px}"
-            ".nums{display:flex;gap:12px}.num{flex:1;text-align:center}"
-            ".big{display:block;font-size:36px;font-weight:700;color:#128c7e}"
-            ".lbl{font-size:13px;color:#555}"
-            ".pill{display:inline-block;padding:4px 12px;border-radius:999px;"
+            "Roboto,Helvetica,Arial,sans-serif;font-size:17px;line-height:1.6;"
+            "color:#3a2f26;background:#faf5ec}"
+            ".wrap{max-width:680px;margin:0 auto;padding:28px 20px 48px}"
+            "h1{font-family:Georgia,'Times New Roman',serif;font-size:36px;"
+            "line-height:1.15;margin:0;color:#2c2118}"
+            "h2{font-family:Georgia,'Times New Roman',serif;font-size:24px;"
+            "margin:36px 0 10px;color:#2c2118}"
+            ".dateline{color:#96836c;font-size:15px;margin:8px 0 0}"
+            ".warmline{font-family:Georgia,'Times New Roman',serif;font-style:italic;"
+            "font-size:18px;color:#6b5a48;margin:12px 0 28px;line-height:1.5}"
+            ".glance{background:#fffdf8;border-radius:16px;padding:22px;"
+            "box-shadow:0 2px 16px rgba(90,60,25,.08);margin-bottom:20px}"
+            ".today{font-size:19px;line-height:1.5;margin:0 0 16px}"
+            ".nums{display:flex;gap:16px}.num{flex:1;text-align:center}"
+            ".big{display:block;font-family:Georgia,'Times New Roman',serif;"
+            "font-size:42px;font-weight:700;color:#1f6a44;line-height:1.1}"
+            ".lbl{font-size:14px;color:#8a7a68}"
+            ".money{font-family:Georgia,'Times New Roman',serif;font-size:34px;"
+            "font-weight:700;color:#1f6a44;margin:18px 0 0;text-align:center;line-height:1.2}"
+            ".money span{display:block;font-family:-apple-system,BlinkMacSystemFont,"
+            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:14px;"
+            "font-weight:400;color:#8a7a68}"
+            ".bot{background:#fffdf8;border-radius:16px;padding:20px 22px;"
+            "box-shadow:0 2px 16px rgba(90,60,25,.08);margin:0 0 20px}"
+            ".bot p{margin:0 0 10px}.bot p:last-child{margin-bottom:0}"
+            ".bot.loud{background:#fdf3ee}"
+            ".bot.loud p{font-size:19px;font-weight:600;color:#a34a24}"
+            ".pill{display:inline-block;padding:5px 14px;border-radius:999px;"
             "font-weight:700;font-size:14px}"
-            ".pill.on{background:#dcf8c6;color:#075e54}"
-            ".pill.off{background:#fde8e8;color:#a50e0e}"
-            ".pill.idle{background:#eee;color:#555}"
-            ".tag{font-size:12px;color:#888;font-weight:400}"
-            ".card{background:#fff;border:1px solid #e3e3e0;border-left:4px solid #25d366;"
-            "border-radius:12px;padding:16px;margin:12px 0}"
-            ".card.urgent{border-left-color:#d93025}"
-            ".who{font-size:20px;font-weight:700}"
-            ".call{display:inline-block;margin:8px 0;font-size:17px;color:#128c7e;font-weight:600}"
-            ".said{font-size:17px;margin:8px 0}"
-            ".meta{color:#555;font-size:14px;margin:4px 0}"
-            ".bot{color:#555;font-size:14px;margin:4px 0}"
-            ".since{color:#555;font-size:14px;margin:12px 0 0}"
-            ".urgent{color:#a50e0e;font-weight:700;margin:4px 0}"
-            ".allclear{font-size:18px;color:#075e54;font-weight:700}"
-            ".quiet{color:#777;font-size:14px}"
+            ".pill.on{background:#d9ecdf;color:#1f6a44}"
+            ".pill.off{background:#fbe4da;color:#a34a24}"
+            ".pill.idle{background:#f0e8d8;color:#7a6a58}"
+            ".alerts{background:#fdf3ee;border-radius:16px;padding:18px 20px;"
+            "box-shadow:0 2px 16px rgba(90,60,25,.08);margin:0 0 20px}"
+            ".alerttitle{font-family:Georgia,'Times New Roman',serif;font-size:19px;"
+            "font-weight:700;color:#a34a24;margin:0 0 8px}"
+            ".alertline{color:#a34a24;font-weight:600;font-size:17px;margin:10px 0}"
+            ".alertline a{color:#a34a24;font-weight:700}"
+            ".tag{font-size:13px;color:#a08a70;font-weight:400}"
+            ".card{background:#fffdf8;border-radius:16px;padding:22px;margin:16px 0;"
+            "box-shadow:0 2px 16px rgba(90,60,25,.08)}"
+            ".card.urgent{background:#fdf6f0}"
+            ".whorow{display:flex;align-items:center;gap:14px}"
+            ".avatar{width:54px;height:54px;border-radius:50%;display:inline-flex;"
+            "align-items:center;justify-content:center;font-family:Georgia,"
+            "'Times New Roman',serif;font-size:26px;font-weight:700;color:#fff;flex-shrink:0}"
+            ".who{font-family:Georgia,'Times New Roman',serif;font-size:23px;"
+            "font-weight:700;color:#2c2118;line-height:1.2}"
+            ".phone{color:#96836c;font-size:14px;margin-top:2px}"
+            ".call{display:block;text-align:center;background:#1f6a44;color:#fff;"
+            "padding:14px 20px;border-radius:12px;font-weight:700;font-size:17px;"
+            "text-decoration:none;margin:18px 0 0}"
+            ".said{font-family:Georgia,'Times New Roman',serif;font-style:italic;"
+            "font-size:18px;line-height:1.5;margin:16px 0 8px}"
+            ".meta{color:#96836c;font-size:14px;margin:6px 0}"
+            ".told{background:#f6efe0;border-radius:10px;padding:12px 14px;"
+            "font-size:15px;color:#5c4f42;margin:12px 0}"
+            ".since{color:#96836c;font-size:14px;margin:16px 0 4px}"
+            ".urgent{color:#a34a24;font-weight:700;margin:8px 0}"
+            ".allclear{font-family:Georgia,'Times New Roman',serif;font-size:20px;"
+            "color:#1f6a44;font-weight:700;margin:0}"
+            ".quiet{color:#96836c;font-size:14px}"
+            ".insight{font-size:16px;color:#5c4f42;margin:10px 0}"
             ".list{list-style:none;padding:0;margin:0}"
-            ".list li{background:#fff;border:1px solid #e3e3e0;border-radius:10px;"
-            "padding:12px 14px;margin:8px 0}"
-            ".list li.failed{border-left:4px solid #d93025}"
-            ".err{color:#a50e0e}"
-            "button{min-height:44px;padding:10px 20px;font-size:16px;border-radius:10px;"
-            "border:1px solid #128c7e;background:#128c7e;color:#fff;cursor:pointer}"
-            "button.big{width:100%;margin-top:8px}"
-            "input[type=text]{width:100%;box-sizing:border-box;min-height:44px;"
-            "padding:10px 12px;font-size:16px;border:1px solid #ccc;border-radius:10px;margin:8px 0}"
-            "a{color:#128c7e}"
-            "@media (max-width:480px){.nums{flex-direction:column;gap:4px}.num{text-align:left}}"
+            ".list li{background:#fffdf8;border-radius:12px;padding:14px 16px;"
+            "margin:10px 0;box-shadow:0 1px 8px rgba(90,60,25,.06)}"
+            ".list li.failed{background:#fdf3ee}"
+            ".err{color:#a34a24}"
+            ".replybox{background:#f8f1e3;border-radius:12px;padding:14px 16px;margin-top:16px}"
+            ".replybox .quiet{margin:0 0 4px}"
+            "button{min-height:48px;padding:12px 22px;font-size:16px;font-weight:600;"
+            "border-radius:12px;border:0;background:#1f6a44;color:#fff;cursor:pointer;"
+            "font-family:inherit}"
+            "button.primary{width:100%;margin-top:12px}"
+            "button.soft{width:100%;min-height:44px;background:#e8dcc8;color:#5c4f42;"
+            "font-size:15px;margin-top:8px}"
+            "button.resolve{width:100%;min-height:46px;background:#f3ead9;color:#5c4f42;"
+            "font-size:15px;margin-top:14px}"
+            "input[type=text]{width:100%;box-sizing:border-box;min-height:46px;"
+            "padding:11px 14px;font-size:16px;border:1px solid #e5d9c3;border-radius:12px;"
+            "margin:8px 0;background:#fffdf8;color:#3a2f26}"
+            "a{color:#1f6a44}"
+            "@media (max-width:480px){.nums{flex-direction:column;gap:8px}.num{text-align:left}.big{font-size:36px}}"
         )
         # With no priced bookings this week the money part would read
-        # "Rs 0" — a number nobody set. Leave it off instead.
+        # "Rs 0", a number nobody set. Leave it off instead.
         week_line = "This week: {} bookings.".format(len(week_bookings))
         if week_rupees > 0:
             week_line = "This week: {} bookings, Rs {}.".format(
@@ -849,16 +1008,19 @@ class Studio:
         return (
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-            "<title>{} — WhatsApp Studio</title><style>{}</style></head><body>"
+            "<title>{} | WhatsApp Studio</title><style>{}</style></head><body>"
             "<div class='wrap'>"
-            "<h1>{}</h1><p class='sub'>Your WhatsApp receptionist · {}</p>"
+            "<h1>{}</h1>"
+            "<p class='dateline'>{}</p>"
+            "<p class='warmline'>The bot is answering your customers. You only step in when you want to.</p>"
             "<section class='glance'><p class='today'>{}</p>"
             "<div class='nums'>"
             "<div class='num'><span class='big'>{}</span><span class='lbl'>waiting for you</span></div>"
             "<div class='num'><span class='big'>{}</span><span class='lbl'>bookings today</span></div>"
             "<div class='num'><span class='big'>{}</span><span class='lbl'>people messaged today</span></div>"
-            "</div></section>"
-            "<section class='bot'>{}</section>"
+            "</div>{}</section>"
+            "{}"
+            "{}"
             "<h2>People waiting for you <span class='tag'>Handoffs</span></h2>"
             "{}"
             "<p class='quiet'>{} handled today.</p>"
@@ -867,12 +1029,15 @@ class Studio:
             "<h2>Tomorrow ({})</h2>"
             "<ul class='list'>{}</ul>"
             "<p>{}</p>"
+            "{}{}"
             "<h2>Replies the bot sent</h2>"
             "<ul class='list'>{}</ul>"
             "<h2>People who messaged</h2>"
             "<ul class='list'>{}</ul>"
-            "<p class='quiet'><a href='/export'>Export my data</a> — download "
+            "<p class='quiet'><a href='/export'>Export my data</a>. Download "
             "all leads, bookings and handoffs as one file.</p>"
+            "<p class='quiet'>New customers can sign up here: "
+            "<a href='https://forms.gle/VbdEaEdXioxzUGGh8'>WhatsApp Studio signup</a></p>"
             "</div></body></html>"
         ).format(
             html.escape(self.profile.name),
@@ -883,7 +1048,9 @@ class Studio:
             waiting,
             len(todays),
             messaged_today,
-            bot_block,
+            money_html,
+            bot_section,
+            alerts_section,
             waiting_body,
             len(resolved_today),
             html.escape(format_date(today)),
@@ -891,6 +1058,8 @@ class Studio:
             html.escape(format_date(tomorrow)),
             tomorrow_body,
             week_line,
+            most_html,
+            nobook_html,
             out_body,
             lead_body,
         )
