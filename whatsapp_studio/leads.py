@@ -80,6 +80,16 @@ class LeadStore:
         self._save()
         return lead
 
+    def set_name(self, phone, name):
+        """Put a name on a lead's record, for example when the customer
+        gives their name in chat. Returns the lead, or None."""
+        lead = self._leads.get(phone)
+        if lead is None or not name:
+            return None
+        lead["name"] = name
+        self._save()
+        return lead
+
     def has_wamid(self, phone, wamid):
         """True if this phone already sent a message with this Meta id."""
         if not wamid:

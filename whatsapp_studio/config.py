@@ -21,6 +21,9 @@ class Service:
     price: int | None = None  # INR
     duration_min: int = 30
     description: str = ""
+    # The lowest price the owner will accept when the bot negotiates.
+    # None means the price is fixed: the bot never discounts it.
+    floor_price: int | None = None  # INR
     # How many customers can be served at once (chairs, doctors, trainers).
     # 1 is one provider; a two-chair salon sets 2.
     capacity: int = 1
