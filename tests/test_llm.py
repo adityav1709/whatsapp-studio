@@ -499,13 +499,34 @@ class TestStudioLLM(unittest.TestCase):
 
     def test_llm_failure_opens_a_handoff_instead_of_silence(self):
         studio = self._studio(RaisingLLM())
-        entry = studio.handle_message("919810000001", "hello?", "Rahul")
+        # Open hours, pinned: without a now the confirmation wording
+        # follows the real clock and flips after closing time.
+        entry = studio.handle_message(
+            "919810000001",
+            "hello?",
+            "Rahul",
+            now=datetime(2026, 11, 16, 11, 0, tzinfo=IST),
+        )
         self.assertIn("passed this to the team", entry["body"])
         handoff = studio.handoffs.open_for("919810000001")
         self.assertIsNotNone(handoff)
         self.assertEqual(handoff["reason"], "couldn't reply")
         self.assertEqual(len(self.notifier.calls), 1)
         self.assertEqual(len(studio.outbox), 1)
+
+    def test_llm_failure_after_hours_is_honest_about_closing(self):
+        studio = self._studio(RaisingLLM())
+        entry = studio.handle_message(
+            "919810000001",
+            "hello?",
+            "Rahul",
+            now=datetime(2026, 11, 16, 2, 30, tzinfo=IST),
+        )
+        self.assertIn("We're closed right now", entry["body"])
+        self.assertIn("passed your message to the team", entry["body"])
+        self.assertIn("opens at 10:00 AM", entry["body"])
+        self.assertNotIn("30 minutes", entry["body"])
+        self.assertIsNotNone(studio.handoffs.open_for("919810000001"))
 
     def test_no_key_means_no_reply_but_the_lead_is_kept(self):
         studio = self._studio(None)

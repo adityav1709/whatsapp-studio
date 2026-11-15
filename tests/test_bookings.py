@@ -8,6 +8,7 @@ from whatsapp_studio.app import Studio
 from whatsapp_studio.bookings import (
     BookingStore,
     format_time,
+    india_today,
     parse_day,
     parse_hours_range,
     parse_time,
@@ -76,7 +77,9 @@ class TestBookingStore(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = BookingStore(Path(self.tmp.name) / "bookings.json")
         self.haircut = Service("Haircut", 499, 30)
-        self.day = date(2026, 11, 15)
+        # Tomorrow, not a fixed date: cancel_latest only cancels
+        # bookings from today on, so a fixed date goes stale.
+        self.day = india_today() + timedelta(days=1)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -142,7 +145,8 @@ class TestValidateSlot(unittest.TestCase):
         self.store = BookingStore(Path(self.tmp.name) / "bookings.json")
         self.haircut = Service("Haircut", 499, 30)
         self.facial = Service("Facial", 1499, 60)
-        self.day = date(2026, 11, 15)
+        # Same relative date as TestBookingStore: a fixed date goes stale.
+        self.day = india_today() + timedelta(days=1)
         self.hours = "10:00 AM - 8:00 PM"
 
     def tearDown(self):
