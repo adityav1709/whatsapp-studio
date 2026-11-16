@@ -1365,11 +1365,12 @@ class Studio:
         .greeting .type{display:inline-block;overflow:hidden;white-space:nowrap;vertical-align:bottom;max-width:0;animation:typeIn 1.1s steps(16) .35s forwards}
         .greeting .type::after{content:"";display:inline-block;width:2px;height:1em;background:var(--gold);margin-left:3px;vertical-align:-.1em;animation:caret 2.4s steps(1) .35s forwards}
         .warmline{font-size:18px;color:#4a4a44;margin:12px 0 0;line-height:1.6;max-width:700px}
-        .tabs{display:flex;gap:10px;overflow-x:auto;padding:28px 24px 8px;animation:fadeUp .6s ease .08s both}
-        .tabs a{flex-shrink:0;padding:11px 20px;border-radius:999px;border:1px solid var(--ink);background:transparent;color:var(--ink);text-decoration:none;font-weight:500;font-size:15px;transition:background .18s ease}
+        .tabs{display:flex;flex-wrap:wrap;gap:10px;padding:28px 24px 16px;border-bottom:1px solid var(--sage);animation:fadeUp .6s ease .08s both}
+        .tabs a{padding:11px 20px;border-radius:999px;border:1px solid var(--ink);background:#fff;color:var(--ink);text-decoration:none;font-weight:500;font-size:15px;transition:background .18s ease}
         .tabs a.active{background:var(--ink);color:var(--paper)}
         .tabs a:hover{background:var(--sage)}
         .tabs a.active:hover{background:var(--ink)}
+        .tabs a:active,.call:active,button:active{transform:translateY(1px)}
         .hero{margin:24px;padding:56px 32px;background:var(--ink);border-radius:20px;color:var(--paper);animation:fadeUp .6s ease .14s both}
         .hero .today{font-family:var(--serif);font-size:24px;line-height:1.4;color:var(--paper);margin:0 0 20px}
         .hero .money{font-family:var(--serif);font-size:88px;line-height:1;font-weight:400;letter-spacing:-.02em;color:var(--gold);margin:0}
@@ -1389,7 +1390,7 @@ class Studio:
         .alerttitle{font-family:var(--serif);font-size:28px;font-weight:400;color:var(--paper);margin:0 0 8px}
         .alertline{color:#E5E5E1;font-weight:500;font-size:17px;margin:10px 0;max-width:700px}
         .alertline a{color:var(--gold);font-weight:500}
-        h2{font-family:var(--serif);font-size:34px;margin:48px 24px 16px;color:var(--ink);font-weight:400;letter-spacing:-.01em;line-height:1.1}
+        h2{font-family:var(--serif);font-size:34px;margin:56px 24px 16px;color:var(--ink);font-weight:400;letter-spacing:-.01em;line-height:1.1}
         h2::after{content:"";display:block;width:56px;height:3px;background:var(--gold);border-radius:3px;margin-top:10px;transform:rotate(-1deg)}
         .tag{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--grey);font-weight:500}
         .card{background:#fff;border:1px solid var(--sage);border-radius:18px;padding:28px;margin:16px 24px;color:var(--ink);transition:border-color .18s ease}
@@ -1444,7 +1445,7 @@ class Studio:
         @keyframes caret{0%{opacity:1}40%{opacity:0}55%{opacity:1}90%{opacity:0}100%{opacity:0}}
         @supports (animation-timeline:view()){.card,.list li,.thread,h2,.nums,.alerts,.insight,.allclear{animation:fadeUp .6s ease both;animation-timeline:view();animation-range:entry 0% entry 50%}}
         @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}.greeting .type{max-width:none!important}.greeting .type::after{display:none}}
-        @media (max-width:480px){h1{font-size:40px}header{padding:40px 20px 16px}.hero{padding:40px 24px;margin:16px}.hero .money{font-size:64px}.hero .today{font-size:20px}.num .big{font-size:32px}.nums{gap:20px}.card{padding:22px}.bot{padding:22px 24px}h2{font-size:28px}}
+        @media (max-width:480px){h1{font-size:40px}header{padding:40px 20px 16px}.tabs{padding:20px 20px 12px;gap:8px}.tabs a{padding:9px 14px;font-size:14px}.hero{padding:40px 24px;margin:16px}.hero .money{font-size:64px}.hero .today{font-size:20px}.num .big{font-size:32px}.nums{gap:20px}.card{padding:22px}.bot{padding:22px 24px}h2{font-size:28px}}
         """
 
         # With no priced bookings this week the money part would read
@@ -1464,7 +1465,7 @@ class Studio:
         ]
         nav = "<nav class='tabs'>" + "".join(
             "<a href='/?tab={}'{}>{}</a>".format(
-                name, " class='active'" if name == tab else "", label
+                name, " class='active' aria-current='page'" if name == tab else "", label
             )
             for name, label in tab_labels
         ) + "</nav>"
