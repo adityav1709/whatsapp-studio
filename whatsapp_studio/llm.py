@@ -143,10 +143,13 @@ def _catalogue_lines(profile):
     return lines
 
 
-def build_system_prompt(profile, now=None):
+def build_system_prompt(profile, now=None, negotiation_on=True):
     """Ground the model in the shop's real info. Everything it may say
     about prices, hours, and services comes from here; anything else
-    is invented, and inventing is forbidden."""
+    is invented, and inventing is forbidden.
+
+    negotiation_on is the owner's switch. When it is off, prices are
+    fixed and the model never haggles, even if the customer asks."""
     from .bookings import format_date, india_now
 
     now = now or india_now()
@@ -178,18 +181,28 @@ def build_system_prompt(profile, now=None):
             "list_prices. To see free slots, call check_availability. "
             "To book, call create_booking and only confirm it when the "
             "tool says it worked. If the tool says the slot is taken, "
-            "closed, or past, offer the alternatives it returns. To "
+            "closed, past, or not free, offer the alternatives it "
+            "returns. Say the time is not available, never use the word "
+            "blocked with a customer. To "
             "cancel a booking, call cancel_booking. To move one, call "
             "reschedule_booking. If the customer asks for a person, call "
             "hand_over. If a booking was made without a name, ask for "
             "the customer's name, then call set_customer_name with it.",
-            "Negotiation: a customer may ask for a lower price. You may "
-            "come down, but never below the lowest price listed for that "
-            "service, and never discount a fixed price service. If the "
-            "customer asks below the lowest price, hold there and offer "
-            "a cheaper service from the list instead. When you agree a "
-            "price, pass that exact price to create_booking so the "
-            "booking records what was agreed.",
+            (
+                "Negotiation: a customer may ask for a lower price. You may "
+                "come down, but never below the lowest price listed for that "
+                "service, and never discount a fixed price service. If the "
+                "customer asks below the lowest price, hold there and offer "
+                "a cheaper service from the list instead. When you agree a "
+                "price, pass that exact price to create_booking so the "
+                "booking records what was agreed."
+                if negotiation_on
+                else "Prices are fixed. Never negotiate, never offer a "
+                "discount, and never agree a price below the list price, "
+                "even if the customer asks. State the fixed price plainly. "
+                "If the customer says a price is too high, offer a cheaper "
+                "service from the list instead."
+            ),
             "Never confirm a booking, a cancellation, or a reschedule "
             "from your own words. Only the tool result says it happened. "
             "Never tell the customer the lowest price for a service. "

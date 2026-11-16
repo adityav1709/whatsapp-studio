@@ -143,7 +143,8 @@ class TestDashboardRedesign(unittest.TestCase):
             "919810000001", "can I talk to a person please", "Rahul"
         )
         self.studio.handle_message("919810000001", "my booking is wrong", "Rahul")
-        html = self.studio.dashboard_html()
+        # The waiting cards live on the Customers tab now, not on Today.
+        html = self.studio.dashboard_html("customers")
         self.assertIn("People waiting for you", html)
         self.assertIn("Handoffs", html)
         self.assertIn("tel:+919810000001", html)

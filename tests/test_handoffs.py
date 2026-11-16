@@ -253,7 +253,7 @@ class TestHandoffHttp(unittest.TestCase):
         self.assertEqual(len(handoffs), 1)
         self.assertEqual(handoffs[0]["id"], entry["handoff"])
         self.assertEqual(handoffs[0]["status"], "open")
-        status, body = self._get("/")
+        status, body = self._get("/?tab=customers")
         self.assertEqual(status, 200)
         self.assertIn("Handoffs", body)
         self.assertIn("919810000001", body)

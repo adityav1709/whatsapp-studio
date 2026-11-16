@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 
 from whatsapp_studio.app import Studio, make_server
+from whatsapp_studio.blocks import BlockStore
 from whatsapp_studio.bookings import BookingStore
 from whatsapp_studio.config import BusinessProfile
 from whatsapp_studio.handoffs import HandoffStore
@@ -38,7 +39,8 @@ def main():
     store = LeadStore(BASE / "data" / "leads.json")
     bookings = BookingStore(BASE / "data" / "bookings.json")
     handoffs = HandoffStore(BASE / "data" / "handoffs.json")
-    studio = Studio(profile, store, verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"), bookings=bookings, handoffs=handoffs, outbox_path=BASE / "data" / "outbox.json", llm=client_from_env())
+    blocks = BlockStore(BASE / "data" / "blocks.json")
+    studio = Studio(profile, store, verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"), bookings=bookings, handoffs=handoffs, blocks=blocks, outbox_path=BASE / "data" / "outbox.json", llm=client_from_env())
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     httpd = make_server(studio, host=host, port=port)

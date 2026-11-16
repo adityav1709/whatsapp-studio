@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .blocks import BlockStore
 from .bookings import (
     IST,
     BookingStore,
@@ -128,11 +129,19 @@ def handoff_confirmation(profile, reason, now=None):
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, llm=None, demo_mode=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, llm=None, demo_mode=None):
         self.profile = profile
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
         self.handoffs = handoffs if handoffs is not None else HandoffStore()
+        self.blocks = blocks if blocks is not None else BlockStore()
+        # The negotiation switch, on by default: the owner flips it on
+        # the dashboard and the bot stops haggling at once. In memory
+        # like the sending kill switch, so a restart turns it back on.
+        self.negotiation_on = True
+        # One shot notice for the dashboard, set by a form handler and
+        # shown once on the next page render, then cleared.
+        self._notice = None
         self.notifier = notifier if notifier is not None else notifier_from_env()
         self.sender = sender if sender is not None else sender_from_env()
         # The brain. None means no key is set and the bot cannot reply;
@@ -218,6 +227,32 @@ class Studio:
 
     def enable_sending(self):
         self.sending_disabled = False
+
+    def enable_negotiation(self):
+        """The owner lets the bot haggle again, within the floor price."""
+        self.negotiation_on = True
+
+    def disable_negotiation(self):
+        """The owner stops all haggling: fixed prices only from now on."""
+        self.negotiation_on = False
+
+    def block_conflicts(self, day, start_min, end_min):
+        """Bookings that clash with a block over [start_min, end_min).
+        A block over one of these is refused, never silently applied."""
+        return [
+            b for b in self.bookings.bookings_on(day)
+            if start_min < b["start_min"] + b["duration_min"]
+            and b["start_min"] < end_min
+        ]
+
+    def _free_slots(self, day, service, hours):
+        """Free start times on a day, with blocked times taken out too.
+        The bot reads this list at booking time, never a cached one, so
+        a block the owner just made counts at once."""
+        return [
+            s for s in self.bookings.free_slots(day, service, hours)
+            if not self.blocks.is_blocked(day, s, service.duration_min)
+        ]
 
     def wait_for_sends(self, timeout=5):
         """Block until in-flight sends finish. For tests and the demo;
@@ -340,7 +375,7 @@ class Studio:
         """One model turn: system prompt, thread, the new message, then
         tool calls until the model answers in words. Returns the reply
         text, or None when the model could not produce one."""
-        messages = [{"role": "system", "content": build_system_prompt(self.profile, now)}]
+        messages = [{"role": "system", "content": build_system_prompt(self.profile, now, self.negotiation_on)}]
         messages.extend(self._llm_history(phone))
         messages.append({"role": "user", "content": text})
         for _ in range(MAX_TOOL_ROUNDS):
@@ -463,7 +498,7 @@ class Studio:
             hours = self.profile.hours_today(day.weekday())
             if is_closed(hours):
                 return {"ok": True, "closed": True, "date": day.isoformat()}
-            slots = self.bookings.free_slots(day, service, hours)
+            slots = self._free_slots(day, service, hours)
             start = parse_time(args.get("time") or "") if args.get("time") else None
             if start is not None:
                 slots = sorted(slots, key=lambda s: abs(s - start))[:4]
@@ -498,7 +533,7 @@ class Studio:
             if day == today and start <= now_min:
                 future = [
                     s
-                    for s in self.bookings.free_slots(day, service, hours)
+                    for s in self._free_slots(day, service, hours)
                     if s > now_min
                 ]
                 return {
@@ -511,6 +546,15 @@ class Studio:
                     "ok": False,
                     "error": "invalid slot",
                     "hours": hours,
+                    "alternatives": _alternatives(day, service, start),
+                }
+            # A time the owner blocked is not free, same as a time
+            # already taken. The error never says blocked, so the bot
+            # never repeats that word to a customer.
+            if self.blocks.is_blocked(day, start, service.duration_min):
+                return {
+                    "ok": False,
+                    "error": "not free",
                     "alternatives": _alternatives(day, service, start),
                 }
             agreed = args.get("price")
@@ -542,6 +586,19 @@ class Studio:
                         "error": "fixed price",
                         "price": service.price,
                     }
+            # The switch is off: the model may still send an agreed
+            # price, but the code never books below the list price.
+            if (
+                not self.negotiation_on
+                and agreed is not None
+                and price is not None
+                and price != service.price
+            ):
+                return {
+                    "ok": False,
+                    "error": "fixed price",
+                    "price": service.price,
+                }
             customer_name = (
                 args.get("customer_name")
                 or sender_name
@@ -629,7 +686,7 @@ class Studio:
             if day == today and start <= now_min:
                 future = [
                     s
-                    for s in self.bookings.free_slots(day, service, hours)
+                    for s in self._free_slots(day, service, hours)
                     if s > now_min
                 ]
                 return {
@@ -642,6 +699,12 @@ class Studio:
                     "ok": False,
                     "error": "invalid slot",
                     "hours": hours,
+                    "alternatives": _alternatives(day, service, start),
+                }
+            if self.blocks.is_blocked(day, start, service.duration_min):
+                return {
+                    "ok": False,
+                    "error": "not free",
                     "alternatives": _alternatives(day, service, start),
                 }
             # The old booking is only cancelled once the new slot is
@@ -717,7 +780,7 @@ class Studio:
         return {"ok": False, "error": f"unknown tool: {name}"}
     def _nearest_slots(self, day, service, start, limit=4):
         """Free slots nearest to a requested time, for offering alternatives."""
-        free = self.bookings.free_slots(
+        free = self._free_slots(
             day, service, self.profile.hours_today(day.weekday())
         )
         return sorted(free, key=lambda s: abs(s - start))[:limit]
@@ -868,13 +931,16 @@ class Studio:
         """The owner's page, in tabs. Server side, no JavaScript: a tab
         is a link to the same page with ?tab=, and the server renders
         only that tab's section. The header (shop name, the day, the
-        bot switch) stays on every tab. Today is the default: the
-        glance, the money, anything wrong, the people waiting. Bookings
-        is the calendar of appointments. Customers is who messaged and
-        who asked and did not book. Replies is where the owner writes
-        a reply, drafts one on request, and sees the replies that
-        failed. Conversation is the full WhatsApp style thread for each
-        waiting person.
+        bot switch, the negotiation switch) stays on every tab. Today
+        is the default and stays a clean overview: the glance, the
+        money, anything wrong, and the counts that say which tab to
+        tap. The detail lives behind its own tab, never on Today.
+        Bookings is the calendar of appointments and where the owner
+        blocks a time. Customers is the people waiting and who messaged
+        and who asked and did not book. Replies is where the owner
+        writes a reply, drafts one on request, and sees the replies
+        that failed. Conversation is the full WhatsApp style thread
+        for each waiting person.
 
         The look follows the Ellipsus standard: paper and ink, charcoal
         and warm off white fields, one gold accent, Fraunces serif
@@ -943,6 +1009,31 @@ class Studio:
         if todays and rupees_today > 0:
             sentence += f" Bookings today: Rs {rupees_today}."
 
+        # A block today shows in the glance, with the reason, so the
+        # owner remembers why that time is gone. Only when a block
+        # exists; with none the sentence stays exactly as pinned.
+        today_blocks = self.blocks.blocks_on(today)
+        if today_blocks:
+            span = parse_hours_range(self.profile.hours_today(today.weekday()))
+            if span and any(
+                b["start_min"] <= span[0] and b["end_min"] >= span[1]
+                for b in today_blocks
+            ):
+                sentence += " Closed today."
+            else:
+                total = sum(b["end_min"] - b["start_min"] for b in today_blocks)
+                if total >= 60:
+                    amount = "{} hour{}".format(
+                        total // 60, "s" if total // 60 != 1 else ""
+                    )
+                else:
+                    amount = "{} minutes".format(total)
+                reason = (today_blocks[0].get("reason") or "").strip()
+                if reason:
+                    sentence += " {} blocked for {}.".format(amount, reason)
+                else:
+                    sentence += " {} blocked.".format(amount)
+
         money_html = ""
         if todays and rupees_today > 0:
             money_html = (
@@ -1008,6 +1099,26 @@ class Studio:
             )
             bot_class = "bot loud"
         bot_section = "<section class='{}'>{}</section>".format(bot_class, bot_block)
+
+        # The negotiation switch sits next to the bot control, where the
+        # owner already looks. A real control: flipping it takes effect
+        # at once, and the bot reads it on every message.
+        if self.negotiation_on:
+            neg_section = (
+                "<section class='bot'><p><span class='pill on'>Negotiation: ON</span> "
+                "Let the bot negotiate prices. It may come down to the "
+                "lowest price you set for a service, never below it.</p>"
+                "<form method='post' action='/negotiation/disable'>"
+                "<button type='submit' class='primary'>Turn negotiation off</button></form></section>"
+            )
+        else:
+            neg_section = (
+                "<section class='bot'><p><span class='pill off'>Negotiation: OFF</span> "
+                "Let the bot negotiate prices. It is off, so the bot "
+                "quotes fixed prices only and never haggles.</p>"
+                "<form method='post' action='/negotiation/enable'>"
+                "<button type='submit' class='primary'>Turn negotiation on</button></form></section>"
+            )
 
         # No key, no brain: say so plainly at the top, so the owner
         # never thinks the bot is answering when it cannot reply.
@@ -1433,7 +1544,9 @@ class Studio:
         button.ghost:hover{background:var(--paper)}
         button.resolve{width:100%;min-height:44px;background:var(--paper);color:var(--ink);font-size:15px;margin-top:14px;border:1px solid var(--sage)}
         button.resolve:hover{border-color:#C9C9C2}
-        input[type=text]{width:100%;box-sizing:border-box;min-height:46px;padding:11px 14px;font-size:16px;border:1px solid #D8D8D2;border-radius:14px;margin:8px 0;background:#fff;color:var(--ink)}
+        input[type=text],input[type=date],input[type=time]{width:100%;box-sizing:border-box;min-height:46px;padding:11px 14px;font-size:16px;border:1px solid #D8D8D2;border-radius:14px;margin:8px 0;background:#fff;color:var(--ink)}
+        label{display:block;font-size:15px;font-weight:500;margin:14px 0 0;color:var(--ink)}
+        button.inline{width:auto;min-height:38px;padding:8px 18px;font-size:14px;margin-top:10px}
         a{color:var(--ink);text-decoration:underline;text-decoration-color:var(--gold);text-underline-offset:3px}
         a:hover{text-decoration-thickness:2px}
         .hero a,.alerts a{color:var(--gold)}
@@ -1481,38 +1594,90 @@ class Studio:
                 "<div class='num'><span class='big'>{}</span><span class='lbl'>people messaged today</span></div>"
                 "</div>"
             ).format(waiting, len(todays), messaged_today)
-            body = (
-                hero + nums + alerts_section
-                + "<h2>People waiting for you <span class='tag'>Handoffs</span></h2>"
-                + waiting_body
-                + "<p class='quiet' style='margin:14px 20px'>{} handled today.</p>".format(
-                    len(resolved_today)
-                )
-            )
+            # Today stays a clean overview. The counts say which tab to
+            # tap; the booking and customer detail lives behind its own
+            # tab and never on this page.
+            body = hero + nums + alerts_section
         elif tab == "bookings":
+            # A notice from the last block action, shown once. A
+            # refusal names the booking in the way, so the owner knows
+            # to cancel or move it first.
+            notice_html = ""
+            if self._notice:
+                notice_html = (
+                    "<section class='alerts'><p class='alertline'>{}</p></section>"
+                ).format(html.escape(self._notice))
+                self._notice = None
+            block_items = []
+            for block in self.blocks.all_blocks():
+                if date.fromisoformat(block["date"]) < today:
+                    continue
+                reason = (block.get("reason") or "").strip()
+                line = "{} · {} to {}".format(
+                    format_date(date.fromisoformat(block["date"])),
+                    format_time(block["start_min"]),
+                    format_time(block["end_min"]),
+                )
+                if reason:
+                    line += " · {}".format(html.escape(reason))
+                block_items.append(
+                    "<li>{} "
+                    "<form method='post' action='/blocks/remove'>"
+                    "<input type='hidden' name='block_id' value='{}'>"
+                    "<button type='submit' class='inline'>Open this time again</button></form></li>".format(
+                        line, block["id"]
+                    )
+                )
+            blocks_body = "".join(block_items) or "<li>No blocked times.</li>"
             body = (
                 "<section class='hero'>{}</section>".format(money_html)
                 if money_html
                 else ""
-            ) + (
+            ) + notice_html + (
                 "<h2>Bookings today ({})</h2>"
                 "<ul class='list'>{}</ul>"
                 "<h2>Tomorrow ({})</h2>"
                 "<ul class='list'>{}</ul>"
                 "<p class='insight'>{}</p>"
+                "<h2>Block a time</h2>"
+                "<div class='card'><p class='quiet'>When you are out, the bot "
+                "says that time is not available and offers the nearest "
+                "free times instead.</p>"
+                "<form method='post' action='/blocks/add'>"
+                "<label>Day</label>"
+                "<input type='date' name='day' value='{}' required>"
+                "<label>From</label>"
+                "<input type='time' name='start' required>"
+                "<label>To</label>"
+                "<input type='time' name='end' required>"
+                "<label>Reason</label>"
+                "<input type='text' name='reason' placeholder='Lunch' maxlength='80'>"
+                "<button type='submit' class='primary'>Block this time</button></form></div>"
+                "<h2>Blocked times</h2>"
+                "<ul class='list'>{}</ul>"
             ).format(
                 html.escape(format_date(today)),
                 book_body,
                 html.escape(format_date(tomorrow)),
                 tomorrow_body,
                 week_line,
+                today.isoformat(),
+                blocks_body,
             )
         elif tab == "customers":
+            # The people waiting live here now, not on Today: Today is
+            # a clean overview, and this is where people are.
             body = (
-                "{}{}"
-                "<h2>People who messaged</h2>"
-                "<ul class='list'>{}</ul>"
-            ).format(most_html, nobook_html, lead_body)
+                "<h2>People waiting for you <span class='tag'>Handoffs</span></h2>"
+                + waiting_body
+                + "<p class='quiet' style='margin:14px 20px'>{} handled today.</p>".format(
+                    len(resolved_today)
+                )
+                + most_html
+                + nobook_html
+                + "<h2>People who messaged</h2>"
+                "<ul class='list'>{}</ul>".format(lead_body)
+            )
         elif tab == "replies":
             body = (
                 "<h2>Reply to a customer</h2>"
@@ -1539,6 +1704,7 @@ class Studio:
             "{}"
             "{}"
             "{}"
+            "{}"
             "<p class='foot'><a href='/export'>Export my data</a>. Download "
             "all leads, bookings and handoffs as one file.</p>"
             "<p class='foot'>New customers can sign up here: "
@@ -1553,6 +1719,7 @@ class Studio:
             html.escape(warmline),
             nav,
             bot_section,
+            neg_section,
             key_notice,
             body,
         )
@@ -1635,6 +1802,7 @@ def make_handler(studio):
                     "leads": studio.leads.all_leads(),
                     "bookings": studio.bookings.all_bookings(),
                     "handoffs": studio.handoffs.all_handoffs(),
+                    "blocks": studio.blocks.all_blocks(),
                 }
                 data = json.dumps(payload, indent=2).encode("utf-8")
                 self.send_response(200)
@@ -1691,6 +1859,98 @@ def make_handler(studio):
                 studio.enable_sending()
                 self.send_response(303)
                 self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path == "/negotiation/enable":
+                studio.enable_negotiation()
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path == "/negotiation/disable":
+                studio.disable_negotiation()
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path == "/blocks/add":
+                # One day at a time, no recurring blocks. A block over
+                # an existing booking is refused and the booking is
+                # named, so the owner cancels or moves it first.
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                fields = parse_qs(raw.decode("utf-8", errors="replace"))
+                day_text = (fields.get("day") or [""])[0].strip()
+                start_text = (fields.get("start") or [""])[0].strip()
+                end_text = (fields.get("end") or [""])[0].strip()
+                reason = (fields.get("reason") or [""])[0].strip()
+                try:
+                    day = date.fromisoformat(day_text)
+                except ValueError:
+                    day = parse_day(day_text, india_today())
+                start = parse_time(start_text) if start_text else None
+                end = parse_time(end_text) if end_text else None
+                today = india_today()
+                now_min = india_now().hour * 60 + india_now().minute
+                if day is None:
+                    notice = "Pick a day to block."
+                elif start is None or end is None:
+                    notice = "Pick a start and an end time."
+                elif start >= end:
+                    notice = "The end time must be after the start time."
+                elif day < today:
+                    notice = "You cannot block a day that has already gone."
+                elif day == today and end <= now_min:
+                    notice = "That time has already gone."
+                elif is_closed(studio.profile.hours_today(day.weekday())):
+                    notice = "The shop is closed that day."
+                else:
+                    conflicts = studio.block_conflicts(day, start, end)
+                    if conflicts:
+                        first = conflicts[0]
+                        notice = (
+                            "That time already has a booking: {} for {} at {}. "
+                            "Cancel it or move it first, then block the time."
+                        ).format(
+                            first.get("name") or first["phone"],
+                            first["service"],
+                            format_time(first["start_min"]),
+                        )
+                    else:
+                        studio.blocks.add(day, start, end, reason)
+                        when = "today" if day == today else format_date(day)
+                        notice = "Blocked {} {} to {}".format(
+                            when, format_time(start), format_time(end)
+                        )
+                        if reason:
+                            notice += " for {}".format(reason)
+                        notice += "."
+                studio._notice = notice
+                self.send_response(303)
+                self.send_header("Location", "/?tab=bookings")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path == "/blocks/remove":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                fields = parse_qs(raw.decode("utf-8", errors="replace"))
+                try:
+                    block_id = int((fields.get("block_id") or [""])[0])
+                except ValueError:
+                    block_id = None
+                removed = (
+                    studio.blocks.remove(block_id) if block_id is not None else None
+                )
+                if removed is None:
+                    self._send_json(404, {"error": "block not found"})
+                    return
+                studio._notice = "Opened that time again."
+                self.send_response(303)
+                self.send_header("Location", "/?tab=bookings")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
