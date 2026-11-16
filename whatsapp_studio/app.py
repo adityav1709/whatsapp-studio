@@ -55,7 +55,7 @@ from .llm import (
     build_system_prompt,
     openai_tool_calls,
 )
-from .notify import notifier_from_env
+from .notify import TelegramNotifier, notifier_from_env
 from .security import check_basic_auth, verify_webhook_signature
 from .send import MAX_TEXT_CHARS, sender_from_env
 
@@ -224,6 +224,51 @@ class Studio:
         """Kill switch: stop all sending instantly. Replies keep being
         recorded, so the owner can see what would have gone out."""
         self.sending_disabled = True
+
+    def setup_checklist(self):
+        """Four things a real install needs before it can serve a shop:
+        a brain that replies, a WhatsApp number, services with prices,
+        and a way to reach the owner. Each item says what is missing
+        and exactly which setting fixes it, so a fresh install can be
+        checked in one glance instead of guessed at."""
+        items = []
+        if self.llm is None:
+            items.append(
+                ("Bot replies", False, "Set LLM_API_KEY on Render so the bot can reply.")
+            )
+        elif self.dry_run:
+            items.append(
+                ("Bot replies", False, "Dry run is on, so replies are recorded but not sent.")
+            )
+        elif self.sending_disabled:
+            items.append(
+                ("Bot replies", False, "Sending is paused. Tap Resume sending to switch the bot back on.")
+            )
+        else:
+            items.append(("Bot replies", True, ""))
+        if self.sender is None:
+            items.append(
+                ("WhatsApp number connected", False, "Set WHATSAPP_TOKEN and PHONE_NUMBER_ID on Render.")
+            )
+        else:
+            items.append(("WhatsApp number connected", True, ""))
+        if not self.profile.services:
+            items.append(
+                ("Services and prices filled in", False, "Add services in the business profile.")
+            )
+        elif any(service.price is None for service in self.profile.services):
+            items.append(
+                ("Services and prices filled in", False, "Add prices in the business profile so the bot can quote them.")
+            )
+        else:
+            items.append(("Services and prices filled in", True, ""))
+        if isinstance(self.notifier, TelegramNotifier):
+            items.append(("Owner alerts on", True, ""))
+        else:
+            items.append(
+                ("Owner alerts on", False, "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID on Render so the owner is pinged.")
+            )
+        return items
 
     def enable_sending(self):
         self.sending_disabled = False
@@ -1596,8 +1641,32 @@ class Studio:
             ).format(waiting, len(todays), messaged_today)
             # Today stays a clean overview. The counts say which tab to
             # tap; the booking and customer detail lives behind its own
-            # tab and never on this page.
-            body = hero + nums + alerts_section
+            # tab and never on this page. The setup checklist is for a
+            # real install only: in demo mode the page is a showcase,
+            # so it stays hidden there.
+            setup_html = ""
+            if not self.demo_mode:
+                setup_items = self.setup_checklist()
+                lines = []
+                for label, ok, hint in setup_items:
+                    if ok:
+                        lines.append("<li>{}: done.</li>".format(html.escape(label)))
+                    else:
+                        lines.append(
+                            "<li>{}: not done. {}</li>".format(
+                                html.escape(label), html.escape(hint)
+                            )
+                        )
+                heading = (
+                    "Setup complete"
+                    if all(ok for _, ok, _ in setup_items)
+                    else "Setup"
+                )
+                setup_html = (
+                    "<section class='setup'><h2>{}</h2>"
+                    "<ul class='list'>{}</ul></section>"
+                ).format(heading, "".join(lines))
+            body = hero + nums + alerts_section + setup_html
         elif tab == "bookings":
             # A notice from the last block action, shown once. A
             # refusal names the booking in the way, so the owner knows

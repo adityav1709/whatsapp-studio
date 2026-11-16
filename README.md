@@ -89,7 +89,11 @@ customer as a lead, and lets the owner see everything on one simple dashboard.
   and did not book, what people asked about most), Replies (failures
   only), Conversation (the full WhatsApp style thread for each waiting
   person). A tab is a link to the same page with `?tab=`. The shop name
-  and the bot on/off control stay on every tab
+  and the bot on/off control stay on every tab. Today also carries a
+  quiet Setup checklist at the bottom (bot replies, number connected,
+  prices filled in, owner alerts on), hidden in demo mode: each item
+  says what is missing and exactly which setting fixes it, so a fresh
+  install can be checked in one glance before a pitch
 - The look is bold, not soft: a deep warm charcoal page, a warm gold
   accent, today's money huge up front, strong type, a greeting that
   knows the time of day. The people waiting are real people: a big
