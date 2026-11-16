@@ -59,7 +59,7 @@ class TestVisualSystem(unittest.TestCase):
                 html = studio.dashboard_html(tab)
                 self.assertIn("Bot is ON", html)
                 self.assertIn("Demo", html)
-            self.assertIn("People waiting for you", studio.dashboard_html("today"))
+            self.assertIn("People waiting for you", studio.dashboard_html("customers"))
             replies = studio.dashboard_html("replies")
             self.assertIn("Reply to a customer", replies)
             self.assertIn("Record reply, sending is off", replies)
