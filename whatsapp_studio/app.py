@@ -55,6 +55,7 @@ from .llm import (
     build_system_prompt,
     openai_tool_calls,
 )
+from .missed import MissedStore, REFUSAL_ERRORS, plain_reason
 from .notify import TelegramNotifier, notifier_from_env
 from .security import check_basic_auth, verify_webhook_signature
 from .send import MAX_TEXT_CHARS, sender_from_env
@@ -138,12 +139,21 @@ def handoff_confirmation(profile, reason, now=None):
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, llm=None, demo_mode=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, missed=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, llm=None, demo_mode=None):
         self.profile = profile
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
         self.handoffs = handoffs if handoffs is not None else HandoffStore()
         self.blocks = blocks if blocks is not None else BlockStore()
+        self.missed = missed if missed is not None else MissedStore()
+        # What this turn did, reset at the start of _llm_reply: the
+        # booking refusals in order, whether a booking landed, and
+        # whether an unanswered question was already recorded. A turn
+        # that ends in a booking is good service, not a bad
+        # experience, so its refusals are never recorded.
+        self._turn_refusals = []
+        self._turn_booked = False
+        self._turn_unanswered = False
         # The negotiation switch, on by default: the owner flips it on
         # the dashboard and the bot stops haggling at once. In memory
         # like the sending kill switch, so a restart turns it back on.
@@ -395,6 +405,10 @@ class Studio:
             # The model failed: hand over so the owner knows and the
             # customer hears back, instead of silence.
             handoff = self.handoffs.open(phone, sender_name, "couldn't reply", text)
+            if not self._turn_unanswered and not self.demo_mode:
+                self.missed.record_unanswered(
+                    phone, sender_name, text, "model failed", handoff["id"]
+                )
             confirmation = handoff_confirmation(self.profile, "couldn't reply", now)
             self.leads.record_message(phone, text, None, sender_name, wamid=wamid)
             entry = {"to": phone, "body": confirmation, "intent": "handoff", "handoff": handoff["id"], "ts": int(time.time())}
@@ -410,6 +424,24 @@ class Studio:
         if self._last_handoff is not None:
             entry["handoff"] = self._last_handoff["id"]
             self._last_handoff = None
+        # The turn ended with no booking: every refusal is a person
+        # who left with nothing, so each is recorded for the owner to
+        # call back. The store collapses two tries at the same slot
+        # into one record. A turn that booked is not recorded.
+        if self._turn_refusals and not self._turn_booked and not self.demo_mode:
+            lead = self.leads.get(phone)
+            name = sender_name or (lead or {}).get("name", "") or ""
+            for refusal in self._turn_refusals:
+                self.missed.record_refused(
+                    phone,
+                    name,
+                    refusal["service"],
+                    refusal["date"],
+                    refusal["start_min"],
+                    refusal["reason"],
+                    refusal["alternatives"],
+                    text,
+                )
         return entry
 
     def _llm_history(self, phone, limit=10):
@@ -425,10 +457,26 @@ class Studio:
             for m in thread
         ]
 
+    @staticmethod
+    def _refusal_record(args, outcome, now):
+        """The record for a refused booking tool call, built from what
+        the model asked for and what the tool answered."""
+        today = (now or india_now()).date()
+        return {
+            "service": (args.get("service") or "").strip(),
+            "date": parse_day(args.get("day") or "", today) or today,
+            "start_min": parse_time(args.get("time") or ""),
+            "reason": outcome.get("error") or "",
+            "alternatives": list(outcome.get("alternatives") or []),
+        }
+
     def _llm_reply(self, phone, text, sender_name, now):
         """One model turn: system prompt, thread, the new message, then
         tool calls until the model answers in words. Returns the reply
         text, or None when the model could not produce one."""
+        self._turn_refusals = []
+        self._turn_booked = False
+        self._turn_unanswered = False
         messages = [{"role": "system", "content": build_system_prompt(self.profile, now, self.negotiation_on)}]
         messages.extend(self._llm_history(phone))
         messages.append({"role": "user", "content": text})
@@ -449,14 +497,29 @@ class Studio:
                 )
                 for i, call in enumerate(tool_calls):
                     call_id = call.get("id") or f"call-{i}"
+                    tool_name = call.get("name") or ""
                     outcome = self._run_tool(
-                        call.get("name") or "",
+                        tool_name,
                         call.get("arguments") or {},
                         phone,
                         sender_name,
                         now,
                         text,
                     )
+                    if tool_name in ("create_booking", "reschedule_booking"):
+                        if outcome.get("ok"):
+                            self._turn_booked = True
+                            service = (outcome.get("booking") or {}).get(
+                                "service"
+                            ) or ""
+                            if service:
+                                self.missed.resolve_for_booking(phone, service)
+                        elif outcome.get("error") in REFUSAL_ERRORS:
+                            self._turn_refusals.append(
+                                self._refusal_record(
+                                    call.get("arguments") or {}, outcome, now
+                                )
+                            )
                     messages.append(
                         {
                             "role": "tool",
@@ -815,6 +878,11 @@ class Studio:
             # Remember it so the reply entry carries the handoff id,
             # the way the LLM-failure path already does.
             self._last_handoff = handoff
+            if reason.lower().startswith("cannot answer") and not self.demo_mode:
+                self.missed.record_unanswered(
+                    phone, sender_name, trigger_text, "cannot answer", handoff["id"]
+                )
+                self._turn_unanswered = True
             try:
                 self.notifier.notify(self.profile.name, handoff)
             except Exception:
@@ -1062,6 +1130,11 @@ class Studio:
             )
         if todays and rupees_today > 0:
             sentence += f" Bookings today: Rs {rupees_today}."
+        missed_today = self.missed.open_today(today)
+        if missed_today:
+            sentence += " {} {} left without booking today.".format(
+                missed_today, plural(missed_today, "person", "people")
+            )
 
         # A block today shows in the glance, with the reason, so the
         # owner remembers why that time is gone. Only when a block
@@ -1280,6 +1353,114 @@ class Studio:
             ).format(handoff["id"])
             card += "</div>"
             return card
+
+        def missed_card(record):
+            """One person who left with nothing: name, what they
+            wanted, the plain reason, when, what the bot already
+            offered, and a call button as the main action."""
+            digits = "".join(c for c in record["phone"] if c.isdigit())
+            name = record.get("name")
+            display = name or record["phone"]
+            initial = (name or "?")[:1].upper()
+            color = avatar_colors[
+                sum(ord(c) for c in record["phone"]) % len(avatar_colors)
+            ]
+            card = "<div class='card'>"
+            card += "<div class='whorow'>"
+            card += "<span class='avatar' style='background:{}'>{}</span>".format(
+                color, html.escape(initial)
+            )
+            card += "<div><div class='who'>{}</div>".format(html.escape(display))
+            if name:
+                card += "<div class='phone'>{}</div>".format(
+                    html.escape(record["phone"])
+                )
+            card += "</div></div>"
+            card += "<p class='meta'>{} · {}</p>".format(
+                html.escape(plain_reason(record.get("reason") or "")),
+                html.escape(age_text(record["created_ts"])),
+            )
+            if record["kind"] == "refused":
+                want = (record.get("service") or "").strip()
+                if record.get("date"):
+                    want += " " + format_date(
+                        date.fromisoformat(record["date"])
+                    )
+                if record.get("start_min") is not None:
+                    want += " at " + format_time(record["start_min"])
+                if want.strip():
+                    card += "<p class='want'>{}</p>".format(
+                        html.escape(want.strip())
+                    )
+                if record.get("trigger"):
+                    card += "<p class='quote'>&ldquo;{}&rdquo;</p>".format(
+                        html.escape(record["trigger"])
+                    )
+            else:
+                card += "<p class='quote'>&ldquo;{}&rdquo;</p>".format(
+                    html.escape(record.get("question") or "")
+                )
+            alternatives = record.get("alternatives") or []
+            if alternatives:
+                card += "<p class='meta'>Bot offered: {}.</p>".format(
+                    html.escape(", ".join(alternatives))
+                )
+            if record["occurrences"] > 1:
+                card += "<p class='meta'>Asked {} times.</p>".format(
+                    record["occurrences"]
+                )
+            past = [
+                b
+                for b in self.bookings.all_bookings()
+                if b["phone"] == record["phone"]
+            ]
+            if len(past) >= 2:
+                card += "<p class='meta'>Regular, booked {} times before.</p>".format(
+                    len(past)
+                )
+            card += "<a class='call' href='tel:+{}'>Call {}</a>".format(
+                digits, html.escape(display)
+            )
+            card += (
+                "<form method='post' action='/missed/resolve'>"
+                "<input type='hidden' name='missed_id' value='{}'>"
+                "<select name='how'>"
+                "<option value='called'>Called them</option>"
+                "<option value='booked'>They booked</option>"
+                "<option value='answered'>Answered</option>"
+                "<option value='dismissed'>Dismiss</option>"
+                "</select>"
+                "<button type='submit' class='resolve'>Mark handled</button></form>"
+            ).format(record["id"])
+            card += "</div>"
+            return card
+
+        # Bad experience: people who wanted something, got a no, and
+        # left with nothing. Newest first, three cards on the page,
+        # the rest counted. An unanswered question whose handoff is
+        # still open lives under People waiting, not here as well.
+        open_handoff_ids = {h["id"] for h in open_handoffs}
+        visible_missed = [
+            r
+            for r in self.missed.open_newest()
+            if not (
+                r["kind"] == "unanswered"
+                and r.get("handoff_id") in open_handoff_ids
+            )
+        ]
+        missed_section = ""
+        if visible_missed:
+            shown = visible_missed[:3]
+            extra = len(visible_missed) - len(shown)
+            more = ""
+            if extra:
+                more = "<p class='quiet'>And {} more.</p>".format(extra)
+            missed_section = (
+                "<section class='missed'><p class='missedtitle'>Bad experience</p>"
+                "{}"
+                "{}"
+                "</section>"
+            ).format("".join(missed_card(r) for r in shown), more)
 
         def reply_box(handoff):
             """The owner's reply form, with a draft on request. A draft
@@ -1580,6 +1761,11 @@ class Studio:
         .pill.off{background:var(--sage);color:var(--ink)}
         .pill.idle{background:transparent;border:1px solid #C9C9C2;color:var(--grey)}
         .alerts{background:var(--ink);border-radius:20px;padding:28px 32px;margin:0 24px 32px}
+        .missed{background:#F6E7DE;border-radius:20px;padding:28px 32px;margin:0 24px 32px}
+        .missedtitle{font-family:var(--serif);font-size:28px;font-weight:400;color:var(--ink);margin:0 0 8px}
+        .missed .card{margin:16px 0}
+        .missed .quiet{color:var(--grey);font-size:14px;margin:12px 0 0}
+        .want{font-size:18px;font-weight:500;margin:8px 0}
         .alerttitle{font-family:var(--serif);font-size:28px;font-weight:400;color:var(--paper);margin:0 0 8px}
         .alertline{color:#E5E5E1;font-weight:500;font-size:17px;margin:10px 0;max-width:700px}
         .alertline a{color:var(--gold);font-weight:500}
@@ -1626,7 +1812,7 @@ class Studio:
         button.ghost:hover{background:var(--paper)}
         button.resolve{width:100%;min-height:44px;background:var(--paper);color:var(--ink);font-size:15px;margin-top:14px;border:1px solid var(--sage)}
         button.resolve:hover{border-color:#C9C9C2}
-        input[type=text],input[type=date],input[type=time]{width:100%;box-sizing:border-box;min-height:46px;padding:11px 14px;font-size:16px;border:1px solid #D8D8D2;border-radius:14px;margin:8px 0;background:#fff;color:var(--ink)}
+        input[type=text],input[type=date],input[type=time],select{width:100%;box-sizing:border-box;min-height:46px;padding:11px 14px;font-size:16px;border:1px solid #D8D8D2;border-radius:14px;margin:8px 0;background:#fff;color:var(--ink)}
         label{display:block;font-size:15px;font-weight:500;margin:14px 0 0;color:var(--ink)}
         button.inline{width:auto;min-height:38px;padding:8px 18px;font-size:14px;margin-top:10px}
         a{color:var(--ink);text-decoration:underline;text-decoration-color:var(--gold);text-underline-offset:3px}
@@ -1703,7 +1889,7 @@ class Studio:
                     "<section class='setup'><h2>{}</h2>"
                     "<ul class='list'>{}</ul></section>"
                 ).format(heading, "".join(lines))
-            body = hero + nums + alerts_section + setup_html
+            body = hero + nums + alerts_section + missed_section + setup_html
         elif tab == "bookings":
             # A notice from the last block action, shown once. A
             # refusal names the booking in the way, so the owner knows
@@ -1912,6 +2098,10 @@ def make_handler(studio):
                         ]
                     },
                 )
+            elif parsed.path == "/missed":
+                self._send_json(
+                    200, {"missed": studio.missed.open_newest()}
+                )
             elif parsed.path == "/export":
                 # The owner's way out and the backup before a redeploy:
                 # everything as one downloadable JSON file.
@@ -2071,6 +2261,26 @@ def make_handler(studio):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            if parsed.path == "/missed/resolve":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                fields = parse_qs(raw.decode("utf-8", errors="replace"))
+                try:
+                    missed_id = int((fields.get("missed_id") or [""])[0])
+                except ValueError:
+                    missed_id = None
+                how = (fields.get("how") or [""])[0]
+                if (
+                    missed_id is None
+                    or studio.missed.resolve(missed_id, how) is None
+                ):
+                    self._send_json(404, {"error": "missed record not found"})
+                    return
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if parsed.path == "/handoffs/resolve":
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b""
@@ -2160,6 +2370,9 @@ def make_handler(studio):
                 studio._dispatch(entry)
                 studio._save_outbox()
                 studio.handoffs.resolve(handoff_id)
+                # The owner answered, so the question the bot could
+                # not answer is answered too.
+                studio.missed.resolve_for_handoff(handoff_id, "answered")
                 studio._drafts.pop(handoff_id, None)
                 studio._draft_failed.discard(handoff_id)
                 self.send_response(303)

@@ -186,7 +186,9 @@ def build_system_prompt(profile, now=None, negotiation_on=True):
             "blocked with a customer. To "
             "cancel a booking, call cancel_booking. To move one, call "
             "reschedule_booking. If the customer asks for a person, call "
-            "hand_over. If a booking was made without a name, ask for "
+            "hand_over. If you cannot answer a question from the price "
+            "list, hours, or bookings, call hand_over with a reason that "
+            "starts cannot answer. If a booking was made without a name, ask for "
             "the customer's name, then call set_customer_name with it.",
             (
                 "Negotiation: a customer may ask for a lower price. You may "
@@ -344,7 +346,7 @@ LLM_TOOLS = [
         "type": "function",
         "function": {
             "name": "hand_over",
-            "description": "Pass the conversation to the owner: the customer asked for a person, or you cannot help. The owner is pinged and replies.",
+            "description": "Pass the conversation to the owner: the customer asked for a person, or you cannot help. When you cannot answer a question, say so with a reason that starts cannot answer. The owner is pinged and replies.",
             "parameters": {
                 "type": "object",
                 "properties": {

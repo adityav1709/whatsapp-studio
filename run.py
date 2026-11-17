@@ -23,6 +23,7 @@ from whatsapp_studio.config import BusinessProfile
 from whatsapp_studio.handoffs import HandoffStore
 from whatsapp_studio.leads import LeadStore
 from whatsapp_studio.llm import client_from_env
+from whatsapp_studio.missed import MissedStore
 
 BASE = Path(__file__).resolve().parent
 
@@ -40,7 +41,8 @@ def main():
     bookings = BookingStore(BASE / "data" / "bookings.json")
     handoffs = HandoffStore(BASE / "data" / "handoffs.json")
     blocks = BlockStore(BASE / "data" / "blocks.json")
-    studio = Studio(profile, store, verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"), bookings=bookings, handoffs=handoffs, blocks=blocks, outbox_path=BASE / "data" / "outbox.json", llm=client_from_env())
+    missed = MissedStore(BASE / "data" / "missed.json")
+    studio = Studio(profile, store, verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"), bookings=bookings, handoffs=handoffs, blocks=blocks, missed=missed, outbox_path=BASE / "data" / "outbox.json", llm=client_from_env())
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     httpd = make_server(studio, host=host, port=port)
@@ -65,7 +67,7 @@ def main():
         print("Dashboard password: set.")
     else:
         print("Dashboard password: NOT SET — set DASHBOARD_PASSWORD before a public pilot.")
-    print("Webhook: POST /webhook   Leads: GET /leads   Bookings: GET /bookings   Handoffs: GET /handoffs   Dashboard: GET /")
+    print("Webhook: POST /webhook   Leads: GET /leads   Bookings: GET /bookings   Handoffs: GET /handoffs   Missed: GET /missed   Dashboard: GET /")
     httpd.serve_forever()
 
 

@@ -93,7 +93,13 @@ customer as a lead, and lets the owner see everything on one simple dashboard.
   quiet Setup checklist at the bottom (bot replies, number connected,
   prices filled in, owner alerts on), hidden in demo mode: each item
   says what is missing and exactly which setting fixes it, so a fresh
-  install can be checked in one glance before a pitch
+  install can be checked in one glance before a pitch. Today also
+  shows Bad experience, the people who wanted a booking and got a no,
+  or asked a question the bot could not answer, newest first with a
+  call button, so the owner can call them back. A record closes on
+  its own when they book later, and a question the bot could not
+  answer stays hidden while its handoff is open, since it is already
+  under People waiting
 - The look is bold, not soft: a deep warm charcoal page, a warm gold
   accent, today's money huge up front, strong type, a greeting that
   knows the time of day. The people waiting are real people: a big

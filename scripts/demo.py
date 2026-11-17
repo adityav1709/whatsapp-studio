@@ -20,6 +20,7 @@ from whatsapp_studio.bookings import BookingStore  # noqa: E402
 from whatsapp_studio.config import BusinessProfile  # noqa: E402
 from whatsapp_studio.handoffs import HandoffStore  # noqa: E402
 from whatsapp_studio.leads import LeadStore  # noqa: E402
+from whatsapp_studio.missed import MissedStore  # noqa: E402
 
 
 class FakeSender:
@@ -119,7 +120,7 @@ def main():
         sender = FakeSender()
         studio = Studio(
             profile, store, bookings=BookingStore(), handoffs=HandoffStore(),
-            sender=sender, llm=DemoLLM(),
+            missed=MissedStore(), sender=sender, llm=DemoLLM(),
         )
         print(f"sending state: {studio.sending_state()} (fake sender, no token)")
         httpd = make_server(studio, port=0)
