@@ -263,6 +263,49 @@ class BookingStore:
             self._bookings, key=lambda b: (b["date"], b["start_min"])
         )
 
+    def regulars(self, today=None, quiet_days=30):
+        """Repeat customers: phones with two or more bookings, most
+        bookings first. Each entry carries the name the shop knows,
+        how many times they booked, the service they book most, the
+        last visit, and whether they have gone quiet: no booking in
+        the last `quiet_days` days. A shop lives on its regulars,
+        and a regular gone quiet is the one to call first."""
+        if today is None:
+            today = india_today()
+        by_phone = {}
+        for b in self._bookings:
+            by_phone.setdefault(b["phone"], []).append(b)
+        out = []
+        for phone, mine in by_phone.items():
+            if len(mine) < 2:
+                continue
+            mine = sorted(mine, key=lambda b: (b["date"], b["start_min"]))
+            counts = {}
+            usual = None
+            best = 0
+            for b in mine:
+                counts[b["service"]] = counts.get(b["service"], 0) + 1
+                if counts[b["service"]] >= best:
+                    best = counts[b["service"]]
+                    usual = b["service"]
+            name = ""
+            for b in reversed(mine):
+                if (b.get("name") or "").strip():
+                    name = b["name"]
+                    break
+            last = date.fromisoformat(mine[-1]["date"])
+            out.append(
+                {
+                    "phone": phone,
+                    "name": name,
+                    "count": len(mine),
+                    "usual_service": usual,
+                    "last_date": last,
+                    "quiet": (today - last).days > quiet_days,
+                }
+            )
+        return sorted(out, key=lambda r: (r["count"], r["last_date"]), reverse=True)
+
     def overlapping(self, day, start_min, duration_min):
         """Bookings that clash with a slot starting here."""
         end = start_min + duration_min

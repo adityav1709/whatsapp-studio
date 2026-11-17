@@ -91,6 +91,15 @@ def _is_open_now(profile, now):
     return open_min <= current < close_min
 
 
+def _ordinal(n):
+    """1st, 2nd, 3rd, 4th, and the teens stay th: 11th, 12th, 13th."""
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
 def handoff_confirmation(profile, reason, now=None):
     """The one fixed message sent when a handoff opens and there is no
     model to write it: the model failed, so the owner steps in.
@@ -1486,6 +1495,34 @@ class Studio:
         if len(leads) > 5:
             lead_body += "<li class='quiet'>Showing the latest 5.</li>"
 
+        # Regulars: the repeat customers, most bookings first, with a
+        # note when one has gone quiet. Built from the bookings, so
+        # there is nothing new to store; with no regulars yet the
+        # section stays off the page entirely.
+        regulars_html = ""
+        regulars = self.bookings.regulars(today)
+        if regulars:
+            items = []
+            for r in regulars:
+                usual = r["usual_service"].lower()
+                article = "an" if usual[:1] in "aeiou" else "a"
+                line = "<strong>{}</strong>, {} booking, usually {} {}. Last visit {}.".format(
+                    html.escape(r["name"] or r["phone"]),
+                    _ordinal(r["count"]),
+                    article,
+                    html.escape(usual),
+                    html.escape(format_date(r["last_date"])),
+                )
+                if r["quiet"]:
+                    line += " Has not been back in a while."
+                items.append("<li>{}</li>".format(line))
+            regulars_html = (
+                "<h2>Regulars</h2>"
+                "<p class='quiet'>The people who keep coming back. "
+                "A regular gone quiet is worth a call.</p>"
+                "<ul class='list'>{}</ul>".format("".join(items))
+            )
+
         # The full thread for each waiting person, WhatsApp style:
         # the customer on one side, the business on the other, in
         # order, with the time on each message.
@@ -1746,6 +1783,7 @@ class Studio:
                 + nobook_html
                 + "<h2>People who messaged</h2>"
                 "<ul class='list'>{}</ul>".format(lead_body)
+                + regulars_html
             )
         elif tab == "replies":
             body = (
@@ -1864,6 +1902,16 @@ def make_handler(studio):
                 self._send_json(200, {"bookings": studio.bookings.all_bookings()})
             elif parsed.path == "/handoffs":
                 self._send_json(200, {"handoffs": studio.handoffs.all_handoffs()})
+            elif parsed.path == "/regulars":
+                self._send_json(
+                    200,
+                    {
+                        "regulars": [
+                            {**r, "last_date": r["last_date"].isoformat()}
+                            for r in studio.bookings.regulars()
+                        ]
+                    },
+                )
             elif parsed.path == "/export":
                 # The owner's way out and the backup before a redeploy:
                 # everything as one downloadable JSON file.
