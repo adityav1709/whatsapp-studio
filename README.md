@@ -1,9 +1,29 @@
-# WhatsApp Studio — AI receptionist for Indian small businesses
+# WhatsApp Studio — a free AI receptionist for small businesses on WhatsApp
 
-A small business in India lives on WhatsApp. Customers message "facial ka price kya hai?",
-"timing kya hai?", "book karna hai" — and the owner is busy cutting hair, drilling teeth,
-or training clients. WhatsApp Studio answers those messages instantly, captures the
-customer as a lead, and lets the owner see everything on one simple dashboard.
+Customers message "facial ka price kya hai?", "timing kya hai?", "book karna hai" and the owner is busy cutting hair, drilling teeth, or training clients. WhatsApp Studio answers those messages instantly, takes the booking, and hands over to the owner when a human is needed. Free for now. Live demo: https://whatsapp-studio-x31n.onrender.com/
+
+## Install
+
+Needs Python 3.10 or newer. Nothing else to install, the standard library is all it uses.
+
+```bash
+git clone https://github.com/adityav1709/whatsapp-studio.git
+cd whatsapp-studio
+python3 run.py
+```
+
+Open http://127.0.0.1:8000 in a browser. The demo salon is live at once, no keys needed.
+
+To run your own shop, edit `demo/demo_business.json` or point `PROFILE_PATH` at your own profile file, then restart. Name, services, prices, hours, address, all live in that one file, no code changes needed.
+
+To let the bot reply for real, set two things from the environment, never in the repo:
+
+- `LLM_API_KEY` — your OpenAI key. Without it the bot cannot reply. The model is `LLM_MODEL`, gpt-4o-mini by default, a few paise per message at most for a small shop.
+- `WHATSAPP_TOKEN` and `PHONE_NUMBER_ID` — from your WhatsApp Business app. With both set the server sends customer replies live, without them it stays in demo mode and records everything to the outbox.
+
+Before a public pilot also set `WHATSAPP_APP_SECRET` and `DASHBOARD_PASSWORD`. Details are in Going live and Before a public pilot below.
+
+Run the tests with `python3 -m unittest discover -s tests` from the project folder.
 
 **v1.2 — the complete product: the bot holds a conversation, and nothing it says is a lie**
 - Conversation, not one message: the bot remembers what it asked — "book facial"
