@@ -306,6 +306,33 @@ class BookingStore:
             )
         return sorted(out, key=lambda r: (r["count"], r["last_date"]), reverse=True)
 
+    def first_win(self, today=None):
+        """The booking to celebrate, or None. The earliest booking made
+        today (by created_ts, in India time), with kind "first ever"
+        when it is also the earliest booking in the whole store. A
+        booking made today for tomorrow is today's win; one made
+        yesterday for today is not. Records with no usable created_ts
+        are never a win."""
+        if today is None:
+            today = india_today()
+        made = [
+            b for b in self._bookings
+            if isinstance(b.get("created_ts"), (int, float))
+            and not isinstance(b.get("created_ts"), bool)
+        ]
+        if not made:
+            return None
+        earliest = min(made, key=lambda b: b["created_ts"])
+        made_today = [
+            b for b in made
+            if datetime.fromtimestamp(b["created_ts"], tz=IST).date() == today
+        ]
+        if not made_today:
+            return None
+        first_today = min(made_today, key=lambda b: b["created_ts"])
+        kind = "first ever" if first_today is earliest else "first today"
+        return {"booking": first_today, "kind": kind}
+
     def overlapping(self, day, start_min, duration_min):
         """Bookings that clash with a slot starting here."""
         end = start_min + duration_min

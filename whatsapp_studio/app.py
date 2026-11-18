@@ -1168,6 +1168,39 @@ class Studio:
                 "<p class='moneylbl'>booked today</p>"
             ).format(rupees_today)
 
+        def win_line(win):
+            """One quiet line for the first booking the bot made today:
+            who, what service, what time, how much, and which day when
+            the appointment is not today. No dash characters anywhere."""
+            booking = win["booking"]
+            name = (booking.get("name") or "").strip()
+            service = (booking.get("service") or "service").strip().lower()
+            article = "an" if service[:1] in "aeiou" else "a"
+            day = date.fromisoformat(booking["date"])
+            if day == today:
+                when = ""
+            elif day == today + timedelta(days=1):
+                when = " for tomorrow"
+            else:
+                when = " for {}".format(format_date(day))
+            price = booking.get("price")
+            rupees = " for Rs {}".format(price) if price else ""
+            time = format_time(booking["start_min"])
+            if name:
+                detail = "{} booked {} {}{} at {}{}.".format(
+                    name, article, service, when, time, rupees
+                )
+            else:
+                detail = "{} {}{} at {}{}.".format(
+                    article.capitalize(), service, when, time, rupees
+                )
+            if win["kind"] == "first ever":
+                return (
+                    "Your first booking ever. {} "
+                    "The bot made that happen.".format(detail)
+                )
+            return "First booking today. {}".format(detail)
+
         # A greeting that knows what time it is. Small, human, and it
         # makes the page feel like it was opened today, not generated.
         if now.hour < 12:
@@ -1749,6 +1782,7 @@ class Studio:
         .hero .today{font-family:var(--serif);font-size:24px;line-height:1.4;color:var(--paper);margin:0 0 20px}
         .hero .money{font-family:var(--serif);font-size:88px;line-height:1;font-weight:400;letter-spacing:-.02em;color:var(--gold);margin:0}
         .hero .moneylbl{color:#C9C9C2;font-size:15px;margin:14px 0 0}
+        .hero .win{color:var(--gold);font-size:17px;line-height:1.5;margin:20px 0 0}
         .nums{display:flex;gap:32px;margin:0 24px 32px}
         .num .big{display:block;font-family:var(--serif);font-size:40px;font-weight:400;color:var(--ink);line-height:1.1}
         .num .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--grey)}
@@ -1852,9 +1886,22 @@ class Studio:
         ) + "</nav>"
 
         if tab == "today":
+            # The win lives in the hero, under the money: one line about
+            # the first booking the bot made today, or the shop's first
+            # ever. Never in demo mode or dry run: a rehearsal is not a
+            # win, and sample bookings are not real customers. Still
+            # shows when sending is paused: the booking was real when
+            # it was made.
+            win_html = ""
+            if not self.demo_mode and not self.dry_run:
+                win = self.bookings.first_win(today)
+                if win:
+                    win_html = "<p class='win'>{}</p>".format(
+                        html.escape(win_line(win))
+                    )
             hero = (
-                "<section class='hero'><p class='today'>{}</p>{}</section>"
-            ).format(html.escape(sentence), money_html)
+                "<section class='hero'><p class='today'>{}</p>{}{}</section>"
+            ).format(html.escape(sentence), money_html, win_html)
             nums = (
                 "<div class='nums'>"
                 "<div class='num'><span class='big'>{}</span><span class='lbl'>waiting for you</span></div>"

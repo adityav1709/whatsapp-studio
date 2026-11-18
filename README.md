@@ -99,7 +99,10 @@ customer as a lead, and lets the owner see everything on one simple dashboard.
   call button, so the owner can call them back. A record closes on
   its own when they book later, and a question the bot could not
   answer stays hidden while its handoff is open, since it is already
-  under People waiting
+  under People waiting. Today also shows one quiet gold line under
+  the money when the bot makes the first booking of the day, naming
+  who booked what and when, with a bigger version once ever for the
+  shop's first booking. It never appears in demo mode or dry run
 - The look is bold, not soft: a deep warm charcoal page, a warm gold
   accent, today's money huge up front, strong type, a greeting that
   knows the time of day. The people waiting are real people: a big
