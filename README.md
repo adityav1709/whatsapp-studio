@@ -122,7 +122,13 @@ Run the tests with `python3 -m unittest discover -s tests` from the project fold
   under People waiting. Today also shows one quiet gold line under
   the money when the bot makes the first booking of the day, naming
   who booked what and when, with a bigger version once ever for the
-  shop's first booking. It never appears in demo mode or dry run
+  shop's first booking. It never appears in demo mode or dry run.
+  Today also shows one quiet line after the setup checklist inviting
+  the owner to test the bot himself: text the shop number from
+  another phone and ask the price of the first priced service, with
+  the number as a tap to chat link. It only appears when a test would
+  actually get an answer, live sending with a key set and a price on
+  file, and it stays hidden in demo mode
 - The look is bold, not soft: a deep warm charcoal page, a warm gold
   accent, today's money huge up front, strong type, a greeting that
   knows the time of day. The people waiting are real people: a big
