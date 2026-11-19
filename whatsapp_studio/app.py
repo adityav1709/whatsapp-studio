@@ -28,7 +28,7 @@ import time
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from .blocks import BlockStore
 from .bookings import (
@@ -288,6 +288,39 @@ class Studio:
                 ("Owner alerts on", False, "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID on Render so the owner is pinged.")
             )
         return items
+
+    def self_test_line(self):
+        """One quiet line inviting the owner to test the bot himself:
+        text the shop number from another phone and ask the price of
+        the first priced service. Only when a test would actually get
+        an answer: sending live, a key set, not demo mode, a shop
+        number on file, and at least one published price. Otherwise
+        empty, so the owner is never invited to a test that gets
+        silence. The number is a wa.me link with the question
+        prefilled, so tapping it opens WhatsApp ready to send."""
+        if not self.live or self.llm is None or self.demo_mode:
+            return ""
+        digits = "".join(c for c in self.profile.phone if c.isdigit())
+        if not digits:
+            return ""
+        priced = [s for s in self.profile.services if s.price is not None]
+        if not priced:
+            return ""
+        service = priced[0]
+        message = "What is the price of a {}?".format(service.name)
+        link = "https://wa.me/{}?text={}".format(digits, quote(message))
+        return (
+            "<p class='selftest'>Try it yourself. Text "
+            "<a href='{}'>+{}</a> on WhatsApp from another phone and ask: "
+            "{} You should get Rs {} back in a few seconds, and your "
+            "message will show on this page too. If nothing comes back, "
+            "check the bot is on above.</p>"
+        ).format(
+            html.escape(link, quote=True),
+            html.escape(digits),
+            html.escape(message),
+            service.price,
+        )
 
     def enable_sending(self):
         self.sending_disabled = False
@@ -1830,6 +1863,7 @@ class Studio:
         .allclear{font-family:var(--serif);font-size:24px;font-weight:400;color:var(--ink);margin:0 24px}
         .quiet{color:var(--grey);font-size:14px}
         .insight{font-size:17px;color:var(--ink);margin:16px 24px;max-width:700px}
+        .selftest{font-size:17px;color:var(--ink);margin:16px 24px;max-width:700px}
         .list{list-style:none;padding:0;margin:0 24px}
         .list li{background:#fff;border:1px solid var(--sage);border-radius:14px;padding:16px 18px;margin:10px 0;color:var(--ink)}
         .list li.failed{background:var(--goldpale)}
@@ -1858,7 +1892,7 @@ class Studio:
         @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
         @keyframes typeIn{to{max-width:24ch}}
         @keyframes caret{0%{opacity:1}40%{opacity:0}55%{opacity:1}90%{opacity:0}100%{opacity:0}}
-        @supports (animation-timeline:view()){.card,.list li,.thread,h2,.nums,.alerts,.insight,.allclear{animation:fadeUp .6s ease both;animation-timeline:view();animation-range:entry 0% entry 50%}}
+        @supports (animation-timeline:view()){.card,.list li,.thread,h2,.nums,.alerts,.insight,.selftest,.allclear{animation:fadeUp .6s ease both;animation-timeline:view();animation-range:entry 0% entry 50%}}
         @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}.greeting .type{max-width:none!important}.greeting .type::after{display:none}}
         @media (max-width:480px){h1{font-size:40px}header{padding:40px 20px 16px}.tabs{padding:20px 20px 12px;gap:8px}.tabs a{padding:9px 14px;font-size:14px}.hero{padding:40px 24px;margin:16px}.hero .money{font-size:64px}.hero .today{font-size:20px}.num .big{font-size:32px}.nums{gap:20px}.card{padding:22px}.bot{padding:22px 24px}h2{font-size:28px}}
         """
@@ -1936,7 +1970,7 @@ class Studio:
                     "<section class='setup'><h2>{}</h2>"
                     "<ul class='list'>{}</ul></section>"
                 ).format(heading, "".join(lines))
-            body = hero + nums + alerts_section + missed_section + setup_html
+            body = hero + nums + alerts_section + missed_section + setup_html + self.self_test_line()
         elif tab == "bookings":
             # A notice from the last block action, shown once. A
             # refusal names the booking in the way, so the owner knows
