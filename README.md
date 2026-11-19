@@ -124,6 +124,12 @@ Run the tests with `python3 -m unittest discover -s tests` from the project fold
   the money when the bot makes the first booking of the day, naming
   who booked what and when, with a bigger version once ever for the
   shop's first booking. It never appears in demo mode or dry run.
+  Next to it, one more quiet line for the bookings the bot made while
+  the shop was closed, in the most recent closed stretch: while you
+  were closed, who booked and for how much. It stays all day during
+  the open day that follows, and goes away on its own when the next
+  closed stretch has no bookings. When the first booking of the day
+  was itself made after hours, only the moments line shows.
   Today also shows one quiet line after the setup checklist inviting
   the owner to test the bot himself: text the shop number from
   another phone and ask the price of the first priced service, with

@@ -97,6 +97,46 @@ def is_closed(hours_text):
     return (hours_text or "").strip().lower() == "closed"
 
 
+def _span_for_day(hours_for_weekday, day):
+    """Opening span (open_min, close_min) for a date, or None when the
+    shop is shut all day. Hours that do not parse count as open all
+    day, the same rule `_is_open_now` uses: an unparseable day never
+    makes a moment, it only ends the closed stretch at its close."""
+    hours = hours_for_weekday(day.weekday())
+    if is_closed(hours):
+        return None
+    span = parse_hours_range(hours)
+    if span is None:
+        return (0, 24 * 60)
+    return span
+
+
+def _closed_stretch_start(hours_for_weekday, now):
+    """Start of the most recent closed stretch: the closing time of
+    the last open day before the closed run that contains now, or
+    that ended at today's opening. The overnight stretch is one
+    stretch even though it crosses midnight. Returns None when no
+    open day is found in the last eight days."""
+    day = now.date()
+    minute = now.hour * 60 + now.minute
+    span = _span_for_day(hours_for_weekday, day)
+    if span is None or minute < span[0]:
+        # Shut all day, or not open yet: the stretch started earlier.
+        day = day - timedelta(days=1)
+    elif span[0] <= minute < span[1]:
+        # Open right now: the stretch ended at today's opening.
+        day = day - timedelta(days=1)
+    # After closing today the walk starts at today.
+    for _ in range(8):
+        span = _span_for_day(hours_for_weekday, day)
+        if span is None:
+            day = day - timedelta(days=1)
+            continue
+        start = datetime(day.year, day.month, day.day, tzinfo=IST)
+        return start + timedelta(minutes=span[1])
+    return None
+
+
 def parse_day(text, today=None):
     """A date mentioned in a message, or None.
 
@@ -332,6 +372,45 @@ class BookingStore:
         first_today = min(made_today, key=lambda b: b["created_ts"])
         kind = "first ever" if first_today is earliest else "first today"
         return {"booking": first_today, "kind": kind}
+
+    def moments(self, hours_for_weekday, now=None):
+        """Bookings made while the shop was closed, in the most recent
+        closed stretch, each with a reason: "after closing", "before
+        opening", or "closed day". The appointment date plays no part:
+        a booking made at 9 PM for tomorrow morning is a moment, one
+        made at noon for tomorrow is not. Records with no usable
+        created_ts are never moments. Hours are read from the live
+        profile, so if the owner changed his hours since a booking was
+        made it can be misclassified; moments are recent by nature,
+        so the window for a wrong label is small."""
+        now = now or india_now()
+        start = _closed_stretch_start(hours_for_weekday, now)
+        if start is None:
+            return []
+        out = []
+        for b in self._bookings:
+            created = b.get("created_ts")
+            if not isinstance(created, (int, float)) or isinstance(created, bool):
+                continue
+            made = datetime.fromtimestamp(created, tz=IST)
+            if made < start or made > now:
+                continue
+            hours = hours_for_weekday(made.weekday())
+            if is_closed(hours):
+                reason = "closed day"
+            else:
+                span = parse_hours_range(hours)
+                if span is None:
+                    continue
+                minute = made.hour * 60 + made.minute
+                if minute < span[0]:
+                    reason = "before opening"
+                elif minute >= span[1]:
+                    reason = "after closing"
+                else:
+                    continue
+            out.append({"booking": b, "reason": reason})
+        return sorted(out, key=lambda m: m["booking"]["created_ts"])
 
     def overlapping(self, day, start_min, duration_min):
         """Bookings that clash with a slot starting here."""

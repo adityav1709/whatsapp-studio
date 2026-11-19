@@ -1082,7 +1082,7 @@ class Studio:
         thread.extend(customers[i:])
         return thread
 
-    def dashboard_html(self, tab="today"):
+    def dashboard_html(self, tab="today", now=None):
         """The owner's page, in tabs. Server side, no JavaScript: a tab
         is a link to the same page with ?tab=, and the server renders
         only that tab's section. The header (shop name, the day, the
@@ -1114,8 +1114,8 @@ class Studio:
         if tab not in tabs:
             tab = "today"
 
-        today = india_today()
-        now = india_now()
+        now = now or india_now()
+        today = now.date()
         open_handoffs = [
             h for h in self.handoffs.all_handoffs() if h["status"] == "open"
         ]
@@ -1233,6 +1233,46 @@ class Studio:
                     "The bot made that happen.".format(detail)
                 )
             return "First booking today. {}".format(detail)
+
+        def moments_line(moments, today, closed_today):
+            """One quiet line for the bookings the bot made while the
+            shop was closed: who, what service, what time, how much,
+            and which day when the appointment is not today. No dash
+            characters anywhere."""
+            verb = "still booked" if closed_today else "booked"
+            lead = (
+                "Closed today. " if closed_today else "While you were closed, "
+            )
+            if len(moments) == 1:
+                booking = moments[0]["booking"]
+                name = (booking.get("name") or "").strip()
+                service = (booking.get("service") or "service").strip().lower()
+                article = "an" if service[:1] in "aeiou" else "a"
+                day = date.fromisoformat(booking["date"])
+                if day == today:
+                    when = ""
+                elif day == today + timedelta(days=1):
+                    when = " for tomorrow"
+                else:
+                    when = " for {}".format(format_date(day))
+                price = booking.get("price")
+                rupees = " for Rs {}".format(price) if price else ""
+                time = format_time(booking["start_min"])
+                if name:
+                    detail = "{} {} {} {}{} at {}{}".format(
+                        name, verb, article, service, when, time, rupees
+                    )
+                else:
+                    who = "Someone" if closed_today else "someone"
+                    detail = "{} {} {} {}{} at {}{}".format(
+                        who, verb, article, service, when, time, rupees
+                    )
+                return "{}{}.".format(lead, detail)
+            total = sum((m["booking"].get("price") or 0) for m in moments)
+            rupees = " for Rs {}".format(total) if total > 0 else ""
+            return "{}{} people {}{}.".format(
+                lead, len(moments), verb, rupees
+            )
 
         # A greeting that knows what time it is. Small, human, and it
         # makes the page feel like it was opened today, not generated.
@@ -1922,20 +1962,40 @@ class Studio:
         if tab == "today":
             # The win lives in the hero, under the money: one line about
             # the first booking the bot made today, or the shop's first
-            # ever. Never in demo mode or dry run: a rehearsal is not a
-            # win, and sample bookings are not real customers. Still
+            # ever. The moments line sits next to it: the bookings made
+            # while the shop was closed, in the most recent closed
+            # stretch. Never in demo mode or dry run: a rehearsal is not
+            # a win, and sample bookings are not real customers. Still
             # shows when sending is paused: the booking was real when
             # it was made.
             win_html = ""
+            moments_html = ""
             if not self.demo_mode and not self.dry_run:
                 win = self.bookings.first_win(today)
                 if win:
                     win_html = "<p class='win'>{}</p>".format(
                         html.escape(win_line(win))
                     )
+                moments = self.bookings.moments(
+                    self.profile.hours_today, now
+                )
+                if moments:
+                    # When the first booking made today was itself made
+                    # after hours, the moments line says everything the
+                    # win line would say, plus the closed context.
+                    if win and any(
+                        win["booking"] is m["booking"] for m in moments
+                    ):
+                        win_html = ""
+                    closed_today = is_closed(
+                        self.profile.hours_today(today.weekday())
+                    )
+                    moments_html = "<p class='win'>{}</p>".format(
+                        html.escape(moments_line(moments, today, closed_today))
+                    )
             hero = (
-                "<section class='hero'><p class='today'>{}</p>{}{}</section>"
-            ).format(html.escape(sentence), money_html, win_html)
+                "<section class='hero'><p class='today'>{}</p>{}{}{}</section>"
+            ).format(html.escape(sentence), money_html, win_html, moments_html)
             nums = (
                 "<div class='nums'>"
                 "<div class='num'><span class='big'>{}</span><span class='lbl'>waiting for you</span></div>"
