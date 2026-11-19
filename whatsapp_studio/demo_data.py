@@ -152,6 +152,63 @@ def _sample_time(base, ago, day_start, previous):
     return ts
 
 
+def _last_closing_time(now):
+    """Most recent 8:30 PM in India time: a booking made then was
+    made after the shop closed, whatever time the server booted."""
+    candidate = now.replace(hour=20, minute=30, second=0, microsecond=0)
+    if candidate > now:
+        candidate -= timedelta(days=1)
+    return int(candidate.timestamp())
+
+
+def _seed_mock_extras(studio, now, today, base):
+    """The rest of the showcase, so every section has something to
+    show: a regular, a booking made after closing, and two people
+    who left with nothing. All sample numbers, all in the past so
+    the counts for today stay exactly as the sample day sets them.
+    The moment booking is made after closing on purpose: its
+    created time is set back to the most recent 8:30 PM, since
+    book() always stamps now. Only the JSON store lets a seed set
+    that time; the Postgres store has no such path, and the showcase
+    never runs on Postgres anyway."""
+    haircut = studio.profile.service_named("Haircut")
+    facial = studio.profile.service_named("Facial")
+    hair_spa = studio.profile.service_named("Hair Spa")
+    if haircut is not None:
+        studio.bookings.book(
+            "919810000001", "Rahul", haircut, today - timedelta(days=10), 660
+        )
+    moment = None
+    if facial is not None:
+        moment = studio.bookings.book(
+            "919810000007", "Meera", facial, today + timedelta(days=1), 660
+        )
+    if moment is not None and getattr(studio.bookings, "backend", "json") == "json":
+        moment["created_ts"] = _last_closing_time(now)
+        studio.bookings._save()
+    if hair_spa is not None:
+        studio.missed.record_refused(
+            "919810000008",
+            "Karan",
+            "Hair Spa",
+            today,
+            870,
+            "already taken",
+            ["3:30 PM"],
+            "book hair spa today 2:30pm",
+            now_ts=base,
+            sample=True,
+        )
+    studio.missed.record_unanswered(
+        "919810000009",
+        "Divya",
+        "Do you do keratin treatment?",
+        "cannot answer",
+        now_ts=base,
+        sample=True,
+    )
+
+
 def seed_demo_data(studio, now=None):
     """Fill empty stores with the sample day. Returns True when it
     seeded, False when any store already had data and nothing changed.
@@ -209,5 +266,6 @@ def seed_demo_data(studio, now=None):
             if service is not None:
                 day = today if booking["day"] == "today" else today + timedelta(days=1)
                 studio.bookings.book(phone, name, service, day, booking["start_min"])
+    _seed_mock_extras(studio, now, today, base)
     studio._save_outbox()
     return True

@@ -47,6 +47,12 @@ class TestDemoMode(unittest.TestCase):
             self.assertTrue(
                 all(e.get("send_status") == "recorded" for e in studio.outbox)
             )
+            # The mock extras ride along with the sample day: one
+            # regular, one booking made after closing, two people who
+            # left with nothing. Today stays exactly as before.
+            self.assertEqual(len(studio.bookings.all_bookings()), 5)
+            self.assertEqual(len(studio.bookings.regulars()), 1)
+            self.assertEqual(len(studio.missed.open_newest()), 2)
 
     def test_demo_mode_thread_is_a_full_conversation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,7 +112,7 @@ class TestDemoMode(unittest.TestCase):
                 len([h for h in second.handoffs.all_handoffs() if h["status"] == "open"]),
                 2,
             )
-            self.assertEqual(len(second.bookings.all_bookings()), 3)
+            self.assertEqual(len(second.bookings.all_bookings()), 5)
             self.assertEqual(len(second.outbox), 7)
             self.assertIs(first.demo_mode, True)
             self.assertIs(second.demo_mode, True)

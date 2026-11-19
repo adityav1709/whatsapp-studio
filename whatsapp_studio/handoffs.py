@@ -52,6 +52,8 @@ def _atomic_write(path, text):
 class HandoffStore:
     """Handoffs persisted as JSON; path=None keeps them in memory only."""
 
+    backend = "json"
+
     def __init__(self, path=None):
         self.path = Path(path) if path else None
         self._handoffs = []

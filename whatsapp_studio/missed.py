@@ -95,6 +95,8 @@ class MissedStore:
     """Missed customers persisted as JSON; path=None keeps them in
     memory only."""
 
+    backend = "json"
+
     def __init__(self, path=None):
         self.path = Path(path) if path else None
         self._records = []
@@ -147,11 +149,13 @@ class MissedStore:
             "resolved_how": None,
         }
 
-    def record_refused(self, phone, name, service, day, start_min, reason, alternatives, trigger, now_ts=None):
+    def record_refused(self, phone, name, service, day, start_min, reason, alternatives, trigger, now_ts=None, sample=False):
         """Record a refused booking, or bump the open record when the
         same person asked for the same slot again. Returns the record,
-        or None for a demo phone, which is never recorded."""
-        if (phone or "").startswith(_DEMO_PREFIX):
+        or None for a demo phone, which is never recorded. The seeder
+        passes sample=True so the showcase can show the section with
+        fake numbers; live traffic never passes it."""
+        if (phone or "").startswith(_DEMO_PREFIX) and not sample:
             return None
         now_ts = now_ts if now_ts is not None else int(time.time())
         date_key = day.isoformat() if day is not None else None
@@ -186,11 +190,13 @@ class MissedStore:
         self._write()
         return record
 
-    def record_unanswered(self, phone, name, question, reason, handoff_id=None, now_ts=None):
+    def record_unanswered(self, phone, name, question, reason, handoff_id=None, now_ts=None, sample=False):
         """Record a question the bot could not answer, or bump the
         open record when the same person asked it again. Returns the
-        record, or None for a demo phone."""
-        if (phone or "").startswith(_DEMO_PREFIX):
+        record, or None for a demo phone. The seeder passes sample=True
+        so the showcase can show the section with fake numbers; live
+        traffic never passes it."""
+        if (phone or "").startswith(_DEMO_PREFIX) and not sample:
             return None
         now_ts = now_ts if now_ts is not None else int(time.time())
         for record in self._records:

@@ -14,6 +14,14 @@ import time
 from pathlib import Path
 
 
+class DuplicateMessageError(Exception):
+    """A message id Meta already delivered. Raised by a store when the
+    wamid was already recorded, so the caller can skip the turn
+    instead of answering the same message twice. Only the Postgres
+    store raises it; the JSON store keeps the old check-then-record
+    shape."""
+
+
 def _atomic_write(path, text):
     """Write a file so a crash mid-write cannot corrupt it: a uniquely
     named temp file in the same directory, then a rename. The server
@@ -34,11 +42,13 @@ def _atomic_write(path, text):
 
 
 class LeadStore:
-    def __init__(self, path):
-        self.path = Path(path)
+    backend = "json"
+
+    def __init__(self, path=None):
+        self.path = Path(path) if path else None
         self._leads = {}
         self._save_lock = threading.Lock()
-        if self.path.exists():
+        if self.path and self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
                 self._leads = data if isinstance(data, dict) else {}
@@ -48,6 +58,8 @@ class LeadStore:
                 self._leads = {}
 
     def _save(self):
+        if self.path is None:
+            return
         with self._save_lock:
             _atomic_write(self.path, json.dumps(self._leads, indent=2))
 

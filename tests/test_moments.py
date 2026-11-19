@@ -411,9 +411,12 @@ class TestMomentsDashboard(unittest.TestCase):
 
     def test_dashboard_hides_moments_in_demo_mode(self):
         studio = _studio(self.tmp.name, demo_mode=True)
+        # Noon, not 11am: the demo seed already holds a sample
+        # booking at 11am tomorrow, and the slot check counts every
+        # service at that time.
         _book(
             studio, "919999900001", "Priya", "Haircut",
-            self.tomorrow, 660, created=_epoch(self.yesterday, 21, 0),
+            self.tomorrow, 720, created=_epoch(self.yesterday, 21, 0),
         )
         page = studio.dashboard_html("today", now=_at(self.today, 9))
         self.assertIsNone(_moments_text(page))

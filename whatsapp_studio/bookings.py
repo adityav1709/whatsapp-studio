@@ -50,6 +50,106 @@ _MONTHS = {
 _RELATIVE_TIMES = {"subah": 11 * 60, "dopahar": 15 * 60, "shaam": 18 * 60, "sham": 18 * 60}
 
 
+def _regulars_from(bookings, today, quiet_days=30):
+    """Repeat customers, from a plain list of booking dicts: phones
+    with two or more bookings, most bookings first. Each entry carries
+    the name the shop knows, how many times they booked, the service
+    they book most, the last visit, and whether they have gone quiet.
+    Shared by the JSON store and the Postgres store, so the two
+    backends can never disagree about who a regular is."""
+    by_phone = {}
+    for b in bookings:
+        by_phone.setdefault(b["phone"], []).append(b)
+    out = []
+    for phone, mine in by_phone.items():
+        if len(mine) < 2:
+            continue
+        mine = sorted(mine, key=lambda b: (b["date"], b["start_min"]))
+        counts = {}
+        usual = None
+        best = 0
+        for b in mine:
+            counts[b["service"]] = counts.get(b["service"], 0) + 1
+            if counts[b["service"]] >= best:
+                best = counts[b["service"]]
+                usual = b["service"]
+        name = ""
+        for b in reversed(mine):
+            if (b.get("name") or "").strip():
+                name = b["name"]
+                break
+        last = date.fromisoformat(mine[-1]["date"])
+        out.append(
+            {
+                "phone": phone,
+                "name": name,
+                "count": len(mine),
+                "usual_service": usual,
+                "last_date": last,
+                "quiet": (today - last).days > quiet_days,
+            }
+        )
+    return sorted(out, key=lambda r: (r["count"], r["last_date"]), reverse=True)
+
+
+def _first_win_from(bookings, today):
+    """The booking to celebrate, or None: the earliest booking made
+    today (by created_ts, in India time), with kind "first ever" when
+    it is also the earliest booking in the whole store. Records with
+    no usable created_ts are never a win."""
+    made = [
+        b for b in bookings
+        if isinstance(b.get("created_ts"), (int, float))
+        and not isinstance(b.get("created_ts"), bool)
+    ]
+    if not made:
+        return None
+    earliest = min(made, key=lambda b: b["created_ts"])
+    made_today = [
+        b for b in made
+        if datetime.fromtimestamp(b["created_ts"], tz=IST).date() == today
+    ]
+    if not made_today:
+        return None
+    first_today = min(made_today, key=lambda b: b["created_ts"])
+    kind = "first ever" if first_today is earliest else "first today"
+    return {"booking": first_today, "kind": kind}
+
+
+def _moments_from(bookings, hours_for_weekday, now):
+    """Bookings made while the shop was closed, in the most recent
+    closed stretch, each with a reason: "after closing", "before
+    opening", or "closed day". The appointment date plays no part.
+    Records with no usable created_ts are never moments."""
+    start = _closed_stretch_start(hours_for_weekday, now)
+    if start is None:
+        return []
+    out = []
+    for b in bookings:
+        created = b.get("created_ts")
+        if not isinstance(created, (int, float)) or isinstance(created, bool):
+            continue
+        made = datetime.fromtimestamp(created, tz=IST)
+        if made < start or made > now:
+            continue
+        hours = hours_for_weekday(made.weekday())
+        if is_closed(hours):
+            reason = "closed day"
+        else:
+            span = parse_hours_range(hours)
+            if span is None:
+                continue
+            minute = made.hour * 60 + made.minute
+            if minute < span[0]:
+                reason = "before opening"
+            elif minute >= span[1]:
+                reason = "after closing"
+            else:
+                continue
+        out.append({"booking": b, "reason": reason})
+    return sorted(out, key=lambda m: m["booking"]["created_ts"])
+
+
 def format_time(minutes):
     """11:00 AM style; minutes since midnight."""
     hour, minute = divmod(minutes, 60)
@@ -277,6 +377,8 @@ def _atomic_write(path, text):
 class BookingStore:
     """Bookings persisted as JSON; path=None keeps them in memory only."""
 
+    backend = "json"
+
     def __init__(self, path=None):
         self.path = Path(path) if path else None
         self._bookings = []
@@ -312,39 +414,7 @@ class BookingStore:
         and a regular gone quiet is the one to call first."""
         if today is None:
             today = india_today()
-        by_phone = {}
-        for b in self._bookings:
-            by_phone.setdefault(b["phone"], []).append(b)
-        out = []
-        for phone, mine in by_phone.items():
-            if len(mine) < 2:
-                continue
-            mine = sorted(mine, key=lambda b: (b["date"], b["start_min"]))
-            counts = {}
-            usual = None
-            best = 0
-            for b in mine:
-                counts[b["service"]] = counts.get(b["service"], 0) + 1
-                if counts[b["service"]] >= best:
-                    best = counts[b["service"]]
-                    usual = b["service"]
-            name = ""
-            for b in reversed(mine):
-                if (b.get("name") or "").strip():
-                    name = b["name"]
-                    break
-            last = date.fromisoformat(mine[-1]["date"])
-            out.append(
-                {
-                    "phone": phone,
-                    "name": name,
-                    "count": len(mine),
-                    "usual_service": usual,
-                    "last_date": last,
-                    "quiet": (today - last).days > quiet_days,
-                }
-            )
-        return sorted(out, key=lambda r: (r["count"], r["last_date"]), reverse=True)
+        return _regulars_from(self._bookings, today, quiet_days)
 
     def first_win(self, today=None):
         """The booking to celebrate, or None. The earliest booking made
@@ -355,23 +425,7 @@ class BookingStore:
         are never a win."""
         if today is None:
             today = india_today()
-        made = [
-            b for b in self._bookings
-            if isinstance(b.get("created_ts"), (int, float))
-            and not isinstance(b.get("created_ts"), bool)
-        ]
-        if not made:
-            return None
-        earliest = min(made, key=lambda b: b["created_ts"])
-        made_today = [
-            b for b in made
-            if datetime.fromtimestamp(b["created_ts"], tz=IST).date() == today
-        ]
-        if not made_today:
-            return None
-        first_today = min(made_today, key=lambda b: b["created_ts"])
-        kind = "first ever" if first_today is earliest else "first today"
-        return {"booking": first_today, "kind": kind}
+        return _first_win_from(self._bookings, today)
 
     def moments(self, hours_for_weekday, now=None):
         """Bookings made while the shop was closed, in the most recent
@@ -384,33 +438,7 @@ class BookingStore:
         made it can be misclassified; moments are recent by nature,
         so the window for a wrong label is small."""
         now = now or india_now()
-        start = _closed_stretch_start(hours_for_weekday, now)
-        if start is None:
-            return []
-        out = []
-        for b in self._bookings:
-            created = b.get("created_ts")
-            if not isinstance(created, (int, float)) or isinstance(created, bool):
-                continue
-            made = datetime.fromtimestamp(created, tz=IST)
-            if made < start or made > now:
-                continue
-            hours = hours_for_weekday(made.weekday())
-            if is_closed(hours):
-                reason = "closed day"
-            else:
-                span = parse_hours_range(hours)
-                if span is None:
-                    continue
-                minute = made.hour * 60 + made.minute
-                if minute < span[0]:
-                    reason = "before opening"
-                elif minute >= span[1]:
-                    reason = "after closing"
-                else:
-                    continue
-            out.append({"booking": b, "reason": reason})
-        return sorted(out, key=lambda m: m["booking"]["created_ts"])
+        return _moments_from(self._bookings, hours_for_weekday, now)
 
     def overlapping(self, day, start_min, duration_min):
         """Bookings that clash with a slot starting here."""
@@ -464,6 +492,39 @@ class BookingStore:
         self._bookings.append(booking)
         self._save()
         return booking
+
+    def reschedule(self, phone, name, service, day, start_min, price=None):
+        """Move the customer's most recent upcoming booking to a new
+        slot, as one step. Returns (cancelled, booking). When the new
+        slot is not free, or there is no booking to move, both are
+        None and nothing changes. A failed move never destroys the
+        booking it was meant to move: when the new booking cannot be
+        made, the old one goes back. The Postgres store does the same
+        in one transaction; this one does it in one method so the
+        caller never holds a cancelled booking in its hands."""
+        today = india_today().isoformat()
+        mine = [
+            b for b in self._bookings
+            if b["phone"] == phone and b["date"] >= today
+        ]
+        if not mine:
+            return None, None
+        latest = sorted(mine, key=lambda b: (b["date"], b["start_min"]))[-1]
+        others = [
+            b for b in self.overlapping(day, start_min, service.duration_min)
+            if b is not latest
+        ]
+        if len(others) >= service.capacity:
+            return None, None
+        self._bookings.remove(latest)
+        booking = self.book(
+            phone, name, service, day, start_min, price=price
+        )
+        if booking is None:
+            self._bookings.append(latest)
+            self._save()
+            return None, None
+        return latest, booking
 
     def cancel_latest(self, phone):
         """Cancel the customer's most recent upcoming booking; returns it."""

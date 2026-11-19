@@ -538,8 +538,11 @@ class TestMissedFlow(unittest.TestCase):
             "Haircut", "tomorrow", "11am",
             "Sorry, 11:00 AM tomorrow is already taken.",
         ))
+        # The demo seed itself carries sample missed records, so the
+        # turn must add none rather than the store staying empty.
+        before = len(studio.missed.all_records())
         studio.handle_message(PRIYA, "book haircut tomorrow 11am", "Priya")
-        self.assertEqual(studio.missed.all_records(), [])
+        self.assertEqual(len(studio.missed.all_records()), before)
 
     def test_no_record_from_a_voice_note(self):
         self.studio.handle_non_text_message(PRIYA, "audio", "Priya")

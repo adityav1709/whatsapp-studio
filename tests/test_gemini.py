@@ -415,6 +415,45 @@ class TestStudioWithGemini(unittest.TestCase):
             llm=client,
         )
 
+    def test_gemini_drafts_a_reply_for_a_waiting_person(self):
+        # The owner taps Draft a reply with the Gemini key set: the
+        # brain itself writes the draft, in words only, so it cannot
+        # book, cancel, or change anything. The draft is never sent.
+        payload = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": "Hi Rahul, sorry for the wait. The team will call you about the refund today."}
+                        ]
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout=None):
+            return self._fake_response(payload)
+
+        studio = self._studio(GeminiClient("AIza-test"))
+        studio.leads.record_message(
+            "919810000001", "can I talk to a person please", None, "Rahul"
+        )
+        studio.handoffs.open(
+            "919810000001",
+            "Rahul",
+            "asked for a person",
+            "can I talk to a person please",
+        )
+        with mock.patch(
+            "whatsapp_studio.llm.urllib.request.urlopen", fake_urlopen
+        ):
+            draft = studio.draft_reply("919810000001")
+        self.assertEqual(
+            draft,
+            "Hi Rahul, sorry for the wait. The team will call you about the refund today.",
+        )
+        self.assertIsNotNone(studio.handoffs.open_for("919810000001"))
+
     def test_gemini_books_through_get_price(self):
         payloads = [
             {

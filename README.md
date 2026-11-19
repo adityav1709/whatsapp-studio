@@ -4,7 +4,7 @@ Customers message "facial ka price kya hai?", "timing kya hai?", "book karna hai
 
 ## Install
 
-Needs Python 3.10 or newer. Nothing else to install, the standard library is all it uses.
+Needs Python 3.10 or newer. Nothing else to install for local use, the standard library is all it uses. Postgres storage needs one install, `pip install -r requirements.txt`, and only when `DATABASE_URL` is set.
 
 ```bash
 git clone https://github.com/adityav1709/whatsapp-studio.git
@@ -25,6 +25,21 @@ To let the bot reply for real, set two things from the environment, never in the
 Before a public pilot also set `WHATSAPP_APP_SECRET` and `DASHBOARD_PASSWORD`. Details are in Going live and Before a public pilot below.
 
 Run the tests with `python3 -m unittest discover -s tests` from the project folder.
+
+**Saving your data (Postgres)**
+- By default the shop saves to JSON files under `data/`, and on Render's free tier a redeploy can wipe them. Set `DATABASE_URL` to a Postgres connection string and the shop saves there instead: one table each for customers, bookings, handoffs, blocks, missed customers and the reply history, plus a dedup table for incoming message ids. The tables are created at startup.
+- Local dev needs nothing: with no `DATABASE_URL` set, the JSON files are used exactly as before, and no database install is needed.
+- Demo mode never runs against a real database. `DEMO_MODE=1` with `DATABASE_URL` set refuses to start, so sample customers can never land on real slots.
+- Moving existing data over: export first, then `python3 scripts/import_json.py --dry-run` to see what would move, then `--confirm` to move it. The import runs in one step, refuses unless the tables are empty, and never imports demo phones. `--verify` checks the counts and a sample of records after the move.
+- If the database goes down, the shop says so: `/health` answers 503 and the dashboard line under Setup says bookings are saved on this server for now. The bot never silently falls back to JSON on a live install.
+- Honest limit: Render's free Postgres is a 30 day trial with no backups. Before real shop data lands, move to the paid tier, about $6 to $7 a month, or export regularly.
+
+**v2.1 — the data survives a redeploy: Postgres storage**
+- Set `DATABASE_URL` and every store moves to Postgres: customers, bookings, handoffs, blocks, missed customers, the outbox, and the dedup table that stops a redelivered WhatsApp message being answered twice. Without it, the JSON files carry on exactly as before.
+- Two bookings can no longer take the same slot: the availability check and the insert happen as one locked step in the database, so a second webhook cannot slip in between. A reschedule is one step too: the old booking only goes when the new one is in.
+- A redelivered message is answered once: the message id claim and the message record happen in one database step, so a Meta redelivery that arrives while the first is still being handled is caught.
+- The dashboard says plainly how the shop saves: a quiet line under Setup, "Your bookings are saved safely" on Postgres, or a plain warning on JSON. `/health` gains `db` and `db_ok`, and answers 503 while the database is down.
+- `/export` now covers everything: missed customers and the reply history join leads, bookings, handoffs and blocks, with the export time and the counts.
 
 **v1.2 — the complete product: the bot holds a conversation, and nothing it says is a lie**
 - Conversation, not one message: the bot remembers what it asked — "book facial"
@@ -124,6 +139,9 @@ Run the tests with `python3 -m unittest discover -s tests` from the project fold
   the money when the bot makes the first booking of the day, naming
   who booked what and when, with a bigger version once ever for the
   shop's first booking. It never appears in demo mode or dry run.
+  Add ?mock=1 to the page address to preview it with sample data:
+  the win line and the moments line both show, and the page says
+  it is a mock preview, so nothing reads as a real customer.
   Next to it, one more quiet line for the bookings the bot made while
   the shop was closed, in the most recent closed stretch: while you
   were closed, who booked and for how much. It stays all day during

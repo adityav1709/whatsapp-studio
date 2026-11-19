@@ -9,7 +9,10 @@ Env:    PORT (default 8000), HOST (default 127.0.0.1; set 0.0.0.0 when
         records messages and replies to nobody), LLM_MODEL (default
         gpt-4o-mini), DEMO_MODE=1 (showcase: the bot reads as on with
         sample customers on empty stores; off by default, a real
-        install with no key still says so plainly)
+        install with no key still says so plainly),
+        DATABASE_URL (set to save bookings, customers and replies in
+        Postgres instead of JSON files; without it the JSON files
+        under data/ are used, exactly as before)
 """
 from __future__ import annotations
 
@@ -17,13 +20,9 @@ import os
 from pathlib import Path
 
 from whatsapp_studio.app import Studio, make_server
-from whatsapp_studio.blocks import BlockStore
-from whatsapp_studio.bookings import BookingStore
 from whatsapp_studio.config import BusinessProfile
-from whatsapp_studio.handoffs import HandoffStore
-from whatsapp_studio.leads import LeadStore
+from whatsapp_studio.db import build_stores
 from whatsapp_studio.llm import client_from_env
-from whatsapp_studio.missed import MissedStore
 
 BASE = Path(__file__).resolve().parent
 
@@ -37,16 +36,35 @@ def load_profile():
 
 def main():
     profile = load_profile()
-    store = LeadStore(BASE / "data" / "leads.json")
-    bookings = BookingStore(BASE / "data" / "bookings.json")
-    handoffs = HandoffStore(BASE / "data" / "handoffs.json")
-    blocks = BlockStore(BASE / "data" / "blocks.json")
-    missed = MissedStore(BASE / "data" / "missed.json")
-    studio = Studio(profile, store, verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"), bookings=bookings, handoffs=handoffs, blocks=blocks, missed=missed, outbox_path=BASE / "data" / "outbox.json", llm=client_from_env())
+    database_url = os.environ.get("DATABASE_URL") or None
+    # Demo mode never runs against a real database: seeding sample
+    # customers into it would put fake bookings on real slots. Refuse
+    # loudly at boot instead of starting in a broken state.
+    if database_url and os.environ.get("DEMO_MODE") == "1":
+        raise SystemExit(
+            "DEMO_MODE=1 refuses to run against a real database."
+            " Unset DEMO_MODE or DATABASE_URL and restart."
+        )
+    stores = build_stores(database_url, BASE / "data")
+    studio = Studio(
+        profile,
+        stores.leads,
+        verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"),
+        bookings=stores.bookings,
+        handoffs=stores.handoffs,
+        blocks=stores.blocks,
+        missed=stores.missed,
+        outbox_store=stores.outbox,
+        llm=client_from_env(),
+    )
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     httpd = make_server(studio, host=host, port=port)
     print(f"WhatsApp Studio running for {profile.name} on http://{host}:{port}")
+    if database_url:
+        print("Storage: Postgres (DATABASE_URL set).")
+    else:
+        print("Storage: JSON files under data/. Set DATABASE_URL for Postgres.")
     if studio.llm is not None:
         print(f"LLM: on (model {studio.llm.model}).")
     else:

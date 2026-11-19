@@ -22,7 +22,6 @@ from __future__ import annotations
 import html
 import json
 import os
-import tempfile
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -45,8 +44,10 @@ from .bookings import (
     parse_time,
     validate_slot,
 )
+from .db import JsonOutboxStore
 from .demo_data import seed_demo_data
 from .handoffs import HandoffStore, age_text
+from .leads import DuplicateMessageError
 from .llm import (
     LLM_TOOLS,
     MAX_LLM_CHARS,
@@ -59,25 +60,6 @@ from .missed import MissedStore, REFUSAL_ERRORS, plain_reason
 from .notify import TelegramNotifier, notifier_from_env
 from .security import check_basic_auth, verify_webhook_signature
 from .send import MAX_TEXT_CHARS, sender_from_env
-
-
-def _atomic_write(path, text):
-    """Write a file so a crash mid-write cannot corrupt it: a uniquely
-    named temp file in the same directory, then a rename. The server
-    handles webhooks on threads, so the temp name must be unique per
-    write — two webhooks at the same moment must never share one."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
 
 
 def _is_open_now(profile, now):
@@ -139,7 +121,7 @@ def handoff_confirmation(profile, reason, now=None):
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, missed=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, llm=None, demo_mode=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, missed=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, outbox_store=None, llm=None, demo_mode=None):
         self.profile = profile
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
@@ -194,9 +176,26 @@ class Studio:
         # read exactly what would have been sent before anything reaches a customer.
         # With a path, the reply history survives a restart the same way
         # leads and bookings do; without one it stays in memory only.
-        self._outbox_path = Path(outbox_path) if outbox_path else None
+        # A Postgres install passes its own outbox store instead.
+        self._outbox_store = (
+            outbox_store
+            if outbox_store is not None
+            else JsonOutboxStore(outbox_path)
+        )
         self._outbox_lock = threading.Lock()
         self.outbox = self._load_outbox()
+        # Demo mode never runs against a real database: seeding sample
+        # customers into it would put fake bookings on real slots and
+        # silence the bot for fake phones. Refuse loudly instead.
+        if self.demo_mode and any(
+            getattr(s, "backend", "json") == "postgres"
+            for s in (self.leads, self.bookings, self.handoffs,
+                      self.blocks, self.missed)
+        ):
+            raise RuntimeError(
+                "Demo mode refuses to run against a real database."
+                " Unset DEMO_MODE or DATABASE_URL and restart."
+            )
         # A dead empty page attracts nobody. In demo mode, and only
         # when the stores are empty, seed the sample day at boot so
         # the dashboard shows the bot at work. Real data is never
@@ -205,23 +204,25 @@ class Studio:
             seed_demo_data(self)
 
     def _load_outbox(self):
-        if self._outbox_path is None or not self._outbox_path.exists():
-            return []
-        try:
-            data = json.loads(self._outbox_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return []
-        if not isinstance(data, list):
-            return []
-        return data[-100:]
+        return self._outbox_store.load()
 
     def _save_outbox(self):
-        if self._outbox_path is None:
-            return
         if len(self.outbox) > 100:
             del self.outbox[:-100]
         with self._outbox_lock:
-            _atomic_write(self._outbox_path, json.dumps(self.outbox, indent=2))
+            self._outbox_store.save(self.outbox)
+
+    def db_status(self):
+        """True when saving works. The JSON stores always work; a
+        Postgres store pings the database, so a dead database reads
+        as down instead of an empty shop."""
+        ping = getattr(self.leads, "ping", None)
+        if ping is None:
+            return True
+        try:
+            return bool(ping())
+        except Exception:
+            return False
 
     @property
     def live(self):
@@ -322,6 +323,22 @@ class Studio:
             service.price,
         )
 
+    def saving_line(self):
+        """One quiet line under Setup, on real installs only: whether
+        bookings survive a restart. Plain words, no database jargon.
+        Empty in demo mode, where the page is a showcase."""
+        if self.demo_mode:
+            return ""
+        if getattr(self.leads, "backend", "json") == "postgres":
+            text = "Your bookings are saved safely. They stay even when the app restarts."
+        else:
+            text = (
+                "Your bookings are saved on this server for now. "
+                "They can be lost when the app restarts. "
+                "Ask Aditya about safe saving."
+            )
+        return "<p class='saving'>{}</p>".format(html.escape(text))
+
     def enable_sending(self):
         self.sending_disabled = False
 
@@ -414,8 +431,9 @@ class Studio:
         entry["wamid"] = wamid
 
     def _record_reply(self, phone, text, intent, sender_name, reply, wamid=None):
-        """Record the incoming message, queue the reply, and send it if live."""
-        self.leads.record_message(phone, text, intent, sender_name, wamid=wamid)
+        """Queue the reply, and send it if live. The incoming message
+        is already recorded by handle_message before the brain runs, so
+        this only records the reply."""
         entry = {"to": phone, "body": reply, "intent": intent, "ts": int(time.time())}
         self.outbox.append(entry)
         self._dispatch(entry)
@@ -423,15 +441,22 @@ class Studio:
         return entry
 
     def handle_message(self, phone, text, sender_name="", now=None, wamid=None):
+        # The message is recorded first, before the brain runs, and the
+        # wamid claim is the dedup: a redelivery of a message already
+        # recorded raises instead of being answered twice. Meta
+        # redelivers when it gets no 200, so this is the turn the
+        # duplicate is caught on.
+        try:
+            self.leads.record_message(phone, text, None, sender_name, wamid=wamid)
+        except DuplicateMessageError:
+            return {"to": phone, "body": None, "duplicate": True}
         # A handoff is total: while one is open the message is recorded for
         # the owner to read, but the bot sends nothing.
         if self.handoffs.open_for(phone) is not None:
-            self.leads.record_message(phone, text, None, sender_name, wamid=wamid)
             return {"to": phone, "body": None, "paused": True}
-        # No key, no brain: the bot cannot reply. Record the lead and
-        # send nothing; the dashboard says a key is needed.
+        # No key, no brain: the bot cannot reply. The lead is recorded
+        # above and nothing is sent; the dashboard says a key is needed.
         if self.llm is None:
-            self.leads.record_message(phone, text, None, sender_name, wamid=wamid)
             return {"to": phone, "body": None, "no_llm": True}
         reply = self._llm_reply(phone, text, sender_name, now)
         if reply is None:
@@ -443,7 +468,6 @@ class Studio:
                     phone, sender_name, text, "model failed", handoff["id"]
                 )
             confirmation = handoff_confirmation(self.profile, "couldn't reply", now)
-            self.leads.record_message(phone, text, None, sender_name, wamid=wamid)
             entry = {"to": phone, "body": confirmation, "intent": "handoff", "handoff": handoff["id"], "ts": int(time.time())}
             self.outbox.append(entry)
             self._dispatch(entry)
@@ -859,6 +883,8 @@ class Studio:
                 }
             # The old booking is only cancelled once the new slot is
             # valid and free; a failed move never destroys a booking.
+            # The store moves it as one step, so a second webhook
+            # cannot take the slot in between.
             others = [
                 b
                 for b in self.bookings.overlapping(day, start, service.duration_min)
@@ -874,19 +900,15 @@ class Studio:
                     "error": "already taken",
                     "alternatives": _alternatives(day, service, start),
                 }
-            cancelled = self.bookings.cancel_latest(phone)
-            keep_price = (
-                latest.get("price")
-                if service.name == latest["service"]
-                else None
-            )
-            booking = self.bookings.book(
+            cancelled, booking = self.bookings.reschedule(
                 phone,
                 latest.get("name") or sender_name,
                 service,
                 day,
                 start,
-                price=keep_price,
+                price=latest.get("price")
+                if service.name == latest["service"]
+                else None,
             )
             if booking is None:
                 return {"ok": False, "error": "already taken"}
@@ -954,21 +976,23 @@ class Studio:
             "document": "document",
         }
         label = labels.get(msg_type, "message")
-        # While a handoff is open the bot stays quiet; the message is
-        # still recorded for the owner to read.
-        if self.handoffs.open_for(phone) is not None:
+        # The message is recorded first, before anything else, and the
+        # wamid claim is the dedup, the same as typed messages.
+        try:
             self.leads.record_message(
                 phone, f"[sent a {label}]", None, sender_name, wamid=wamid
             )
+        except DuplicateMessageError:
+            return None
+        # While a handoff is open the bot stays quiet; the message is
+        # still recorded for the owner to read.
+        if self.handoffs.open_for(phone) is not None:
             return None
         reason = f"sent a {label}"
         handoff = self.handoffs.open(phone, sender_name, reason, f"sent a {label}")
         reply = (
             "I can only read typed messages right now — please type it "
             "and I will help right away."
-        )
-        self.leads.record_message(
-            phone, f"[sent a {label}]", None, sender_name, wamid=wamid
         )
         entry = {"to": phone, "body": reply, "intent": "handoff", "handoff": handoff["id"], "ts": int(time.time())}
         self.outbox.append(entry)
@@ -1005,15 +1029,21 @@ class Studio:
                     wamid = msg.get("id")
                     if wamid and self.leads.has_wamid(phone, wamid):
                         continue
-                    if msg.get("type") != "text":
-                        self.handle_non_text_message(
-                            phone, msg.get("type", ""), contacts.get(phone, ""), wamid=wamid
-                        )
+                    try:
+                        if msg.get("type") != "text":
+                            self.handle_non_text_message(
+                                phone, msg.get("type", ""), contacts.get(phone, ""), wamid=wamid
+                            )
+                            count += 1
+                            continue
+                        text = (msg.get("text") or {}).get("body", "")
+                        self.handle_message(phone, text, contacts.get(phone, ""), wamid=wamid)
                         count += 1
+                    except DuplicateMessageError:
+                        # A second delivery that slipped past the check
+                        # above: already recorded, already answered or
+                        # being answered. Skip it, do not answer twice.
                         continue
-                    text = (msg.get("text") or {}).get("body", "")
-                    self.handle_message(phone, text, contacts.get(phone, ""), wamid=wamid)
-                    count += 1
         return count
 
     def _conversation_thread(self, phone):
@@ -1082,7 +1112,7 @@ class Studio:
         thread.extend(customers[i:])
         return thread
 
-    def dashboard_html(self, tab="today", now=None):
+    def dashboard_html(self, tab="today", now=None, mock=False):
         """The owner's page, in tabs. Server side, no JavaScript: a tab
         is a link to the same page with ?tab=, and the server renders
         only that tab's section. The header (shop name, the day, the
@@ -1095,7 +1125,10 @@ class Studio:
         and who asked and did not book. Replies is where the owner
         writes a reply, drafts one on request, and sees the replies
         that failed. Conversation is the full WhatsApp style thread
-        for each waiting person.
+        for each waiting person. With mock=True the win and moments
+        lines show in demo mode too, so a preview shows every section
+        with sample data; the page says so, and nothing about it
+        reads as a real customer.
 
         The look follows the Ellipsus standard: paper and ink, charcoal
         and warm off white fields, one gold accent, Fraunces serif
@@ -1296,14 +1329,21 @@ class Studio:
             # The showcase: the bot reads as on, with a clear Demo
             # label and a sample data note, so a visitor sees the
             # product alive and nobody mistakes samples for real
-            # customers. Nothing here is sent to a real phone.
+            # customers. Nothing here is sent to a real phone. A mock
+            # preview says so on the page, so the extra sections it
+            # shows are read as samples too.
+            mock_note = (
+                "<p class='quiet'>Mock preview. Every section is shown with sample data.</p>"
+                if mock
+                else ""
+            )
             bot_block = (
                 "<p><span class='pill on'>Bot is ON</span> "
                 "<span class='pill idle'>Demo</span> "
                 "Bot is ON. This is a demo with sample customers, so "
                 "replies are shown here and nothing is sent to a real phone.</p>"
                 "<p class='quiet'>Sample data. These people are not real customers.</p>"
-            )
+            ) + mock_note
             bot_class = "bot"
         elif state == "paused":
             bot_block = (
@@ -1952,9 +1992,10 @@ class Studio:
             ("replies", "Replies"),
             ("conversation", "Conversation"),
         ]
+        mock_qs = "&mock=1" if mock else ""
         nav = "<nav class='tabs'>" + "".join(
-            "<a href='/?tab={}'{}>{}</a>".format(
-                name, " class='active' aria-current='page'" if name == tab else "", label
+            "<a href='/?tab={}{}'{}>{}</a>".format(
+                name, mock_qs, " class='active' aria-current='page'" if name == tab else "", label
             )
             for name, label in tab_labels
         ) + "</nav>"
@@ -1967,10 +2008,11 @@ class Studio:
             # stretch. Never in demo mode or dry run: a rehearsal is not
             # a win, and sample bookings are not real customers. Still
             # shows when sending is paused: the booking was real when
-            # it was made.
+            # it was made. A mock preview lifts the demo gate so the
+            # owner can see both lines with sample data.
             win_html = ""
             moments_html = ""
-            if not self.demo_mode and not self.dry_run:
+            if (not self.demo_mode or mock) and not self.dry_run:
                 win = self.bookings.first_win(today)
                 if win:
                     win_html = "<p class='win'>{}</p>".format(
@@ -2030,7 +2072,7 @@ class Studio:
                     "<section class='setup'><h2>{}</h2>"
                     "<ul class='list'>{}</ul></section>"
                 ).format(heading, "".join(lines))
-            body = hero + nums + alerts_section + missed_section + setup_html + self.self_test_line()
+            body = hero + nums + alerts_section + missed_section + setup_html + self.saving_line() + self.self_test_line()
         elif tab == "bookings":
             # A notice from the last block action, shown once. A
             # refusal names the booking in the way, so the owner knows
@@ -2203,13 +2245,21 @@ def make_handler(studio):
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path == "/health":
+                # The uptime check. On the database backend it also says
+                # whether saving works: a 503 when the database is down
+                # tells Render and Meta that the shop cannot take
+                # bookings right now, instead of quietly losing them.
+                ok = studio.db_status()
+                backend = getattr(studio.leads, "backend", "json")
                 self._send_json(
-                    200,
+                    200 if ok else 503,
                     {
-                        "status": "ok",
+                        "status": "ok" if ok else "degraded",
                         "business": studio.profile.name,
                         "live": studio.live,
                         "sending": studio.sending_state(),
+                        "db": backend,
+                        "db_ok": ok,
                     },
                 )
             elif parsed.path == "/webhook":
@@ -2245,12 +2295,28 @@ def make_handler(studio):
                 )
             elif parsed.path == "/export":
                 # The owner's way out and the backup before a redeploy:
-                # everything as one downloadable JSON file.
+                # everything as one downloadable JSON file. Leads,
+                # bookings, handoffs, blocks, missed customers and the
+                # reply history, plus the counts and the export time,
+                # so an export can be checked without opening it.
                 payload = {
+                    "exported_at": datetime.fromtimestamp(
+                        time.time(), tz=IST
+                    ).isoformat(),
                     "leads": studio.leads.all_leads(),
                     "bookings": studio.bookings.all_bookings(),
                     "handoffs": studio.handoffs.all_handoffs(),
                     "blocks": studio.blocks.all_blocks(),
+                    "missed": studio.missed.all_records(),
+                    "outbox": studio.outbox,
+                    "counts": {
+                        "leads": len(studio.leads.all_leads()),
+                        "bookings": len(studio.bookings.all_bookings()),
+                        "handoffs": len(studio.handoffs.all_handoffs()),
+                        "blocks": len(studio.blocks.all_blocks()),
+                        "missed": len(studio.missed.all_records()),
+                        "outbox": len(studio.outbox),
+                    },
                 }
                 data = json.dumps(payload, indent=2).encode("utf-8")
                 self.send_response(200)
@@ -2265,7 +2331,8 @@ def make_handler(studio):
             elif parsed.path == "/":
                 qs = parse_qs(parsed.query)
                 tab = qs.get("tab", ["today"])[0]
-                self._send_text(200, studio.dashboard_html(tab), "text/html")
+                mock = qs.get("mock", [""])[0] == "1"
+                self._send_text(200, studio.dashboard_html(tab, mock=mock), "text/html")
             else:
                 self._send_json(404, {"error": "not found"})
 

@@ -1,2 +1,5 @@
-# No third-party dependencies.
 # WhatsApp Studio runs on the Python 3.10+ standard library only.
+# The one exception is psycopg, needed only when DATABASE_URL is set
+# (Postgres storage). Without DATABASE_URL the app never imports it,
+# so local dev and the demo run with nothing installed.
+psycopg[binary,pool]>=3.2,<4
