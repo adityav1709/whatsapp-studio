@@ -19,6 +19,7 @@ To run your own shop, edit `demo/demo_business.json` or point `PROFILE_PATH` at 
 To let the bot reply for real, set two things from the environment, never in the repo:
 
 - `LLM_API_KEY` — your OpenAI key. Without it the bot cannot reply. The model is `LLM_MODEL`, gpt-4o-mini by default, a few paise per message at most for a small shop.
+- `GEMINI_API_KEY` — your Google Gemini key, an alternative to the OpenAI key. When it is set the bot uses Gemini instead. The model is `GEMINI_MODEL`, gemini-flash-latest by default.
 - `WHATSAPP_TOKEN` and `PHONE_NUMBER_ID` — from your WhatsApp Business app. With both set the server sends customer replies live, without them it stays in demo mode and records everything to the outbox.
 
 Before a public pilot also set `WHATSAPP_APP_SECRET` and `DASHBOARD_PASSWORD`. Details are in Going live and Before a public pilot below.

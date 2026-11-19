@@ -1,4 +1,4 @@
-"""The brain: an OpenAI language model that talks to customers.
+"""The brain: a language model that talks to customers.
 
 The bot is LLM key based only. There is no rule based conversation layer.
 The model understands the message and decides what to say and what to do,
@@ -7,9 +7,12 @@ availability, booking creation, cancellation, reschedule, and handover
 are tools the model calls. The model never invents a price and never
 creates a booking directly, it calls a tool and the code validates it.
 
-Standard library only, no new dependencies. The key comes from the
-environment (LLM_API_KEY or OPENAI_API_KEY); without it there is no
-client and the bot cannot reply.
+Standard library only, no new dependencies. OpenAI is the default
+brain (LLM_API_KEY or OPENAI_API_KEY, gpt-4o-mini). A Gemini key
+(GEMINI_API_KEY, gemini-flash-latest) selects the Gemini brain
+instead; it speaks the same chat interface, so the Studio never
+knows which one answered. Without any key there is no client and
+the bot cannot reply.
 """
 from __future__ import annotations
 
@@ -20,6 +23,11 @@ import urllib.request
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_MODEL = "gpt-4o-mini"
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent"
+)
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 # A reply longer than this is cut short: WhatsApp caps a text message
 # at 4096 characters, and a short warm reply is what a customer wants.
 MAX_LLM_CHARS = 1000
@@ -85,6 +93,158 @@ class OpenAIClient:
         return {"content": message.get("content"), "tool_calls": tool_calls}
 
 
+def _gemini_tools(tools):
+    """OpenAI shaped tools into Gemini function declarations. The
+    inner function object carries over as is: name, description, and
+    a JSON schema of parameters, which both APIs read the same way."""
+    declarations = []
+    for tool in tools or []:
+        fn = (tool or {}).get("function") or {}
+        parameters = dict(fn.get("parameters") or {})
+        if not parameters:
+            parameters = {"type": "object"}
+        elif not parameters.get("properties"):
+            parameters.pop("properties", None)
+        declarations.append(
+            {
+                "name": fn.get("name") or "",
+                "description": fn.get("description") or "",
+                "parameters": parameters,
+            }
+        )
+    if not declarations:
+        return []
+    return [{"functionDeclarations": declarations}]
+
+
+def _gemini_contents(messages):
+    """OpenAI shaped chat messages into Gemini contents. The system
+    prompt becomes the system instruction and is not a turn. A tool
+    result becomes a function response; its name comes from the
+    assistant turn that made the call, matched by call id, or in
+    order when the id is empty, which is how the Studio records
+    them. Turns of the same role merge into one message, because
+    Gemini wants the roles to alternate."""
+    contents = []
+    system_text = None
+    names_by_id = {}
+    pending_names = []
+
+    def append_part(role, part):
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"].append(part)
+        else:
+            contents.append({"role": role, "parts": [part]})
+
+    for message in messages:
+        role = message.get("role") or ""
+        if role == "system":
+            system_text = message.get("content") or ""
+            continue
+        if role == "tool":
+            name = names_by_id.get(message.get("tool_call_id") or "")
+            if not name and pending_names:
+                name = pending_names.pop(0)
+            try:
+                outcome = json.loads(message.get("content") or "{}")
+            except json.JSONDecodeError:
+                outcome = {"result": message.get("content") or ""}
+            if not isinstance(outcome, dict):
+                outcome = {"result": outcome}
+            append_part(
+                "function",
+                {"functionResponse": {"name": name or "", "response": outcome}},
+            )
+            continue
+        if role == "assistant":
+            parts = []
+            content = message.get("content")
+            if content:
+                parts.append({"text": content})
+            for call in message.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                call_id = call.get("id") or ""
+                fn_name = fn.get("name") or ""
+                if call_id:
+                    names_by_id[call_id] = fn_name
+                pending_names.append(fn_name)
+                try:
+                    arguments = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                parts.append(
+                    {"functionCall": {"name": fn_name, "args": arguments}}
+                )
+            for part in parts:
+                append_part("model", part)
+            continue
+        append_part("user", {"text": message.get("content") or ""})
+    return system_text, contents
+
+
+class GeminiClient:
+    """One generateContent call. Same shape back as OpenAIClient:
+    {"content": str or None, "tool_calls": [...]} with a tool call
+    as {"id": str, "name": str, "arguments": dict}, so the Studio
+    feeds it the same messages and never knows which brain
+    answered. Gemini gives a function call no id, so the id comes
+    back empty and the caller fills one in."""
+
+    def __init__(self, api_key, model=DEFAULT_GEMINI_MODEL):
+        self.api_key = api_key
+        self.model = model
+
+    def chat(self, messages, tools=None):
+        system_text, contents = _gemini_contents(messages)
+        payload = {"contents": contents}
+        if system_text:
+            payload["system_instruction"] = {"parts": [{"text": system_text}]}
+        declarations = _gemini_tools(tools)
+        if declarations:
+            payload["tools"] = declarations
+        payload["generationConfig"] = {"maxOutputTokens": 500}
+        request = urllib.request.Request(
+            GEMINI_URL.format(model=self.model),
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-goog-api-key": self.api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Gemini API error: HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Gemini request failed: {exc.reason}") from exc
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise RuntimeError("Gemini returned no candidates")
+        parts = ((candidates[0].get("content") or {}).get("parts")) or []
+        texts = []
+        tool_calls = []
+        for part in parts:
+            if "text" in part:
+                texts.append(part["text"])
+            call = part.get("functionCall") or {}
+            if call:
+                arguments = call.get("args") or {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                tool_calls.append(
+                    {
+                        "id": "",
+                        "name": call.get("name") or "",
+                        "arguments": arguments,
+                    }
+                )
+        return {"content": "".join(texts) or None, "tool_calls": tool_calls}
+
+
 def openai_tool_calls(tool_calls):
     """Re-encode parsed tool calls into the shape the chat API wants
     back in the next request: the assistant message that made them."""
@@ -104,10 +264,15 @@ def openai_tool_calls(tool_calls):
 
 
 def client_from_env():
-    """A real client only when a key is set. LLM_API_KEY wins;
-    OPENAI_API_KEY is the same thing under its usual name. The model
-    comes from LLM_MODEL, default gpt-4o-mini. No key, no client,
-    and the bot cannot reply."""
+    """A real client only when a key is set. A Gemini key selects
+    the Gemini brain; otherwise LLM_API_KEY wins and OPENAI_API_KEY
+    is the same thing under its usual name. The model comes from
+    GEMINI_MODEL or LLM_MODEL, default gemini-flash-latest or
+    gpt-4o-mini. No key, no client, and the bot cannot reply."""
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_key:
+        model = os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+        return GeminiClient(gemini_key, model)
     api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return None
