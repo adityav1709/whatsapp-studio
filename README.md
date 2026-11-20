@@ -324,6 +324,19 @@ the booking still works. `profiles/` holds draft pilot profiles for real
 prospects — Snips Salon, Gurgaon is the first — with only verified facts
 in them; prices wait for the owner to confirm.
 
+**Set up your shop (onboarding form)**
+A prospect who wants a receptionist fills in one page at `/onboard`:
+no account, no password, nothing written to the server. Shop name,
+kind of shop, services with prices or blank, hours, closed days, and
+her WhatsApp number, typed twice. Prices are always optional: a blank
+price means the shop confirms it, and a "price varies" tick means the
+price depends on the service. The form validates everything on the
+server and shows the shop back as the bot will know it, with a sample
+of her own bot answering a customer, then hands her a profile file to
+download and send to Aditya. Nothing is live until he connects her
+number and deploys it. Form bodies over 64 KB are refused. The
+dashboard footer links here.
+
 **Owner setup form**
 The dashboard has a Setup tab, behind the dashboard password, where the
 owner fills in prices, durations and hours herself: one price and one
