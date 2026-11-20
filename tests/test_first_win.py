@@ -193,6 +193,10 @@ class TestFirstWin(unittest.TestCase):
 
 
 class TestFirstWinDashboard(unittest.TestCase):
+    # The win line tests pin each booking's creation to 11 AM, inside
+    # opening hours: a booking created after hours becomes a moment
+    # instead, and the moments line replaces the win line on the page.
+    # Without the pin the suite goes red whenever it runs at night.
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.studio = _studio(self.tmp.name)
@@ -203,7 +207,8 @@ class TestFirstWinDashboard(unittest.TestCase):
 
     def test_dashboard_shows_first_booking_ever(self):
         _book(
-            self.studio, "919999900001", "Priya", "Haircut", self.today, 660
+            self.studio, "919999900001", "Priya", "Haircut", self.today, 660,
+            created=_epoch(self.today, 11, 0),
         )
         page = self.studio.dashboard_html("today")
         text = _win_text(page)
@@ -220,7 +225,8 @@ class TestFirstWinDashboard(unittest.TestCase):
             yesterday, 660, created=_epoch(yesterday),
         )
         _book(
-            self.studio, "919999900002", "Priya", "Haircut", self.today, 660
+            self.studio, "919999900002", "Priya", "Haircut", self.today, 660,
+            created=_epoch(self.today, 11, 0),
         )
         text = _win_text(self.studio.dashboard_html("today"))
         self.assertEqual(
@@ -232,7 +238,8 @@ class TestFirstWinDashboard(unittest.TestCase):
     def test_dashboard_names_tomorrow_for_a_future_appointment(self):
         tomorrow = self.today + timedelta(days=1)
         _book(
-            self.studio, "919999900001", "Priya", "Haircut", tomorrow, 660
+            self.studio, "919999900001", "Priya", "Haircut", tomorrow, 660,
+            created=_epoch(self.today, 11, 0),
         )
         text = _win_text(self.studio.dashboard_html("today"))
         self.assertEqual(
@@ -268,7 +275,8 @@ class TestFirstWinDashboard(unittest.TestCase):
 
     def test_dashboard_shows_win_only_on_the_today_tab(self):
         _book(
-            self.studio, "919999900001", "Priya", "Haircut", self.today, 660
+            self.studio, "919999900001", "Priya", "Haircut", self.today, 660,
+            created=_epoch(self.today, 11, 0),
         )
         for tab in ("bookings", "customers", "replies", "conversation"):
             self.assertNotIn(
@@ -280,9 +288,10 @@ class TestFirstWinDashboard(unittest.TestCase):
         profile.services = [Service("Haircut", None, 30)]
         studio = _studio(self.tmp.name, profile=profile)
         service = profile.services[0]
-        studio.bookings.book(
+        booking = studio.bookings.book(
             "919999900001", "", service, self.today, 660
         )
+        booking["created_ts"] = _epoch(self.today, 11, 0)
         text = _win_text(studio.dashboard_html("today"))
         self.assertEqual(
             text,
@@ -292,16 +301,18 @@ class TestFirstWinDashboard(unittest.TestCase):
 
     def test_win_copy_has_no_dash(self):
         _book(
-            self.studio, "919999900001", "Priya", "Haircut", self.today, 660
+            self.studio, "919999900001", "Priya", "Haircut", self.today, 660,
+            created=_epoch(self.today, 11, 0),
         )
         text = _win_text(self.studio.dashboard_html("today"))
         self.assertNotIn("-", text)
-        self.assertNotIn("\u2013", text)
-        self.assertNotIn("\u2014", text)
+        self.assertNotIn("–", text)
+        self.assertNotIn("—", text)
 
     def test_glance_and_money_unchanged_with_win(self):
         _book(
-            self.studio, "919999900001", "Priya", "Haircut", self.today, 660
+            self.studio, "919999900001", "Priya", "Haircut", self.today, 660,
+            created=_epoch(self.today, 11, 0),
         )
         page = self.studio.dashboard_html("today")
         self.assertIn("1 booked", page)
