@@ -48,7 +48,9 @@ from .bookings import (
 from .config import (
     DAY_KEYS,
     DAY_LABELS,
+    ONBOARDING_SERVICE_ROWS,
     BusinessProfile,
+    validate_onboarding_profile,
     validate_setup_hours,
     validate_setup_services,
 )
@@ -2367,8 +2369,8 @@ class Studio:
             "{}"
             "<p class='foot'><a href='/export'>Export my data</a>. Download "
             "all leads, bookings and handoffs as one file.</p>"
-            "<p class='foot'>New customers can sign up here: "
-            "<a href='https://forms.gle/VbdEaEdXioxzUGGh8'>WhatsApp Studio signup</a></p>"
+            "<p class='foot'>New here? "
+            "<a href='/onboard'>Set up your shop</a> and your WhatsApp starts answering customers.</p>"
             "</div></body></html>"
         ).format(
             html.escape(self.profile.name),
@@ -2383,6 +2385,345 @@ class Studio:
             key_notice,
             body,
         )
+
+ONBOARD_DURATIONS = (15, 30, 45, 60, 90, 120)
+ONBOARD_MAX_BODY = 65536
+ONBOARD_DAY_SHORT = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+ONBOARD_CATEGORIES = (
+    ("salon", "Salon"),
+    ("clinic", "Clinic"),
+    ("gym", "Gym"),
+    ("other", "Other"),
+)
+# The fields the confirmation page carries back as hidden inputs, so
+# the download and the edit both revalidate exactly what she typed.
+ONBOARD_FIELD_KEYS = (
+    "name", "category", "city", "address", "owner_name", "phone",
+    "phone_confirm", "open", "close", "closed", "service", "price",
+    "duration", "varies",
+)
+
+_ONBOARD_CSS = """
+:root{--ink:#292A2E;--paper:#F4F4F2;--sage:#E5E5E1;--gold:#E8C96A;
+--goldpale:#F5EBCB;--grey:#6b6b66;--serif:'Fraunces',Georgia,'Times New Roman',serif;
+--sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;font-family:var(--sans);font-size:18px;line-height:1.6;color:var(--ink);background:var(--paper)}
+.wrap{max-width:960px;margin:0 auto;padding:0 0 80px}
+header{padding:56px 24px 24px}
+h1{font-family:var(--serif);font-size:56px;line-height:1.05;margin:0;font-weight:400;letter-spacing:-.01em}
+h2{font-family:var(--serif);font-size:34px;margin:56px 24px 16px;font-weight:400;letter-spacing:-.01em;line-height:1.1}
+h2::after{content:"";display:block;width:56px;height:3px;background:var(--gold);border-radius:3px;margin-top:10px;transform:rotate(-1deg)}
+.intro{font-size:18px;margin:12px 24px 0;max-width:700px}
+.quiet{color:var(--grey);font-size:14px}
+.thread{background:var(--sage);border-radius:18px;padding:16px;margin:16px 24px;display:flex;flex-direction:column;gap:8px;max-width:760px}
+.threadtitle{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:500;color:var(--grey);margin:0 0 6px}
+.msg{max-width:82%;border-radius:16px;padding:12px 14px}
+.msg p{margin:0;font-size:16px;line-height:1.5;color:var(--ink)}
+.msg.in{align-self:flex-start;background:#fff;border-bottom-left-radius:4px}
+.msg.out{align-self:flex-end;background:var(--goldpale);border-bottom-right-radius:4px}
+.list{list-style:none;padding:0;margin:0 24px}
+.list li{background:#fff;border:1px solid var(--sage);border-radius:14px;padding:16px 18px;margin:10px 0}
+.card{background:#fff;border:1px solid var(--sage);border-radius:18px;padding:28px;margin:16px 24px}
+.card p{margin:0 0 10px}
+.card p:last-child{margin-bottom:0}
+.err{color:var(--ink);font-weight:500}
+.field{margin:0 24px}
+label{display:block;font-size:15px;font-weight:500;margin:14px 0 0}
+label.inline{display:inline-block;margin:8px 16px 0 0;font-weight:400}
+input[type=text],input[type=time],input[type=tel],select{width:100%;box-sizing:border-box;min-height:46px;padding:11px 14px;font-size:16px;border:1px solid #D8D8D2;border-radius:14px;margin:8px 0;background:#fff;color:var(--ink)}
+input[type=radio],input[type=checkbox]{min-height:0;margin:0 6px 0 0}
+button{min-height:44px;padding:12px 24px;font-size:16px;font-weight:500;border-radius:999px;border:0;background:var(--ink);color:var(--paper);cursor:pointer;font-family:inherit}
+button.primary{width:100%;margin-top:12px;background:var(--gold);color:var(--ink)}
+button.ghost{width:100%;margin-top:8px;background:transparent;color:var(--ink);border:1px solid var(--ink)}
+a{color:var(--ink);text-decoration:underline;text-decoration-color:var(--gold);text-underline-offset:3px}
+.foot{margin:40px 24px 0;color:var(--grey);font-size:14px}
+@media (max-width:480px){h1{font-size:40px}header{padding:40px 20px 16px}h2{font-size:28px}}
+"""
+
+
+def _onboard_page(title, body):
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<link rel='preconnect' href='https://fonts.googleapis.com'>"
+        "<link rel='preconnect' href='https://fonts.gstatic.com' crossorigin>"
+        "<link href='https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;1,9..144,400&family=Inter:wght@400;500&display=swap' rel='stylesheet'>"
+        "<title>{} | WhatsApp Studio</title><style>{}</style></head><body>"
+        "<div class='wrap'>{}</div></body></html>"
+    ).format(html.escape(title), _ONBOARD_CSS, body)
+
+
+def _onboard_value(fields, key, default=""):
+    return (fields.get(key) or [default])[0]
+
+
+def _onboard_error(errors, key):
+    if key in errors:
+        return "<p class='err'>{}</p>".format(html.escape(errors[key]))
+    return ""
+
+
+def _onboard_hidden_fields(fields):
+    parts = []
+    for key in ONBOARD_FIELD_KEYS:
+        for value in fields.get(key) or []:
+            parts.append(
+                "<input type='hidden' name='{}' value='{}'>".format(
+                    html.escape(key, quote=True),
+                    html.escape(value, quote=True),
+                )
+            )
+    return "".join(parts)
+
+
+def _onboard_slug(name):
+    slug = []
+    for ch in (name or "").lower():
+        if ch.isalnum():
+            slug.append(ch)
+        elif slug and slug[-1] != "-":
+            slug.append("-")
+    return "".join(slug).strip("-")
+
+
+def _onboard_hours_line(hours):
+    """Plain words for the hours a profile holds: one daily value, or
+    the closed days named next to the range."""
+    ranges = {value for value in hours.values() if value != "closed"}
+    span = next(iter(ranges)) if ranges else None
+    if span is None:
+        return "Closed every day"
+    closed = [
+        label
+        for key, label in zip(DAY_KEYS, DAY_LABELS)
+        if hours.get(key) == "closed"
+    ]
+    if not closed:
+        return "Open {} every day".format(span)
+    if len(closed) == 1:
+        return "Open {}, closed {}".format(span, closed[0])
+    return "Open {}, closed {} and {}".format(
+        span, ", ".join(closed[:-1]), closed[-1]
+    )
+
+
+def _onboard_place_word(category):
+    return {"salon": "salon", "clinic": "clinic", "gym": "gym"}.get(
+        category, "shop"
+    )
+
+
+def _onboard_sample_reply(profile):
+    """The question a customer asks about the first service, and the
+    answer the bot gives from the shop's own details. Priced, varying
+    and unpriced services each get their own honest wording."""
+    service = profile["services"][0]
+    shop = profile["name"]
+    place = _onboard_place_word(profile["category"])
+    question = "{} ka price kya hai?".format(service["name"])
+    if service["price"] is not None:
+        answer = "{} at {} is Rs {}.".format(service["name"], shop, service["price"])
+    elif service.get("price_varies"):
+        answer = "{} at {}: the price depends on the service, so the {} confirms it.".format(
+            service["name"], shop, place
+        )
+    else:
+        answer = "{} at {}: the {} confirms the price.".format(
+            service["name"], shop, place
+        )
+    return question, answer
+
+
+def _onboard_form_html(fields, errors):
+    """The onboarding form. Proof first, then the fields: only what
+    she knows from memory at her counter. Every value she typed is
+    kept when an error sends her back, and each error sits next to
+    the box it belongs to."""
+    category = _onboard_value(fields, "category", "salon").lower()
+    radios = "".join(
+        "<label class='inline'><input type='radio' name='category' value='{}'{}> {}</label>".format(
+            value, " checked" if category == value else "", label
+        )
+        for value, label in ONBOARD_CATEGORIES
+    )
+    names = list(fields.get("service") or [])
+    prices = list(fields.get("price") or [])
+    durations = list(fields.get("duration") or [])
+    varies = set(fields.get("varies") or [])
+    rows = []
+    for index in range(ONBOARDING_SERVICE_ROWS):
+        name = names[index] if index < len(names) else ""
+        price = prices[index] if index < len(prices) else ""
+        try:
+            duration = int(durations[index]) if index < len(durations) else 30
+        except ValueError:
+            duration = 30
+        if duration not in ONBOARD_DURATIONS:
+            duration = 30
+        options = "".join(
+            "<option value='{}'{}>{} minutes</option>".format(
+                minutes, " selected" if minutes == duration else "", minutes
+            )
+            for minutes in ONBOARD_DURATIONS
+        )
+        rows.append(
+            "<li><label>Service <input type='text' name='service' value='{}'></label> "
+            "<label>Price Rs <input type='text' name='price' inputmode='numeric' value='{}'></label> "
+            "<label>Minutes <select name='duration'>{}</select></label> "
+            "<label class='inline'><input type='checkbox' name='varies' value='{}'{}> Price varies</label>{}</li>".format(
+                html.escape(name, quote=True),
+                html.escape(price, quote=True),
+                options,
+                index,
+                " checked" if str(index) in varies else "",
+                _onboard_error(errors, "service_{}".format(index)),
+            )
+        )
+    closed = set(fields.get("closed") or [])
+    closed_boxes = "".join(
+        "<label class='inline'><input type='checkbox' name='closed' value='{}'{}> {}</label>".format(
+            key, " checked" if key in closed else "", short
+        )
+        for key, short in zip(DAY_KEYS, ONBOARD_DAY_SHORT)
+    )
+    open_value = _onboard_value(fields, "open", "10:00")
+    close_value = _onboard_value(fields, "close", "20:00")
+    if len(open_value) != 5 or open_value[2] != ":":
+        open_value = "10:00"
+    if len(close_value) != 5 or close_value[2] != ":":
+        close_value = "20:00"
+    return _onboard_page(
+        "Set up your shop",
+        "<header><h1>Set up your shop</h1>"
+        "<p class='intro'>Your WhatsApp starts answering customers. "
+        "It takes about 3 minutes. It is free while we test it with a "
+        "few shops, and nothing goes live until you say so.</p></header>"
+        "<div class='thread'><p class='threadtitle'>What your customers will see</p>"
+        "<div class='msg in'><p>facial ka price kya hai?</p></div>"
+        "<div class='msg out'><p>Facial at Glow &amp; Grace Salon is Rs 1499.</p></div></div>"
+        "<form method='post' action='/onboard'>"
+        "<h2>Your shop</h2>"
+        "<div class='field'><label>Shop name "
+        "<input type='text' name='name' maxlength='100' value='{}'></label>{}"
+        "<p class='quiet'>The name your customers know.</p>"
+        "<label>What kind of shop is it?</label>{}{}"
+        "<label>City <input type='text' name='city' maxlength='100' value='{}'></label>{}"
+        "<label>Address <input type='text' name='address' maxlength='200' value='{}'></label>{}"
+        "<p class='quiet'>A landmark works, like near Nirvana Country, Sector 50.</p>"
+        "<label>Your name <input type='text' name='owner_name' maxlength='100' value='{}'></label>{}"
+        "<p class='quiet'>So we know who we are talking to.</p></div>"
+        "<h2>Services and prices</h2>"
+        "<div class='field'><p class='quiet'>One per row. Leave the price blank "
+        "when you want to tell the customer yourself. Tick price varies "
+        "when the price depends on the service.</p>{}</div>"
+        "<ul class='list'>{}</ul>"
+        "<h2>Hours</h2>"
+        "<div class='field'><p class='quiet'>The same hours every day. "
+        "If a day is different, you can change it later.</p>"
+        "<label>Opens at <input type='time' name='open' value='{}'></label> "
+        "<label>Closes at <input type='time' name='close' value='{}'></label>{}"
+        "<label>Closed on</label>{}</div>"
+        "<h2>How do we reach you</h2>"
+        "<div class='field'><label>Your WhatsApp number "
+        "<input type='tel' name='phone' inputmode='tel' value='{}'></label>{}"
+        "<p class='quiet'>The number your customers already message. "
+        "Only Aditya sees it, and nothing goes live until you send him "
+        "your shop file.</p>"
+        "<label>Type it again "
+        "<input type='tel' name='phone_confirm' inputmode='tel' value='{}'></label>{}"
+        "<p class='quiet'>A wrong number means your receptionist answers from nowhere.</p>"
+        "<button type='submit' class='primary'>See my receptionist</button></div>"
+        "</form>"
+        "<p class='foot'><a href='/'>Back to the demo shop</a></p>".format(
+            html.escape(_onboard_value(fields, "name"), quote=True),
+            _onboard_error(errors, "name"),
+            radios,
+            _onboard_error(errors, "category"),
+            html.escape(_onboard_value(fields, "city"), quote=True),
+            _onboard_error(errors, "city"),
+            html.escape(_onboard_value(fields, "address"), quote=True),
+            _onboard_error(errors, "address"),
+            html.escape(_onboard_value(fields, "owner_name"), quote=True),
+            _onboard_error(errors, "owner_name"),
+            _onboard_error(errors, "services"),
+            "".join(rows),
+            html.escape(open_value, quote=True),
+            html.escape(close_value, quote=True),
+            _onboard_error(errors, "hours"),
+            closed_boxes,
+            html.escape(_onboard_value(fields, "phone"), quote=True),
+            _onboard_error(errors, "phone"),
+            html.escape(_onboard_value(fields, "phone_confirm"), quote=True),
+            _onboard_error(errors, "phone_confirm"),
+        ),
+    )
+
+
+def _onboard_confirmation_html(profile, fields):
+    """What she told us, as the bot will use it, a sample of her own
+    bot answering a customer, and the honest next step: send the file
+    to Aditya. Nothing here claims the bot is live."""
+    owner_name = (fields.get("owner_name") or [""])[0].strip()
+    title = "Thanks, {}.".format(owner_name) if owner_name else "Your shop file is ready."
+    place = _onboard_place_word(profile["category"])
+    service_lines = []
+    for service in profile["services"]:
+        if service["price"] is not None:
+            line = "{}: Rs {}, {} minutes".format(
+                service["name"], service["price"], service["duration_min"]
+            )
+        elif service.get("price_varies"):
+            line = "{}: price varies, the {} confirms it".format(
+                service["name"], place
+            )
+        else:
+            line = "{}: price to confirm".format(service["name"])
+        service_lines.append("<li>{}</li>".format(html.escape(line)))
+    question, answer = _onboard_sample_reply(profile)
+    hidden = _onboard_hidden_fields(fields)
+    return _onboard_page(
+        title,
+        "<header><h1>{}</h1>"
+        "<p class='intro'>This is your shop, as your receptionist will "
+        "know it. Check it over, then download the file and send it to "
+        "Aditya.</p></header>"
+        "<h2>What you told us</h2>"
+        "<div class='card'><p><strong>{}</strong>, {}</p>"
+        "<p>{}</p>"
+        "{}"
+        "<ul>{}</ul></div>"
+        "<h2>What your customers will see</h2>"
+        "<div class='thread'><div class='msg in'><p>{}</p></div>"
+        "<div class='msg out'><p>{}</p></div></div>"
+        "<h2>What happens next</h2>"
+        "<div class='card'><p>Send this file to Aditya on WhatsApp and "
+        "he will switch your receptionist on. Until then nothing "
+        "changes for your customers. Your number works exactly as it "
+        "does today.</p></div>"
+        "<div class='field'><form method='post' action='/onboard/download'>{}"
+        "<button type='submit' class='primary'>Download your shop file</button></form>"
+        "<p class='quiet'>This file is your shop. Keep it safe and send it to Aditya.</p>"
+        "<form method='post' action='/onboard'>{}"
+        "<input type='hidden' name='_action' value='edit'>"
+        "<button type='submit' class='ghost'>Change something</button></form></div>"
+        "<p class='foot'><a href='/'>Back to the demo shop</a></p>".format(
+            html.escape(title),
+            html.escape(profile["name"]),
+            html.escape(profile["category"]),
+            html.escape(_onboard_hours_line(profile["hours"])),
+            (
+                "<p>{}</p>".format(html.escape(profile["address"]))
+                if profile["address"]
+                else ""
+            ),
+            "".join(service_lines),
+            html.escape(question),
+            html.escape(answer),
+            hidden,
+            hidden,
+        ),
+    )
+
 
 def make_handler(studio):
     class Handler(BaseHTTPRequestHandler):
@@ -2414,11 +2755,27 @@ def make_handler(studio):
             self.end_headers()
             self.wfile.write(data)
 
+        def _read_body(self, limit=ONBOARD_MAX_BODY):
+            """Read a form body, refusing anything over limit with a
+            413. The webhook keeps its own read path: signature
+            verification needs the raw body before anything is parsed.
+            Returns None when the body was refused."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > limit:
+                self.close_connection = True
+                self._send_json(413, {"error": "body too large"})
+                return None
+            return self.rfile.read(length) if length else b""
+
         def _require_auth(self):
             """True when this request may proceed. When a dashboard
-            password is set, every path except the webhook and /health
-            needs Basic Auth — Meta calls the webhook and cannot log in,
-            and health checks must stay open."""
+            password is set, every path except the webhook, /health
+            and /onboard needs Basic Auth — Meta calls the webhook
+            and cannot log in, health checks must stay open, and a
+            prospect filling in the form has no password yet."""
             if not studio.dashboard_password:
                 return True
             if check_basic_auth(studio.dashboard_password, self.headers.get("Authorization")):
@@ -2455,6 +2812,11 @@ def make_handler(studio):
                     self._send_text(200, challenge)
                 else:
                     self._send_json(403, {"error": "verification failed"})
+            elif parsed.path == "/onboard":
+                # Public: a prospect has no dashboard password yet.
+                # The form writes nothing to the server, so there is
+                # nothing privileged behind it.
+                self._send_text(200, _onboard_form_html({}, {}), "text/html")
             elif not self._require_auth():
                 return
             elif parsed.path == "/leads":
@@ -2546,6 +2908,56 @@ def make_handler(studio):
                 count = studio.handle_webhook_payload(payload)
                 self._send_json(200, {"received": True, "processed": count})
                 return
+            if parsed.path == "/onboard":
+                # Public, like the GET: the form writes nothing to the
+                # server, it only validates and shows the shop back.
+                raw = self._read_body()
+                if raw is None:
+                    return
+                fields = parse_qs(
+                    raw.decode("utf-8", errors="replace"), keep_blank_values=True
+                )
+                if (fields.get("_action") or [""])[0] == "edit":
+                    self._send_text(200, _onboard_form_html(fields, {}), "text/html")
+                    return
+                profile, errors = validate_onboarding_profile(fields)
+                if errors:
+                    self._send_text(
+                        200, _onboard_form_html(fields, errors), "text/html"
+                    )
+                    return
+                self._send_text(
+                    200, _onboard_confirmation_html(profile, fields), "text/html"
+                )
+                return
+            if parsed.path == "/onboard/download":
+                # The confirmation page posts the same fields back; the
+                # file is built from a fresh validation, never from
+                # anything stored, because nothing is stored.
+                raw = self._read_body()
+                if raw is None:
+                    return
+                fields = parse_qs(
+                    raw.decode("utf-8", errors="replace"), keep_blank_values=True
+                )
+                profile, errors = validate_onboarding_profile(fields)
+                if errors:
+                    self._send_text(
+                        200, _onboard_form_html(fields, errors), "text/html"
+                    )
+                    return
+                data = json.dumps(profile, indent=2).encode("utf-8")
+                slug = _onboard_slug(profile["name"]) or "shop"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header(
+                    "Content-Disposition",
+                    'attachment; filename="{}.json"'.format(slug),
+                )
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if not self._require_auth():
                 return
             if parsed.path == "/sending/disable":
@@ -2580,8 +2992,9 @@ def make_handler(studio):
                 # The owner saves prices, durations and hours. Blank
                 # inputs must survive parsing, or a blank price reads
                 # as a missing field instead of price on request.
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length else b""
+                raw = self._read_body()
+                if raw is None:
+                    return
                 fields = parse_qs(
                     raw.decode("utf-8", errors="replace"), keep_blank_values=True
                 )
