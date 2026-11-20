@@ -3,7 +3,7 @@
 Aditya opened the live site on his phone and the tabs were not on
 the page: the tab bar was a horizontally scrolling pill row, so
 Replies and Conversation slid off the right edge with no cue. The
-bar now wraps, so all five tabs are on the page at once, on every
+bar now wraps, so all six tabs are on the page at once, on every
 tab page, with the current one marked.
 """
 import re
@@ -25,6 +25,7 @@ TABS = (
     ("customers", "Customers"),
     ("replies", "Replies"),
     ("conversation", "Conversation"),
+    ("setup", "Setup"),
 )
 
 
@@ -45,7 +46,7 @@ def style(html):
 
 
 class TestTabsVisible(unittest.TestCase):
-    def test_all_five_tabs_on_every_tab_page(self):
+    def test_all_six_tabs_on_every_tab_page(self):
         with tempfile.TemporaryDirectory() as tmp:
             studio = make_studio(tmp)
             for tab, _ in TABS:

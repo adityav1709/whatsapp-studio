@@ -141,7 +141,9 @@ class TestSetupChecklist(unittest.TestCase):
 
     def test_demo_mode_hides_the_checklist(self):
         studio = _studio(self.tmp.name, demo_mode=True)
-        self.assertNotIn("Setup", studio.dashboard_html("today"))
+        # The Setup tab link stays in the bar (it shows a note there),
+        # but the checklist section itself stays hidden in demo mode.
+        self.assertNotIn("<section class='setup'>", studio.dashboard_html("today"))
 
     def test_checklist_copy_has_no_dash(self):
         page = _studio(self.tmp.name, llm=None, sender=None, notifier=NullNotifier()).dashboard_html("today")
