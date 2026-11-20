@@ -6,6 +6,7 @@ onboarding flow) can edit it without touching code.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -78,6 +79,10 @@ class Service:
     # How many customers can be served at once (chairs, doctors, trainers).
     # 1 is one provider; a two-chair salon sets 2.
     capacity: int = 1
+    # True when the price genuinely varies (bridal makeup, hair
+    # extensions): the bot says the shop confirms it, and says it
+    # varies, instead of sounding like it forgot the price.
+    price_varies: bool = False
 
     def to_dict(self):
         return {
@@ -87,6 +92,7 @@ class Service:
             "description": self.description,
             "floor_price": self.floor_price,
             "capacity": self.capacity,
+            "price_varies": self.price_varies,
         }
 
     @classmethod
@@ -249,3 +255,185 @@ def validate_setup_hours(day_texts):
     if len(set(values)) == 1:
         return {"daily": values[0]}, None
     return dict(zip(DAY_KEYS, values)), None
+
+
+ONBOARDING_CATEGORIES = ("salon", "clinic", "gym", "other")
+ONBOARDING_SERVICE_ROWS = 10
+ONBOARDING_MAX_SERVICES = 20
+
+
+def normalize_onboarding_phone(text):
+    """Digits only Indian mobile for the onboarding form, or None.
+    Strips spaces, dashes and a leading +91 / 91 / 0, then requires
+    10 digits starting 6 to 9. Anything else is not a number the bot
+    can be switched on for."""
+    digits = re.sub(r"\D", "", text or "")
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) != 10 or digits[0] not in "6789":
+        return None
+    return digits
+
+
+def validate_onboarding_profile(fields):
+    """Fields from the onboarding form (a parse_qs dict). Returns
+    (profile, errors): the profile in BusinessProfile.to_dict shape
+    when every check passes, else None and errors keyed by field,
+    each a plain sentence for the box it belongs to. The owner's
+    name rides along as owner_name in the file, so Aditya knows who
+    he is calling, and is dropped when the profile is loaded. Pure:
+    nothing here touches the disk or the live profile."""
+    errors = {}
+
+    def one(key):
+        return (fields.get(key) or [""])[0].strip()
+
+    def too_long(value, limit):
+        return len(value) > limit
+
+    name = one("name")
+    if not name:
+        errors["name"] = "Tell us the name of your shop."
+    elif too_long(name, 100):
+        errors["name"] = "That name is longer than 100 letters. Use a shorter one."
+    category = one("category").lower()
+    if category not in ONBOARDING_CATEGORIES:
+        errors["category"] = "Pick what kind of shop it is."
+    city = one("city")
+    if too_long(city, 100):
+        errors["city"] = "That city is longer than 100 letters. Use a shorter one."
+    address = one("address")
+    if too_long(address, 200):
+        errors["address"] = "That address is longer than 200 letters. Use a shorter one."
+    owner_name = one("owner_name")
+    if too_long(owner_name, 100):
+        errors["owner_name"] = "That name is longer than 100 letters. Use a shorter one."
+    phone = normalize_onboarding_phone(one("phone"))
+    if phone is None:
+        errors["phone"] = (
+            "That does not look like an Indian mobile number. "
+            "It should be 10 digits, like 98991 27791."
+        )
+    elif normalize_onboarding_phone(one("phone_confirm")) != phone:
+        errors["phone_confirm"] = (
+            "The two numbers do not match. Type the same number twice."
+        )
+
+    hours = {}
+    open_text = one("open")
+    close_text = one("close")
+    clock = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+    if not clock.match(open_text) or not clock.match(close_text):
+        errors["hours"] = "Tell us when the shop opens and closes."
+    else:
+        open_min = int(open_text[:2]) * 60 + int(open_text[3:])
+        close_min = int(close_text[:2]) * 60 + int(close_text[3:])
+        if close_min <= open_min:
+            errors["hours"] = "The closing time has to be after the opening time."
+        else:
+            closed = set(fields.get("closed") or [])
+            day_texts = [
+                "closed" if key in closed else "{} - {}".format(open_text, close_text)
+                for key in DAY_KEYS
+            ]
+            if all(text == "closed" for text in day_texts):
+                errors["hours"] = (
+                    "The shop is closed every day. Leave at least one day open."
+                )
+            else:
+                hours, error = validate_setup_hours(day_texts)
+                if error:
+                    errors["hours"] = error
+
+    names = fields.get("service") or []
+    prices = fields.get("price") or []
+    durations = fields.get("duration") or []
+    if not (len(names) == len(prices) == len(durations)):
+        errors["services"] = (
+            "The page sent a half filled form. Load it again and try once more."
+        )
+        services = []
+    elif len(names) > ONBOARDING_MAX_SERVICES:
+        errors["services"] = (
+            "That is a lot of services. List the first 20 and add the rest later."
+        )
+        services = []
+    else:
+        varies = set()
+        for raw in fields.get("varies") or []:
+            try:
+                varies.add(int(raw))
+            except ValueError:
+                pass
+        services = []
+        seen = set()
+        for index, (name_text, price_text, duration_text) in enumerate(
+            zip(names, prices, durations)
+        ):
+            service_name = (name_text or "").strip()
+            # A wholly blank row is not a service: the form ships ten
+            # rows and most shops use fewer. Duration always arrives
+            # (the select pre-selects 30), so it never marks a row used.
+            if (
+                not service_name
+                and not (price_text or "").strip()
+                and index not in varies
+            ):
+                continue
+            key = "service_{}".format(index)
+            if not service_name:
+                errors[key] = (
+                    "Service {} needs a name. Fill it in or leave the "
+                    "whole row blank.".format(index + 1)
+                )
+                continue
+            if too_long(service_name, 100):
+                errors[key] = (
+                    "That service name is longer than 100 letters. "
+                    "Use a shorter one."
+                )
+                continue
+            if service_name.lower() in seen:
+                errors[key] = "You listed {} twice. Keep it once.".format(service_name)
+                continue
+            seen.add(service_name.lower())
+            price, error = parse_setup_price(price_text)
+            if error:
+                errors[key] = "{}: {}".format(service_name, error)
+                continue
+            duration, error = parse_setup_duration(duration_text)
+            if error:
+                errors[key] = "{}: {}".format(service_name, error)
+                continue
+            services.append(
+                Service(
+                    name=service_name,
+                    price=price,
+                    duration_min=duration,
+                    price_varies=index in varies,
+                )
+            )
+        if not services and "services" not in errors:
+            errors["services"] = (
+                "List at least one service, so the bot has something "
+                "to answer about."
+            )
+
+    if errors:
+        return None, errors
+    profile = BusinessProfile(
+        name=name,
+        category=category,
+        city=city,
+        phone=phone,
+        hours=hours,
+        services=services,
+        greeting="Hello! Welcome to {}.".format(name),
+        address=address,
+        offers="",
+    ).to_dict()
+    if owner_name:
+        profile["owner_name"] = owner_name
+    return profile, {}

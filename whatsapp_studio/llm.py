@@ -287,11 +287,18 @@ def _catalogue_lines(profile):
     lines = []
     for service in profile.services:
         if service.price is None:
-            lines.append(
-                f"- {service.name}: price confirmed at the shop "
-                f"({service.duration_min} min). No published price, so "
-                "never quote a number for it."
-            )
+            if service.price_varies:
+                lines.append(
+                    f"- {service.name}: price varies, the shop confirms it "
+                    f"({service.duration_min} min). No published price, so "
+                    "never quote a number for it."
+                )
+            else:
+                lines.append(
+                    f"- {service.name}: price confirmed at the shop "
+                    f"({service.duration_min} min). No published price, so "
+                    "never quote a number for it."
+                )
         elif service.floor_price is not None:
             lines.append(
                 f"- {service.name}: Rs {service.price} "
