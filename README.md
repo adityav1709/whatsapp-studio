@@ -324,6 +324,17 @@ the booking still works. `profiles/` holds draft pilot profiles for real
 prospects — Snips Salon, Gurgaon is the first — with only verified facts
 in them; prices wait for the owner to confirm.
 
+**Owner setup form**
+The dashboard has a Setup tab, behind the dashboard password, where the
+owner fills in prices, durations and hours herself: one price and one
+time per service, one line per day (like `10:00 AM - 8:00 PM`, or
+`closed`). A blank price means the shop confirms it. Saving updates the
+profile file and the running bot at once, and the previous version is
+kept next to the file as `<profile>.bak`, so a wrong save can be undone.
+Prices saved here stay until the next deploy, then the file goes back
+to what is in the repo: download the profile from Export my data and
+commit it to make a save permanent. The demo page cannot be changed.
+
 **Going live**
 Sending replies through Meta for real needs a WhatsApp Business app and a
 `WHATSAPP_TOKEN` + `PHONE_NUMBER_ID` (both, from the environment at

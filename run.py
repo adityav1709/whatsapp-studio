@@ -27,11 +27,16 @@ from whatsapp_studio.llm import client_from_env
 BASE = Path(__file__).resolve().parent
 
 
+def profile_path():
+    """The file the profile came from. The setup form saves through
+    this path, so it is computed once and shared."""
+    return os.environ.get("PROFILE_PATH") or str(BASE / "demo" / "demo_business.json")
+
+
 def load_profile():
     """The business this install serves. PROFILE_PATH lets Aditya point
     the server at a prospect's JSON file without editing code."""
-    path = os.environ.get("PROFILE_PATH") or str(BASE / "demo" / "demo_business.json")
-    return BusinessProfile.from_json(path)
+    return BusinessProfile.from_json(profile_path())
 
 
 def main():
@@ -56,6 +61,7 @@ def main():
         missed=stores.missed,
         outbox_store=stores.outbox,
         llm=client_from_env(),
+        profile_path=profile_path(),
     )
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
