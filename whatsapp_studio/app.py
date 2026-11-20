@@ -33,6 +33,7 @@ from .blocks import BlockStore
 from .bookings import (
     IST,
     BookingStore,
+    _atomic_write,
     format_date,
     format_time,
     has_relative_time,
@@ -43,6 +44,13 @@ from .bookings import (
     parse_hours_range,
     parse_time,
     validate_slot,
+)
+from .config import (
+    DAY_KEYS,
+    DAY_LABELS,
+    BusinessProfile,
+    validate_setup_hours,
+    validate_setup_services,
 )
 from .db import JsonOutboxStore
 from .demo_data import seed_demo_data
@@ -121,8 +129,16 @@ def handoff_confirmation(profile, reason, now=None):
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, missed=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, outbox_store=None, llm=None, demo_mode=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, missed=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, outbox_store=None, llm=None, demo_mode=None, profile_path=None):
         self.profile = profile
+        # Where the profile lives on disk, when the server knows it.
+        # The setup form saves through this path; without it, a save
+        # has nowhere to go and is refused. run.py passes it in.
+        self.profile_path = Path(profile_path) if profile_path else None
+        # The profile swap on a setup save is one assignment under
+        # this lock, so a message handled at the same moment sees the
+        # old profile whole or the new one whole, never a mix.
+        self._profile_lock = threading.Lock()
         self.leads = lead_store
         self.bookings = bookings if bookings is not None else BookingStore()
         self.handoffs = handoffs if handoffs is not None else HandoffStore()
@@ -289,6 +305,93 @@ class Studio:
                 ("Owner alerts on", False, "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID on Render so the owner is pinged.")
             )
         return items
+
+    def _newly_closed_with_bookings(self, new_hours):
+        """Future bookings on days the new hours just closed: the owner
+        has to call those customers, so the count belongs in the save
+        notice. Read before the profile swap, against the old hours."""
+        today = india_today()
+        closed_days = set()
+        for weekday in range(7):
+            old = self.profile.hours_today(weekday)
+            new = new_hours.get(DAY_KEYS[weekday], new_hours.get("daily"))
+            if not is_closed(old) and is_closed(new):
+                closed_days.add(weekday)
+        if not closed_days:
+            return 0
+        count = 0
+        for booking in self.bookings.all_bookings():
+            try:
+                day = date.fromisoformat(booking["date"])
+            except (KeyError, ValueError):
+                continue
+            if day >= today and day.weekday() in closed_days:
+                count += 1
+        return count
+
+    def apply_setup(self, fields):
+        """Save the setup form: prices, durations and hours. Returns
+        the notice for the dashboard. The order is the safety:
+        validate everything, write the file, then swap the live
+        profile. A failure anywhere before the swap leaves file and
+        memory untouched, and the notice says so in plain words."""
+        if self.demo_mode:
+            return "The demo page cannot be changed. This is the public showcase."
+        if self.profile_path is None:
+            return "There is no profile file to save to. Ask Aditya to check the setup."
+        names = fields.get("service") or []
+        prices = fields.get("price") or []
+        durations = fields.get("duration") or []
+        if not (len(names) == len(prices) == len(durations)):
+            return "The page sent a half filled form. Load it again and try once more."
+        hours_texts = [(fields.get("hours_" + key) or [""])[0] for key in DAY_KEYS]
+        services, error, warnings = validate_setup_services(
+            self.profile, list(zip(names, prices, durations))
+        )
+        if error:
+            return error
+        hours, error = validate_setup_hours(hours_texts)
+        if error:
+            return error
+        closed_count = self._newly_closed_with_bookings(hours)
+        new_profile = BusinessProfile(
+            name=self.profile.name,
+            category=self.profile.category,
+            city=self.profile.city,
+            phone=self.profile.phone,
+            hours=hours,
+            services=services,
+            greeting=self.profile.greeting,
+            address=self.profile.address,
+            offers=self.profile.offers,
+        )
+        try:
+            current_text = self.profile_path.read_text(encoding="utf-8")
+            current = json.loads(current_text)
+        except (OSError, ValueError):
+            return "The save failed. The profile file could not be read. Try again."
+        merged = dict(current)
+        merged["services"] = [service.to_dict() for service in services]
+        merged["hours"] = hours
+        try:
+            # The previous version stays safe next to the file, so a
+            # wrong save can be undone by Aditya.
+            _atomic_write(Path(str(self.profile_path) + ".bak"), current_text)
+            _atomic_write(self.profile_path, json.dumps(merged, indent=2))
+        except OSError:
+            return "The save failed. Nothing changed. Try again."
+        with self._profile_lock:
+            self.profile = BusinessProfile.from_dict(merged)
+        notice = "Saved. The bot now quotes these prices."
+        if warnings:
+            notice += " " + " ".join(warnings)
+        if closed_count:
+            notice += " {} booking{} {} on a day you just closed. Call those customers.".format(
+                closed_count,
+                "s" if closed_count != 1 else "",
+                "sits" if closed_count == 1 else "sit",
+            )
+        return notice
 
     def self_test_line(self):
         """One quiet line inviting the owner to test the bot himself:
@@ -1143,7 +1246,7 @@ class Studio:
         copy here."""
         from .bookings import format_date, format_time
 
-        tabs = ("today", "bookings", "customers", "replies", "conversation")
+        tabs = ("today", "bookings", "customers", "replies", "conversation", "setup")
         if tab not in tabs:
             tab = "today"
 
@@ -1991,6 +2094,7 @@ class Studio:
             ("customers", "Customers"),
             ("replies", "Replies"),
             ("conversation", "Conversation"),
+            ("setup", "Setup"),
         ]
         mock_qs = "&mock=1" if mock else ""
         nav = "<nav class='tabs'>" + "".join(
@@ -2070,7 +2174,8 @@ class Studio:
                 )
                 setup_html = (
                     "<section class='setup'><h2>{}</h2>"
-                    "<ul class='list'>{}</ul></section>"
+                    "<ul class='list'>{}</ul>"
+                    "<p><a href='/?tab=setup'>Open Setup</a> to fill in prices, times and hours.</p></section>"
                 ).format(heading, "".join(lines))
             body = hero + nums + alerts_section + missed_section + setup_html + self.saving_line() + self.self_test_line()
         elif tab == "bookings":
@@ -2161,6 +2266,85 @@ class Studio:
                 "<h2>Replies the bot sent</h2>"
                 "<ul class='list'>{}</ul>"
             ).format(replies_body, out_body)
+        elif tab == "setup":
+            # A notice from the last save, shown once.
+            notice_html = ""
+            if self._notice:
+                notice_html = (
+                    "<section class='alerts'><p class='alertline'>{}</p></section>"
+                ).format(html.escape(self._notice))
+                self._notice = None
+            if self.demo_mode:
+                body = notice_html + (
+                    "<h2>Setup</h2>"
+                    "<p class='quiet'>This is the demo shop, so its prices "
+                    "and hours cannot be changed here. On a real install "
+                    "this page is where the owner fills in prices, times "
+                    "and hours.</p>"
+                )
+            else:
+                unpriced = [
+                    service for service in self.profile.services
+                    if service.price is None
+                ]
+                # Services still missing a price come first, so the
+                # unfinished work is what the owner sees first.
+                ordered = sorted(
+                    self.profile.services,
+                    key=lambda s: (s.price is not None, s.name),
+                )
+                rows = []
+                for service in ordered:
+                    price = "" if service.price is None else str(service.price)
+                    rows.append(
+                        "<li><strong>{}</strong> "
+                        "<input type='hidden' name='service' value='{}'>"
+                        "<label>Price Rs <input type='text' name='price' "
+                        "inputmode='numeric' value='{}'></label> "
+                        "<label>Minutes <input type='text' name='duration' "
+                        "inputmode='numeric' value='{}'></label></li>".format(
+                            html.escape(service.name),
+                            html.escape(service.name, quote=True),
+                            html.escape(price, quote=True),
+                            service.duration_min,
+                        )
+                    )
+                hour_rows = []
+                for key, label, value in zip(
+                    DAY_KEYS, DAY_LABELS, self.profile.setup_hours_rows()
+                ):
+                    hour_rows.append(
+                        "<li><label>{} "
+                        "<input type='text' name='hours_{}' value='{}'></label></li>".format(
+                            label,
+                            key,
+                            html.escape(value, quote=True),
+                        )
+                    )
+                if unpriced:
+                    count_line = (
+                        "<p class='quiet'>{} of {} services still need a price. "
+                        "A blank price means the shop confirms it.</p>"
+                    ).format(len(unpriced), len(self.profile.services))
+                else:
+                    count_line = (
+                        "<p class='quiet'>Every service has a price. "
+                        "A blank price means the shop confirms it.</p>"
+                    )
+                body = notice_html + (
+                    "<h2>Setup</h2>"
+                    "{}"
+                    "<form method='post' action='/setup/save'>"
+                    "<h2>Prices and times</h2>"
+                    "<ul class='list'>{}</ul>"
+                    "<h2>Hours</h2>"
+                    "<p class='quiet'>One line per day, like 10:00 AM - 8:00 PM, or closed.</p>"
+                    "<ul class='list'>{}</ul>"
+                    "<p class='quiet'>Prices saved here stay until the next deploy, "
+                    "then the file goes back to what is in the repo. "
+                    "Export your data to keep a copy.</p>"
+                    "<button type='submit' class='primary'>Save prices and hours</button></form>"
+                ).format(count_line, "".join(rows), "".join(hour_rows))
         else:
             body = conversation_body
 
@@ -2303,6 +2487,7 @@ def make_handler(studio):
                     "exported_at": datetime.fromtimestamp(
                         time.time(), tz=IST
                     ).isoformat(),
+                    "profile": studio.profile.to_dict(),
                     "leads": studio.leads.all_leads(),
                     "bookings": studio.bookings.all_bookings(),
                     "handoffs": studio.handoffs.all_handoffs(),
@@ -2388,6 +2573,21 @@ def make_handler(studio):
                 studio.disable_negotiation()
                 self.send_response(303)
                 self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path == "/setup/save":
+                # The owner saves prices, durations and hours. Blank
+                # inputs must survive parsing, or a blank price reads
+                # as a missing field instead of price on request.
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                fields = parse_qs(
+                    raw.decode("utf-8", errors="replace"), keep_blank_values=True
+                )
+                studio._notice = studio.apply_setup(fields)
+                self.send_response(303)
+                self.send_header("Location", "/?tab=setup")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
