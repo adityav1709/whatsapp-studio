@@ -6,12 +6,14 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
 from test_llm import C, FixedLLM, ScriptedLLM, T
 from whatsapp_studio.app import Studio, make_server
-from whatsapp_studio.bookings import BookingStore
+from whatsapp_studio.blocks import BlockStore
+from whatsapp_studio.bookings import BookingStore, india_today
 from whatsapp_studio.config import BusinessProfile, Service
 from whatsapp_studio.handoffs import HandoffStore
 from whatsapp_studio.leads import LeadStore
@@ -403,6 +405,185 @@ class TestOwnerReply(unittest.TestCase):
         entry = next(e for e in self.studio.outbox if e.get("handoff") == 1 and e["body"].startswith("Hi Rahul"))
         self.assertEqual(entry["send_status"], "recorded")
         self.assertIsNone(self.studio.handoffs.open_for("919810000001"))
+
+
+class TestBookingReject(unittest.TestCase):
+    """The owner rejects a booked appointment from the Bookings tab:
+    the booking goes, the slot opens, and the two options on the
+    confirmation page each work on their own."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.notifier = FakeNotifier()
+        self.sender = FakeSender()
+        self.day = india_today() + timedelta(days=1)
+        self.service = Service("Haircut", 499, 30)
+        profile = BusinessProfile(
+            name="Glow & Grace Salon",
+            category="salon",
+            city="Gurgaon",
+            phone="919999999999",
+            hours={"daily": "10:00 AM - 8:00 PM"},
+            services=[self.service],
+            address="Sector 50, Gurgaon",
+        )
+        self.studio = Studio(
+            profile,
+            LeadStore(Path(self.tmp.name) / "leads.json"),
+            bookings=BookingStore(),
+            blocks=BlockStore(),
+            notifier=self.notifier,
+            sender=self.sender,
+            llm=FixedLLM("We are open 10:00 AM to 8:00 PM."),
+        )
+        self.studio.bookings.book(
+            "919810000001", "Rahul", self.service, self.day, 660
+        )
+        self.httpd = make_server(self.studio, port=0)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.tmp.cleanup()
+
+    def _get(self, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        status, body = resp.status, resp.read().decode()
+        conn.close()
+        return status, body
+
+    def _post(self, path, fields):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        body = urlencode(fields)
+        conn.request(
+            "POST",
+            path,
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        resp = conn.getresponse()
+        status, location = resp.status, resp.getheader("Location")
+        resp.read()
+        conn.close()
+        return status, location
+
+    def _reject_fields(self, **extra):
+        fields = {
+            "phone": "919810000001",
+            "date": self.day.isoformat(),
+            "start_min": "660",
+        }
+        fields.update(extra)
+        return fields
+
+    def test_bookings_tab_shows_a_reject_button(self):
+        status, body = self._get("/?tab=bookings")
+        self.assertEqual(status, 200)
+        self.assertIn("Haircut", body)
+        self.assertIn("action='/bookings/reject'", body)
+        self.assertIn("name='phone' value='919810000001'", body)
+        self.assertIn("name='start_min' value='660'", body)
+        self.assertIn(">Reject</button>", body)
+
+    def test_confirm_page_offers_both_options_and_removes_nothing(self):
+        status, body = self._get(
+            "/bookings/reject?phone=919810000001&date={}&start_min=660".format(
+                self.day.isoformat()
+            )
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Reject this booking?", body)
+        self.assertIn("Rahul", body)
+        self.assertIn("Haircut", body)
+        self.assertIn("Block this time on the calendar", body)
+        self.assertIn("Tell the customer on WhatsApp", body)
+        self.assertIn("action='/bookings/reject'", body)
+        self.assertIn("Keep the booking", body)
+        self.assertEqual(len(self.studio.bookings.all_bookings()), 1)
+
+    def test_confirm_page_for_missing_booking_is_404(self):
+        status, _ = self._get(
+            "/bookings/reject?phone=919810000099&date={}&start_min=660".format(
+                self.day.isoformat()
+            )
+        )
+        self.assertEqual(status, 404)
+
+    def test_reject_by_default_frees_the_slot_and_tells_nobody(self):
+        status, location = self._post("/bookings/reject", self._reject_fields())
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/?tab=bookings")
+        self.assertEqual(self.studio.bookings.all_bookings(), [])
+        self.assertTrue(self.studio.bookings.is_free(self.day, 660, 30))
+        self.assertEqual(self.studio.blocks.all_blocks(), [])
+        self.assertEqual(self.studio.outbox, [])
+        self.assertEqual(self.sender.calls, [])
+        _, body = self._get("/?tab=bookings")
+        self.assertIn("Rejected Rahul&#x27;s Haircut booking", body)
+        self.assertIn("That time is open again.", body)
+        self.assertNotIn("Blocked that time", body)
+
+    def test_reject_twice_second_is_404(self):
+        status, _ = self._post("/bookings/reject", self._reject_fields())
+        self.assertEqual(status, 303)
+        status, _ = self._post("/bookings/reject", self._reject_fields())
+        self.assertEqual(status, 404)
+
+    def test_reject_with_block_closes_the_slot(self):
+        status, _ = self._post(
+            "/bookings/reject", self._reject_fields(block_slot="1")
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.studio.bookings.all_bookings(), [])
+        self.assertTrue(self.studio.blocks.is_blocked(self.day, 660, 30))
+        self.assertEqual(len(self.studio.blocks.all_blocks()), 1)
+        _, body = self._get("/?tab=bookings")
+        self.assertIn("Blocked that time on the calendar.", body)
+
+    def test_reject_with_inform_sends_when_live(self):
+        status, _ = self._post(
+            "/bookings/reject", self._reject_fields(inform="1")
+        )
+        self.assertEqual(status, 303)
+        self.studio.wait_for_sends()
+        self.assertEqual(len(self.sender.calls), 1)
+        to, body = self.sender.calls[0]
+        self.assertEqual(to, "919810000001")
+        self.assertIn("cannot keep your Haircut appointment", body)
+        self.assertIn("Rahul", body)
+        entry = self.studio.outbox[0]
+        self.assertEqual(entry["send_status"], "sent")
+        _, page = self._get("/?tab=bookings")
+        self.assertIn("Rahul has been told on WhatsApp.", page)
+
+    def test_reject_with_inform_records_when_sending_is_off(self):
+        self.studio.sender = None
+        status, _ = self._post(
+            "/bookings/reject", self._reject_fields(inform="1")
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.sender.calls, [])
+        self.assertEqual(len(self.studio.outbox), 1)
+        entry = self.studio.outbox[0]
+        self.assertEqual(entry["send_status"], "recorded")
+        self.assertIn("cannot keep your Haircut appointment", entry["body"])
+        _, page = self._get("/?tab=bookings")
+        self.assertIn("The message was recorded, not sent", page)
+
+    def test_reject_with_both_options_blocks_and_informs(self):
+        status, _ = self._post(
+            "/bookings/reject",
+            self._reject_fields(block_slot="1", inform="1"),
+        )
+        self.assertEqual(status, 303)
+        self.assertTrue(self.studio.blocks.is_blocked(self.day, 660, 30))
+        self.studio.wait_for_sends()
+        self.assertEqual(len(self.sender.calls), 1)
 
 
 if __name__ == "__main__":

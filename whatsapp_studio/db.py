@@ -597,6 +597,29 @@ class PgBookingStore(_PgStore):
                     )
                     return booking_from_row(cur.fetchone())
 
+    def reject(self, phone, day, start_min):
+        """Remove one booking the owner rejected, by phone, date and
+        start time; returns it, or None when there is no such booking.
+        Same shape as cancel_latest, matched on the booking itself
+        instead of the latest one."""
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                with self._cursor(conn) as cur:
+                    cur.execute(
+                        "SELECT * FROM bookings WHERE phone = %s"
+                        " AND date = %s AND start_min = %s"
+                        " ORDER BY id LIMIT 1 FOR UPDATE",
+                        (phone, day, start_min),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    cur.execute(
+                        "DELETE FROM bookings WHERE id = %s RETURNING *",
+                        (row["id"],),
+                    )
+                    return booking_from_row(cur.fetchone())
+
     def update_latest_name(self, phone, name):
         with self._pool.connection() as conn:
             with conn.transaction():

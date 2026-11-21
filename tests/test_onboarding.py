@@ -87,8 +87,10 @@ class TestOnboardingValidation(unittest.TestCase):
         self.assertEqual(len(profile["services"]), 2)
         self.assertIsNone(profile["services"][0]["price"])
         self.assertTrue(profile["services"][0]["price_varies"])
+        self.assertIsNone(profile["services"][0]["floor_price"])
         self.assertEqual(profile["services"][0]["duration_min"], 60)
         self.assertEqual(profile["services"][1]["price"], 199)
+        self.assertIsNone(profile["services"][1]["floor_price"])
 
     def test_profile_round_trips_through_the_dataclass(self):
         profile, _ = validate_onboarding_profile(valid_fields())
@@ -214,6 +216,62 @@ class TestOnboardingValidation(unittest.TestCase):
             self.assertNotIn("\u2013", message)
             self.assertNotIn("\u2014", message)
 
+    def test_lowest_price_persists_to_floor_price(self):
+        profile, errors = validate_onboarding_profile(
+            valid_fields(lowest=["300", "", "", "", "", "", "", "", "", ""])
+        )
+        self.assertEqual(errors, {})
+        self.assertEqual(profile["services"][0]["floor_price"], 300)
+        self.assertIsNone(profile["services"][1]["floor_price"])
+
+    def test_lowest_price_equal_to_listed_price_is_fine(self):
+        profile, errors = validate_onboarding_profile(
+            valid_fields(
+                lowest=["", "199", "", "", "", "", "", "", "", ""],
+                varies=["0", "1"],
+            )
+        )
+        self.assertEqual(errors, {})
+        self.assertEqual(profile["services"][1]["floor_price"], 199)
+
+    def test_lowest_price_above_listed_price_is_refused(self):
+        _, errors = validate_onboarding_profile(
+            valid_fields(
+                price=["499", "199", "", "", "", "", "", "", "", ""],
+                lowest=["600", "", "", "", "", "", "", "", "", ""],
+            )
+        )
+        self.assertIn("service_0", errors)
+        self.assertIn("lowest price", errors["service_0"])
+
+    def test_lowest_price_must_be_whole_rupees(self):
+        _, errors = validate_onboarding_profile(
+            valid_fields(lowest=["abc", "", "", "", "", "", "", "", "", ""])
+        )
+        self.assertIn("service_0", errors)
+        self.assertIn("whole rupees", errors["service_0"])
+
+    def test_lowest_price_without_varies_is_ignored(self):
+        profile, errors = validate_onboarding_profile(
+            valid_fields(
+                lowest=["300", "", "", "", "", "", "", "", "", ""],
+                varies=[],
+            )
+        )
+        self.assertEqual(errors, {})
+        self.assertIsNone(profile["services"][0]["floor_price"])
+
+    def test_lowest_price_only_row_is_not_a_blank_row(self):
+        _, errors = validate_onboarding_profile(
+            valid_fields(
+                service=["", "", "", "", "", "", "", "", "", ""],
+                price=["", "", "", "", "", "", "", "", "", ""],
+                lowest=["300", "", "", "", "", "", "", "", "", ""],
+            )
+        )
+        self.assertIn("service_0", errors)
+        self.assertIn("needs a name", errors["service_0"])
+
     def test_price_varies_round_trips_in_the_service(self):
         service = Service("Bridal Makeup", None, 120, price_varies=True)
         back = Service.from_dict(service.to_dict())
@@ -284,18 +342,53 @@ class TestOnboardingHTTP(unittest.TestCase):
         except urllib.error.HTTPError as err:
             return err.code, err.read().decode()
 
-    def test_form_is_public_and_shows_ten_service_rows(self):
+    def test_form_is_public_and_shows_two_service_rows(self):
         status, body = self._get("/onboard", auth=False)
         self.assertEqual(status, 200)
         self.assertIn("Set up your shop", body)
         self.assertIn("action='/onboard'", body)
-        self.assertEqual(body.count("name='service'"), 10)
+        self.assertEqual(body.count("name='service'"), 2)
+        self.assertEqual(body.count("name='lowest'"), 2)
+        self.assertIn("Lowest Rs", body)
+        self.assertIn("id='add-service'", body)
+        self.assertIn("Add service", body)
+        self.assertEqual(body.count("<script"), 1)
         self.assertIn("facial ka price kya hai?", body)
         self.assertIn("Price varies", body)
         self.assertIn("Type it again", body)
         self.assertNotIn("Hello! Welcome to Glow & Grace.", body)
         self.assertNotIn("action='/setup/save'", body)
-        self.assertNotIn("<script", body)
+        self.assertNotIn("<script>alert", body)
+
+    def test_added_service_row_submits(self):
+        status, body, _ = self._post(
+            "/onboard",
+            valid_fields(
+                service=["Hair Spa", "Shampoo", "Haircut"],
+                price=["", "199", "299"],
+                duration=["60", "30", "45"],
+            ),
+            auth=False,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Haircut: Rs 299, 45 minutes", body)
+        self.assertIn("Thanks, Ritu.", body)
+
+    def test_error_round_trip_keeps_added_rows(self):
+        status, body, _ = self._post(
+            "/onboard",
+            valid_fields(
+                phone=["123"],
+                service=["Hair Spa", "Shampoo", "Haircut"],
+                price=["", "199", "299"],
+                duration=["60", "30", "45"],
+            ),
+            auth=False,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("does not look like an Indian mobile number", body)
+        self.assertEqual(body.count("name='service'"), 3)
+        self.assertIn("value='Haircut'", body)
 
     def test_valid_submission_shows_the_confirmation(self):
         before = self.path.read_text(encoding="utf-8")
@@ -334,6 +427,29 @@ class TestOnboardingHTTP(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("&lt;script&gt;", body)
         self.assertNotIn("<script>alert", body)
+
+    def test_lowest_price_shows_on_confirmation_and_rides_the_hidden_fields(self):
+        status, body, _ = self._post(
+            "/onboard",
+            valid_fields(lowest=["300", "", "", "", "", "", "", "", "", ""]),
+            auth=False,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(
+            "Hair Spa: price varies, the salon confirms it, lowest Rs 300", body
+        )
+        self.assertIn("type='hidden' name='lowest' value='300'", body)
+
+    def test_download_carries_the_lowest_price(self):
+        status, body, _ = self._post(
+            "/onboard/download",
+            valid_fields(lowest=["300", "", "", "", "", "", "", "", "", ""]),
+            auth=False,
+        )
+        self.assertEqual(status, 200)
+        profile = json.loads(body)
+        self.assertEqual(profile["services"][0]["floor_price"], 300)
+        self.assertIsNone(profile["services"][1]["floor_price"])
 
     def test_download_returns_the_profile_as_a_file(self):
         before = self.path.read_text(encoding="utf-8")

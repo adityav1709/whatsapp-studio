@@ -120,6 +120,26 @@ class TestBookingStore(unittest.TestCase):
         self.assertIsNotNone(self.store.book("919810000002", "Priya", self.haircut, self.day, 720))
         self.assertIsNone(self.store.cancel_latest("919810000099"))
 
+    def test_reject_removes_the_booking_and_frees_the_slot(self):
+        booked = self.store.book("919810000001", "Rahul", self.haircut, self.day, 660)
+        self.assertIsNotNone(booked)
+        rejected = self.store.reject("919810000001", self.day, 660)
+        self.assertEqual(rejected["service"], "Haircut")
+        self.assertEqual(rejected["start_min"], 660)
+        self.assertEqual(self.store.all_bookings(), [])
+        self.assertTrue(self.store.is_free(self.day, 660, 30))
+        self.assertIsNotNone(
+            self.store.book("919810000002", "Priya", self.haircut, self.day, 660)
+        )
+
+    def test_reject_missing_booking_returns_none(self):
+        self.assertIsNone(self.store.reject("919810000001", self.day, 660))
+
+    def test_reject_twice_second_returns_none(self):
+        self.store.book("919810000001", "Rahul", self.haircut, self.day, 660)
+        self.assertIsNotNone(self.store.reject("919810000001", self.day, 660))
+        self.assertIsNone(self.store.reject("919810000001", self.day, 660))
+
     def test_persists_to_disk(self):
         self.store.book("919810000001", "Rahul", self.haircut, self.day, 660)
         reloaded = BookingStore(Path(self.tmp.name) / "bookings.json")

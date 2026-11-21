@@ -258,6 +258,7 @@ def validate_setup_hours(day_texts):
 
 
 ONBOARDING_CATEGORIES = ("salon", "clinic", "gym", "other")
+ONBOARDING_DEFAULT_SERVICE_ROWS = 2
 ONBOARDING_SERVICE_ROWS = 10
 ONBOARDING_MAX_SERVICES = 20
 
@@ -350,7 +351,12 @@ def validate_onboarding_profile(fields):
     names = fields.get("service") or []
     prices = fields.get("price") or []
     durations = fields.get("duration") or []
-    if not (len(names) == len(prices) == len(durations)):
+    # A lowest price only arrives when the form renders that box; an
+    # older page without it is the same as every lowest left blank.
+    lowest_texts = fields.get("lowest")
+    if lowest_texts is None:
+        lowest_texts = [""] * len(names)
+    if not (len(names) == len(prices) == len(durations) == len(lowest_texts)):
         errors["services"] = (
             "The page sent a half filled form. Load it again and try once more."
         )
@@ -369,16 +375,17 @@ def validate_onboarding_profile(fields):
                 pass
         services = []
         seen = set()
-        for index, (name_text, price_text, duration_text) in enumerate(
-            zip(names, prices, durations)
+        for index, (name_text, price_text, duration_text, lowest_text) in enumerate(
+            zip(names, prices, durations, lowest_texts)
         ):
             service_name = (name_text or "").strip()
-            # A wholly blank row is not a service: the form ships ten
-            # rows and most shops use fewer. Duration always arrives
+            # A wholly blank row is not a service: the form starts
+            # with two rows and the owner adds more. Duration always arrives
             # (the select pre-selects 30), so it never marks a row used.
             if (
                 not service_name
                 and not (price_text or "").strip()
+                and not (lowest_text or "").strip()
                 and index not in varies
             ):
                 continue
@@ -407,11 +414,29 @@ def validate_onboarding_profile(fields):
             if error:
                 errors[key] = "{}: {}".format(service_name, error)
                 continue
+            # The lowest price only counts when the price varies: that
+            # is when the box shows, and when the bot may negotiate.
+            # A fixed price never drops, so a lowest typed against one
+            # is ignored. With no listed price it is the floor the bot
+            # may negotiate down to; with one it cannot sit above it.
+            floor = None
+            if index in varies:
+                floor, error = parse_setup_price(lowest_text)
+                if error:
+                    errors[key] = "{}: {}".format(service_name, error)
+                    continue
+                if floor is not None and price is not None and floor > price:
+                    errors[key] = (
+                        "{}: the lowest price cannot be above the listed "
+                        "price.".format(service_name)
+                    )
+                    continue
             services.append(
                 Service(
                     name=service_name,
                     price=price,
                     duration_min=duration,
+                    floor_price=floor,
                     price_varies=index in varies,
                 )
             )

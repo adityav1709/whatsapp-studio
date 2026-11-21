@@ -371,6 +371,21 @@ class TestPgBookingStore(unittest.TestCase):
         self.assertIsNone(PgBookingStore(FakePool(cursor)).cancel_latest(PHONE))
         self.assertEqual(len(cursor.executed), 1)
 
+    def test_reject_removes_the_booking(self):
+        cursor = FakeCursor()
+        cursor.script(
+            {"one": _booking_row()}, {"one": _booking_row()}
+        )
+        rejected = PgBookingStore(FakePool(cursor)).reject(PHONE, DAY, 660)
+        self.assertEqual(rejected["id"], 7)
+        self.assertIn("DELETE FROM bookings", cursor.executed[1][0])
+
+    def test_reject_with_nothing(self):
+        cursor = FakeCursor()
+        cursor.script({"one": None})
+        self.assertIsNone(PgBookingStore(FakePool(cursor)).reject(PHONE, DAY, 660))
+        self.assertEqual(len(cursor.executed), 1)
+
     def test_reschedule_moves_in_one_transaction(self):
         cursor = FakeCursor()
         cursor.script(

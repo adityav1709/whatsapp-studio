@@ -540,6 +540,23 @@ class BookingStore:
         self._save()
         return latest
 
+    def reject(self, phone, day, start_min):
+        """Remove one booking the owner rejected, by phone, date and
+        start time; returns it, or None when there is no such booking.
+        Removing it frees the slot at once. A second reject of the
+        same booking finds nothing, so it can never be rejected twice."""
+        key = day.isoformat() if isinstance(day, date) else day
+        for booking in self._bookings:
+            if (
+                booking["phone"] == phone
+                and booking["date"] == key
+                and booking["start_min"] == start_min
+            ):
+                self._bookings.remove(booking)
+                self._save()
+                return booking
+        return None
+
     def update_latest_name(self, phone, name):
         """Put a name on the customer's most recent upcoming booking."""
         today = india_today().isoformat()

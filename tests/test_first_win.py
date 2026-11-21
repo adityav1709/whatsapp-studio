@@ -306,8 +306,8 @@ class TestFirstWinDashboard(unittest.TestCase):
         )
         text = _win_text(self.studio.dashboard_html("today"))
         self.assertNotIn("-", text)
-        self.assertNotIn("–", text)
-        self.assertNotIn("—", text)
+        self.assertNotIn("\u2013", text)
+        self.assertNotIn("\u2014", text)
 
     def test_glance_and_money_unchanged_with_win(self):
         _book(

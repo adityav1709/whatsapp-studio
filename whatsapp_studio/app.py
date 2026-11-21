@@ -48,6 +48,7 @@ from .bookings import (
 from .config import (
     DAY_KEYS,
     DAY_LABELS,
+    ONBOARDING_DEFAULT_SERVICE_ROWS,
     ONBOARDING_SERVICE_ROWS,
     BusinessProfile,
     validate_onboarding_profile,
@@ -463,6 +464,48 @@ class Studio:
             if start_min < b["start_min"] + b["duration_min"]
             and b["start_min"] < end_min
         ]
+
+    def reject_booking(self, phone, day, start_min, block_slot=False, inform=False):
+        """The owner rejects a booked appointment. The booking is
+        removed, so the slot opens up again at once. The time is
+        blocked only when asked, so it stays closed for other
+        customers. The customer is told only when asked: a short
+        message that the booking could not be kept, sent on WhatsApp
+        when live and recorded in the outbox when not. Returns a dict
+        with the rejected booking and what was done, or None when
+        there is no such booking, so a second reject of the same one
+        is refused."""
+        booking = self.bookings.reject(phone, day, start_min)
+        if booking is None:
+            return None
+        blocked = False
+        if block_slot:
+            self.blocks.add(
+                day,
+                booking["start_min"],
+                booking["start_min"] + booking["duration_min"],
+                "Rejected {} booking".format(booking["service"]),
+            )
+            blocked = True
+        informed = False
+        if inform:
+            when = format_date(date.fromisoformat(booking["date"]))
+            message = (
+                "Hi {}, this is {}. We are sorry, but we cannot keep "
+                "your {} appointment on {} at {}. Please message us "
+                "to pick another time."
+            ).format(
+                booking.get("name") or "there",
+                self.profile.name,
+                booking["service"],
+                when,
+                format_time(booking["start_min"]),
+            )
+            self._record_reply(
+                booking["phone"], "", "booking_rejected", "", message
+            )
+            informed = True
+        return {"booking": booking, "blocked": blocked, "informed": informed}
 
     def _free_slots(self, day, service, hours):
         """Free start times on a day, with blocked times taken out too.
@@ -1809,7 +1852,7 @@ class Studio:
             "<p class='allclear'>All clear, nobody is waiting for you.</p>"
         )
 
-        def booking_rows(bookings):
+        def booking_rows(bookings, reject=False):
             rows = []
             for b in bookings:
                 digits = "".join(c for c in b["phone"] if c.isdigit())
@@ -1818,21 +1861,35 @@ class Studio:
                     if b.get("price") is not None
                     else "price to confirm"
                 )
+                reject_html = ""
+                if reject:
+                    reject_html = (
+                        " <form method='get' action='/bookings/reject'>"
+                        "<input type='hidden' name='phone' value='{}'>"
+                        "<input type='hidden' name='date' value='{}'>"
+                        "<input type='hidden' name='start_min' value='{}'>"
+                        "<button type='submit' class='inline'>Reject</button></form>"
+                    ).format(
+                        html.escape(b["phone"], quote=True),
+                        html.escape(b["date"], quote=True),
+                        b["start_min"],
+                    )
                 rows.append(
                     "<li><strong>{}</strong> · {} for {} · {} · "
-                    "<a href='tel:+{}'>{}</a></li>".format(
+                    "<a href='tel:+{}'>{}</a>{}</li>".format(
                         html.escape(format_time(b["start_min"])),
                         html.escape(b["service"]),
                         html.escape(b.get("name") or b["phone"]),
                         price,
                         digits,
                         html.escape(b["phone"]),
+                        reject_html,
                     )
                 )
             return rows
 
-        book_body = "".join(booking_rows(todays)) or "<li>No bookings today.</li>"
-        tomorrow_body = "".join(booking_rows(tomorrows)) or "<li>No bookings tomorrow.</li>"
+        book_body = "".join(booking_rows(todays, reject=True)) or "<li>No bookings today.</li>"
+        tomorrow_body = "".join(booking_rows(tomorrows, reject=True)) or "<li>No bookings tomorrow.</li>"
 
         # What people asked about most today, from the messages the bot
         # answered. Count distinct people per service, not messages, so
@@ -2400,7 +2457,7 @@ ONBOARD_CATEGORIES = (
 ONBOARD_FIELD_KEYS = (
     "name", "category", "city", "address", "owner_name", "phone",
     "phone_confirm", "open", "close", "closed", "service", "price",
-    "duration", "varies",
+    "duration", "varies", "lowest",
 )
 
 _ONBOARD_CSS = """
@@ -2430,6 +2487,7 @@ h2::after{content:"";display:block;width:56px;height:3px;background:var(--gold);
 .field{margin:0 24px}
 label{display:block;font-size:15px;font-weight:500;margin:14px 0 0}
 label.inline{display:inline-block;margin:8px 16px 0 0;font-weight:400}
+[hidden]{display:none!important}
 input[type=text],input[type=time],input[type=tel],select{width:100%;box-sizing:border-box;min-height:46px;padding:11px 14px;font-size:16px;border:1px solid #D8D8D2;border-radius:14px;margin:8px 0;background:#fff;color:var(--ink)}
 input[type=radio],input[type=checkbox]{min-height:0;margin:0 6px 0 0}
 button{min-height:44px;padding:12px 24px;font-size:16px;font-weight:500;border-radius:999px;border:0;background:var(--ink);color:var(--paper);cursor:pointer;font-family:inherit}
@@ -2550,10 +2608,18 @@ def _onboard_form_html(fields, errors):
     prices = list(fields.get("price") or [])
     durations = list(fields.get("duration") or [])
     varies = set(fields.get("varies") or [])
+    lowest = list(fields.get("lowest") or [])
     rows = []
-    for index in range(ONBOARDING_SERVICE_ROWS):
+    # Two rows to start; on an error round trip keep every row she
+    # sent, so a service she added is not lost with her typing.
+    row_count = max(
+        ONBOARDING_DEFAULT_SERVICE_ROWS,
+        min(len(names), ONBOARDING_SERVICE_ROWS),
+    )
+    for index in range(row_count):
         name = names[index] if index < len(names) else ""
         price = prices[index] if index < len(prices) else ""
+        lowest_value = lowest[index] if index < len(lowest) else ""
         try:
             duration = int(durations[index]) if index < len(durations) else 30
         except ValueError:
@@ -2570,15 +2636,63 @@ def _onboard_form_html(fields, errors):
             "<li><label>Service <input type='text' name='service' value='{}'></label> "
             "<label>Price Rs <input type='text' name='price' inputmode='numeric' value='{}'></label> "
             "<label>Minutes <select name='duration'>{}</select></label> "
-            "<label class='inline'><input type='checkbox' name='varies' value='{}'{}> Price varies</label>{}</li>".format(
+            "<label class='inline'><input type='checkbox' name='varies' value='{}'{}> Price varies</label> "
+            "<label class='inline lowest'{}>Lowest Rs <input type='text' name='lowest' inputmode='numeric' value='{}'></label>{}</li>".format(
                 html.escape(name, quote=True),
                 html.escape(price, quote=True),
                 options,
                 index,
                 " checked" if str(index) in varies else "",
+                " hidden" if str(index) not in varies else "",
+                html.escape(lowest_value, quote=True),
                 _onboard_error(errors, "service_{}".format(index)),
             )
         )
+    # The button clones the last row and clears it, so the page needs
+    # no row template. The lowest box only shows while its row's price
+    # varies box is ticked. The script is a plain string, never passed
+    # through the format call below, so its braces are safe.
+    add_service = (
+        "<button type='button' class='ghost' id='add-service'>Add service</button>"
+        "<script>(function () {"
+        "var list = document.querySelector('ul.list');"
+        "var button = document.getElementById('add-service');"
+        "if (!list || !button) { return; }"
+        "function atCap() { return list.querySelectorAll('li').length >= "
+        + str(ONBOARDING_SERVICE_ROWS)
+        + "; }"
+        "if (atCap()) { button.disabled = true; }"
+        "button.addEventListener('click', function () {"
+        "if (atCap()) { button.disabled = true; return; }"
+        "var rows = list.querySelectorAll('li');"
+        "var row = rows[rows.length - 1].cloneNode(true);"
+        "var texts = row.querySelectorAll('input[type=text]');"
+        "for (var i = 0; i < texts.length; i++) { texts[i].value = ''; }"
+        "var varies = row.querySelector('input[type=checkbox]');"
+        "varies.checked = false;"
+        "varies.value = rows.length;"
+        "var low = row.querySelector('.lowest');"
+        "if (low) { low.hidden = true; }"
+        "row.querySelector('select').value = '30';"
+        "var errs = row.querySelectorAll('.err');"
+        "for (var j = 0; j < errs.length; j++) { errs[j].remove(); }"
+        "list.appendChild(row);"
+        "if (atCap()) { button.disabled = true; }"
+        "});"
+        "function syncLowest(row) {"
+        "var box = row.querySelector('input[type=checkbox]');"
+        "var low = row.querySelector('.lowest');"
+        "if (box && low) { low.hidden = !box.checked; }"
+        "}"
+        "list.addEventListener('change', function (event) {"
+        "if (event.target && event.target.type === 'checkbox') {"
+        "syncLowest(event.target.closest('li'));"
+        "}"
+        "});"
+        "var all = list.querySelectorAll('li');"
+        "for (var k = 0; k < all.length; k++) { syncLowest(all[k]); }"
+        "})();</script>"
+    )
     closed = set(fields.get("closed") or [])
     closed_boxes = "".join(
         "<label class='inline'><input type='checkbox' name='closed' value='{}'{}> {}</label>".format(
@@ -2615,8 +2729,9 @@ def _onboard_form_html(fields, errors):
         "<h2>Services and prices</h2>"
         "<div class='field'><p class='quiet'>One per row. Leave the price blank "
         "when you want to tell the customer yourself. Tick price varies "
-        "when the price depends on the service.</p>{}</div>"
-        "<ul class='list'>{}</ul>"
+        "when the price depends on the service, then set the lowest "
+        "price you will accept.</p>{}</div>"
+        "<ul class='list'>{}</ul>{}"
         "<h2>Hours</h2>"
         "<div class='field'><p class='quiet'>The same hours every day. "
         "If a day is different, you can change it later.</p>"
@@ -2647,6 +2762,7 @@ def _onboard_form_html(fields, errors):
             _onboard_error(errors, "owner_name"),
             _onboard_error(errors, "services"),
             "".join(rows),
+            add_service,
             html.escape(open_value, quote=True),
             html.escape(close_value, quote=True),
             _onboard_error(errors, "hours"),
@@ -2678,6 +2794,8 @@ def _onboard_confirmation_html(profile, fields):
             )
         else:
             line = "{}: price to confirm".format(service["name"])
+        if service.get("floor_price") is not None:
+            line += ", lowest Rs {}".format(service["floor_price"])
         service_lines.append("<li>{}</li>".format(html.escape(line)))
     question, answer = _onboard_sample_reply(profile)
     hidden = _onboard_hidden_fields(fields)
@@ -2721,6 +2839,41 @@ def _onboard_confirmation_html(profile, fields):
             html.escape(answer),
             hidden,
             hidden,
+        ),
+    )
+
+
+def _reject_confirmation_html(booking):
+    """The owner checks before a booking is rejected: who, what and
+    when, plus two choices that stand alone. The slot stays open and
+    the customer hears nothing unless the owner ticks the box."""
+    when = format_date(date.fromisoformat(booking["date"]))
+    who = booking.get("name") or booking["phone"]
+    return _onboard_page(
+        "Reject this booking",
+        "<header><h1>Reject this booking?</h1>"
+        "<p class='intro'>{} for {} on {} at {}. The booking is "
+        "removed and the time opens up again for other customers.</p></header>"
+        "<div class='card'><form method='post' action='/bookings/reject'>"
+        "<input type='hidden' name='phone' value='{}'>"
+        "<input type='hidden' name='date' value='{}'>"
+        "<input type='hidden' name='start_min' value='{}'>"
+        "<label class='inline'><input type='checkbox' name='block_slot' value='1'> "
+        "Block this time on the calendar</label>"
+        "<p class='quiet'>Tick this to keep the time closed, so nobody else can book it.</p>"
+        "<label class='inline'><input type='checkbox' name='inform' value='1'> "
+        "Tell the customer on WhatsApp</label>"
+        "<p class='quiet'>Sends a short message that the booking could not be kept. "
+        "When sending is off the message is recorded, not sent.</p>"
+        "<button type='submit' class='primary'>Reject this booking</button></form></div>"
+        "<p class='foot'><a href='/?tab=bookings'>Keep the booking</a></p>".format(
+            html.escape(booking["service"]),
+            html.escape(who),
+            html.escape(when),
+            html.escape(format_time(booking["start_min"])),
+            html.escape(booking["phone"], quote=True),
+            html.escape(booking["date"], quote=True),
+            booking["start_min"],
         ),
     )
 
@@ -2823,6 +2976,33 @@ def make_handler(studio):
                 self._send_json(200, {"leads": studio.leads.all_leads()})
             elif parsed.path == "/bookings":
                 self._send_json(200, {"bookings": studio.bookings.all_bookings()})
+            elif parsed.path == "/bookings/reject":
+                # The confirmation page before a reject: who, what and
+                # when, plus the two choices. Nothing is removed here.
+                qs = parse_qs(parsed.query)
+                phone = qs.get("phone", [""])[0]
+                date_text = qs.get("date", [""])[0]
+                try:
+                    day = date.fromisoformat(date_text)
+                    start_min = int(qs.get("start_min", [""])[0])
+                except ValueError:
+                    day = None
+                    start_min = None
+                booking = None
+                if day is not None and start_min is not None:
+                    booking = next(
+                        (
+                            b for b in studio.bookings.bookings_on(day)
+                            if b["phone"] == phone and b["start_min"] == start_min
+                        ),
+                        None,
+                    )
+                if booking is None:
+                    self._send_json(404, {"error": "booking not found"})
+                else:
+                    self._send_text(
+                        200, _reject_confirmation_html(booking), "text/html"
+                    )
             elif parsed.path == "/handoffs":
                 self._send_json(200, {"handoffs": studio.handoffs.all_handoffs()})
             elif parsed.path == "/regulars":
@@ -3077,6 +3257,63 @@ def make_handler(studio):
                     self._send_json(404, {"error": "block not found"})
                     return
                 studio._notice = "Opened that time again."
+                self.send_response(303)
+                self.send_header("Location", "/?tab=bookings")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path == "/bookings/reject":
+                # The owner confirmed on the reject page: remove the
+                # booking, block the time and tell the customer only
+                # when asked, then say what happened on the Bookings
+                # tab. A booking already rejected is not found here,
+                # so it can never be rejected twice.
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                fields = parse_qs(raw.decode("utf-8", errors="replace"))
+                phone = (fields.get("phone") or [""])[0]
+                date_text = (fields.get("date") or [""])[0]
+                try:
+                    day = date.fromisoformat(date_text)
+                    start_min = int((fields.get("start_min") or [""])[0])
+                except ValueError:
+                    day = None
+                    start_min = None
+                if day is None or start_min is None:
+                    self._send_json(404, {"error": "booking not found"})
+                    return
+                result = studio.reject_booking(
+                    phone,
+                    day,
+                    start_min,
+                    block_slot="block_slot" in fields,
+                    inform="inform" in fields,
+                )
+                if result is None:
+                    self._send_json(404, {"error": "booking not found"})
+                    return
+                booking = result["booking"]
+                who = booking.get("name") or booking["phone"]
+                notice = (
+                    "Rejected {}'s {} booking on {} at {}. "
+                    "That time is open again."
+                ).format(
+                    who,
+                    booking["service"],
+                    format_date(day),
+                    format_time(booking["start_min"]),
+                )
+                if result["blocked"]:
+                    notice += " Blocked that time on the calendar."
+                if result["informed"]:
+                    if studio.live:
+                        notice += " {} has been told on WhatsApp.".format(who)
+                    else:
+                        notice += (
+                            " The message was recorded, not sent, "
+                            "because sending is off."
+                        )
+                studio._notice = notice
                 self.send_response(303)
                 self.send_header("Location", "/?tab=bookings")
                 self.send_header("Content-Length", "0")
