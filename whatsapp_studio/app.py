@@ -2878,7 +2878,9 @@ def _reject_confirmation_html(booking):
     )
 
 
-def make_handler(studio):
+def make_handler(studio, router=None):
+    """The HTTP handler. With a router, the webhook routes each change
+    to its shop; everything else keeps showing the default shop."""
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # keep test/demo output clean
             pass
@@ -3085,7 +3087,10 @@ def make_handler(studio):
                 if not isinstance(payload, dict):
                     self._send_json(400, {"error": "invalid payload"})
                     return
-                count = studio.handle_webhook_payload(payload)
+                if router is not None:
+                    count = router.handle_webhook_payload(payload)
+                else:
+                    count = studio.handle_webhook_payload(payload)
                 self._send_json(200, {"received": True, "processed": count})
                 return
             if parsed.path == "/onboard":
@@ -3443,5 +3448,5 @@ def make_handler(studio):
     return Handler
 
 
-def make_server(studio, host="127.0.0.1", port=0):
-    return ThreadingHTTPServer((host, port), make_handler(studio))
+def make_server(studio, host="127.0.0.1", port=0, router=None):
+    return ThreadingHTTPServer((host, port), make_handler(studio, router=router))
