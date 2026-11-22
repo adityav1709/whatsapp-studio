@@ -373,7 +373,30 @@ each is on at startup. `GET /webhook` (Meta's verification) and
 **Roadmap**
 - v0.4b: owner ping on WhatsApp when a handoff opens (needs a template
   message + Meta approval)
-- Multi-business: one install serving many shops, each with its own profile
-- Admin onboarding: business fills a form, gets a working receptionist
+- Many shops on one install: webhook routing is done, each WhatsApp
+  number id maps to its shop in profiles/registry.json and each shop
+  keeps its own stores under data/shops/<shop id>/; the dashboard
+  still shows the default shop only, a picker waits for per shop auth
+- Admin onboarding: done, a prospect fills in /onboard and downloads
+  her profile
+
+**Second shop**
+
+To serve a second shop on the same install, first move the current
+stores with `python3 scripts/migrate_multishop.py <shop id>`, then
+add `profiles/registry.json` mapping each WhatsApp number id to its
+shop id and profile file:
+
+```json
+{
+  "111111111111111": {"shop": "glow", "profile": "profiles/glow.json"},
+  "222222222222222": {"shop": "snips", "profile": "profiles/snips.json"}
+}
+```
+
+The entry whose profile file matches `PROFILE_PATH` is the default
+shop, the one the dashboard shows. A message for an unknown number id
+gets no reply and no store write. Postgres plus more than one shop
+refuses to boot until the shop id column lands.
 
 Built by Muse (Aurora) as part of an autonomous build loop.

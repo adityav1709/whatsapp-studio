@@ -13,6 +13,10 @@ Env:    PORT (default 8000), HOST (default 127.0.0.1; set 0.0.0.0 when
         DATABASE_URL (set to save bookings, customers and replies in
         Postgres instead of JSON files; without it the JSON files
         under data/ are used, exactly as before)
+        A registry file at profiles/registry.json means a second shop:
+        each WhatsApp number id maps to a shop id and a profile file,
+        and the router serves each shop from data/shops/<shop id>/.
+        With no file the server serves the one shop exactly as before.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ from whatsapp_studio.app import Studio, make_server
 from whatsapp_studio.config import BusinessProfile
 from whatsapp_studio.db import build_stores
 from whatsapp_studio.llm import client_from_env
+from whatsapp_studio.multishop import ShopRouter, load_registry
 
 BASE = Path(__file__).resolve().parent
 
@@ -51,22 +56,43 @@ def main():
             " Unset DEMO_MODE or DATABASE_URL and restart."
         )
     stores = build_stores(database_url, BASE / "data")
-    studio = Studio(
-        profile,
-        stores.leads,
-        verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"),
-        bookings=stores.bookings,
-        handoffs=stores.handoffs,
-        blocks=stores.blocks,
-        missed=stores.missed,
-        outbox_store=stores.outbox,
-        llm=client_from_env(),
-        profile_path=profile_path(),
-    )
+    llm = client_from_env()
+    # A registry file means a second shop: the router builds one Studio
+    # per shop, default shop included, each reading its own stores
+    # under data/shops/<shop id>/. With no file the server serves the
+    # one shop exactly as before, so the live install is untouched
+    # until shop two is real.
+    router = None
+    registry_path = BASE / "profiles" / "registry.json"
+    if registry_path.exists():
+        router = ShopRouter(
+            load_registry(registry_path),
+            profile_path(),
+            BASE,
+            database_url=database_url,
+            llm=llm,
+            verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"),
+        )
+        studio = router.default_studio
+    else:
+        studio = Studio(
+            profile,
+            stores.leads,
+            verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"),
+            bookings=stores.bookings,
+            handoffs=stores.handoffs,
+            blocks=stores.blocks,
+            missed=stores.missed,
+            outbox_store=stores.outbox,
+            llm=llm,
+            profile_path=profile_path(),
+        )
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
-    httpd = make_server(studio, host=host, port=port)
+    httpd = make_server(studio, host=host, port=port, router=router)
     print(f"WhatsApp Studio running for {profile.name} on http://{host}:{port}")
+    if router is not None:
+        print(f"Shops on this install: {', '.join(router.shop_ids)}.")
     if database_url:
         print("Storage: Postgres (DATABASE_URL set).")
     else:
