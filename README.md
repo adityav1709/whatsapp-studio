@@ -336,7 +336,18 @@ server and shows the shop back as the bot will know it, with a sample
 of her own bot answering a customer, then hands her a profile file to
 download and send to Aditya. Nothing is live until he connects her
 number and deploys it. Form bodies over 64 KB are refused. The
-dashboard footer links here.
+dashboard footer links here. The moment she submits a valid form,
+Aditya gets a Telegram ping (the same owner alerts as a booking or a
+handoff) with her shop, her name and number, her top services and
+hours — a lead, not a signup, because the shop file is still only on
+her phone and she still has to send it. The form tells her this
+before she submits, and the confirmation says he will message her on
+WhatsApp. One ping per phone number per day, in memory only, so a
+refresh or an edit and resubmit does not buzz him twice; a failed
+ping never breaks her confirmation page. This deliberately reverses
+the original onboarding note that said no Telegram ping: a ping
+writes nothing and stores nothing, so the no-storage rule still
+holds.
 
 **Owner setup form**
 The dashboard has a Setup tab, behind the dashboard password, where the
