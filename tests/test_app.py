@@ -44,6 +44,7 @@ class FakeNotifier:
         self.calls = []
         self.booking_calls = []
         self.send_failed_calls = []
+        self.onboard_calls = []
 
     def notify(self, business_name, handoff):
         self.calls.append((business_name, handoff))
@@ -53,6 +54,9 @@ class FakeNotifier:
 
     def notify_send_failed(self, business_name, entry):
         self.send_failed_calls.append((business_name, entry))
+
+    def notify_onboard(self, profile, seen_before=False):
+        self.onboard_calls.append((profile, seen_before))
 
 
 class FakeSender:
