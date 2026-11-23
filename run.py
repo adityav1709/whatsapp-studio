@@ -17,6 +17,9 @@ Env:    PORT (default 8000), HOST (default 127.0.0.1; set 0.0.0.0 when
         each WhatsApp number id maps to a shop id and a profile file,
         and the router serves each shop from data/shops/<shop id>/.
         With no file the server serves the one shop exactly as before.
+        DASHBOARD_PASSWORD is the dashboard login (the master password
+        when a registry exists); DASHBOARD_PASSWORD_<SHOP> gives one
+        shop its own login, each shop needing its own.
 """
 from __future__ import annotations
 
@@ -28,6 +31,10 @@ from whatsapp_studio.config import BusinessProfile
 from whatsapp_studio.db import build_stores
 from whatsapp_studio.llm import client_from_env
 from whatsapp_studio.multishop import ShopRouter, load_registry
+from whatsapp_studio.security import (
+    dashboard_password_env_name,
+    load_dashboard_passwords,
+)
 
 BASE = Path(__file__).resolve().parent
 
@@ -63,6 +70,7 @@ def main():
     # one shop exactly as before, so the live install is untouched
     # until shop two is real.
     router = None
+    dashboard_passwords = {}
     registry_path = BASE / "profiles" / "registry.json"
     if registry_path.exists():
         router = ShopRouter(
@@ -74,6 +82,27 @@ def main():
             verify_token=os.environ.get("VERIFY_TOKEN", "studio-demo"),
         )
         studio = router.default_studio
+        # One dashboard password per shop, from the environment. The
+        # Studio still carries DASHBOARD_PASSWORD, which is the master
+        # here: it opens every shop, and the per shop passwords live
+        # only in this map. Two shops sharing a password, or a shop
+        # password equal to the master, refuses boot loudly.
+        try:
+            dashboard_passwords = load_dashboard_passwords(
+                router.shop_ids, master_password=studio.dashboard_password
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Dashboard passwords: {exc}")
+        for shop_id in router.shop_ids:
+            if shop_id in dashboard_passwords:
+                print(f"Dashboard password: set for shop {shop_id}.")
+            else:
+                print(
+                    "WARNING: shop {} has no {} set; its owner cannot "
+                    "log in. The master password still opens it.".format(
+                        shop_id, dashboard_password_env_name(shop_id)
+                    )
+                )
     else:
         studio = Studio(
             profile,
@@ -89,7 +118,13 @@ def main():
         )
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
-    httpd = make_server(studio, host=host, port=port, router=router)
+    httpd = make_server(
+        studio,
+        host=host,
+        port=port,
+        router=router,
+        dashboard_passwords=dashboard_passwords,
+    )
     print(f"WhatsApp Studio running for {profile.name} on http://{host}:{port}")
     if router is not None:
         print(f"Shops on this install: {', '.join(router.shop_ids)}.")
@@ -113,7 +148,14 @@ def main():
         print("Webhook signature verification: ON (WHATSAPP_APP_SECRET set).")
     else:
         print("Webhook signature verification: OFF — set WHATSAPP_APP_SECRET before a public pilot.")
-    if studio.dashboard_password:
+    if router is not None:
+        # Per shop lines already printed above. The shared password
+        # is the master here: it opens every shop, so say so.
+        if studio.dashboard_password:
+            print("Dashboard master password: set (opens every shop).")
+        else:
+            print("Dashboard master password: NOT SET — no master login.")
+    elif studio.dashboard_password:
         print("Dashboard password: set.")
     else:
         print("Dashboard password: NOT SET — set DASHBOARD_PASSWORD before a public pilot.")

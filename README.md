@@ -237,7 +237,8 @@ Run the tests with `python3 -m unittest discover -s tests` from the project fold
 - Demo vs live: live only when both env vars are set, otherwise demo
   mode (outbox only, exactly as before). `WHATSAPP_DRY_RUN=1` forces
   record-only even with a token set. Startup prints the mode;
-  `/health` reports `live` and `sending` (no token in the response)
+  `/health` is generic on purpose (status, database backend and
+  health only — no shop name, no token in the response)
 - Kill switch: a dashboard button (POST `/sending/disable`) stops all
   sending instantly — replies go to the outbox only until it is switched
   back on (POST `/sending/enable`)
@@ -365,7 +366,19 @@ Set both of these from the environment at runtime — never in the repo:
   anyone who finds the URL can inject fake messages.
 - `DASHBOARD_PASSWORD` — one shared password for the dashboard and the
   data endpoints (HTTP Basic Auth, any username). Without it anyone who
-  finds the server can read every lead and resolve handoffs.
+  finds the server can read every lead and resolve handoffs. With more
+  than one shop (a registry file), this password becomes the master: it
+  opens a shop picker listing every shop, and it is never shared with an
+  owner. Each shop gets its own login from `DASHBOARD_PASSWORD_<SHOP>`
+  (the shop id uppercased, hyphens as underscores): that password opens
+  exactly its shop and nothing else, and a shop password never takes a
+  shop in the URL. Two shops sharing one password, or a shop password
+  equal to the master, refuses boot. A shop with no password set has no
+  owner login (the master still opens it). A wrong password is never a
+  lockout: the 401 says to try again or message Aditya on WhatsApp for
+  a reset. One quirk of Basic Auth: a browser caches one credential per
+  site, so a person running two shops needs a separate browser profile
+  for the second login.
 Both are off by default for the local demo; the server prints whether
 each is on at startup. `GET /webhook` (Meta's verification) and
 `/health` always stay open.
@@ -375,8 +388,9 @@ each is on at startup. `GET /webhook` (Meta's verification) and
   message + Meta approval)
 - Many shops on one install: webhook routing is done, each WhatsApp
   number id maps to its shop in profiles/registry.json and each shop
-  keeps its own stores under data/shops/<shop id>/; the dashboard
-  still shows the default shop only, a picker waits for per shop auth
+  keeps its own stores under data/shops/<shop id>/; per shop dashboard
+  auth is done too, each shop has its own password and the master
+  password opens a shop picker
 - Admin onboarding: done, a prospect fills in /onboard and downloads
   her profile
 
