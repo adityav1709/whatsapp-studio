@@ -69,7 +69,11 @@ from .llm import (
 )
 from .missed import MissedStore, REFUSAL_ERRORS, plain_reason
 from .notify import TelegramNotifier, notifier_from_env
-from .security import check_basic_auth, verify_webhook_signature
+from .security import (
+    check_basic_auth,
+    resolve_dashboard_scope,
+    verify_webhook_signature,
+)
 from .send import MAX_TEXT_CHARS, sender_from_env
 
 
@@ -1260,7 +1264,7 @@ class Studio:
         thread.extend(customers[i:])
         return thread
 
-    def dashboard_html(self, tab="today", now=None, mock=False):
+    def dashboard_html(self, tab="today", now=None, mock=False, shop_id=None):
         """The owner's page, in tabs. Server side, no JavaScript: a tab
         is a link to the same page with ?tab=, and the server renders
         only that tab's section. The header (shop name, the day, the
@@ -1278,6 +1282,13 @@ class Studio:
         with sample data; the page says so, and nothing about it
         reads as a real customer.
 
+        shop_id is set only when the master password picked a shop:
+        the shop then rides in every link and form on the page, so
+        the next request stays in that shop instead of landing back
+        on the picker. A shop login never sets it — its credential
+        already picks the shop — so its page is byte identical to
+        today.
+
         The look follows the Ellipsus standard: paper and ink, charcoal
         and warm off white fields, one gold accent, Fraunces serif
         headlines at weight 400 with Inter for body and UI, pill
@@ -1290,6 +1301,16 @@ class Studio:
         tests assert on are kept verbatim. No dash of any kind in the
         copy here."""
         from .bookings import format_date, format_time
+
+        # In master mode the picked shop rides in the URL. Links that
+        # already carry a query take it as &shop=, bare form actions
+        # take it as ?shop=. Both stay empty otherwise, so a shop
+        # login renders exactly the page it rendered before.
+        scope_qs = ""
+        scope_query = ""
+        if shop_id:
+            scope_qs = "&shop=" + quote(shop_id, safe="")
+            scope_query = "?shop=" + quote(shop_id, safe="")
 
         tabs = ("today", "bookings", "customers", "replies", "conversation", "setup")
         if tab not in tabs:
@@ -1469,7 +1490,7 @@ class Studio:
             bot_block = (
                 "<p><span class='pill on'>Sending: LIVE</span> "
                 "Bot is ON. Replies are being sent on WhatsApp.</p>"
-                "<form method='post' action='/sending/disable'>"
+                "<form method='post' action='/sending/disable" + scope_query + "'>"
                 "<button type='submit' class='primary'>Stop sending</button></form>"
             )
             bot_class = "bot"
@@ -1497,7 +1518,7 @@ class Studio:
             bot_block = (
                 "<p><span class='pill off'>Sending: PAUSED</span> "
                 "The bot is stopped. It will not reply to anyone.</p>"
-                "<form method='post' action='/sending/enable'>"
+                "<form method='post' action='/sending/enable" + scope_query + "'>"
                 "<button type='submit' class='primary'>Resume sending</button></form>"
             )
             bot_class = "bot loud"
@@ -1529,7 +1550,7 @@ class Studio:
                 "<section class='bot'><p><span class='pill on'>Negotiation: ON</span> "
                 "Let the bot negotiate prices. It may come down to the "
                 "lowest price you set for a service, never below it.</p>"
-                "<form method='post' action='/negotiation/disable'>"
+                "<form method='post' action='/negotiation/disable" + scope_query + "'>"
                 "<button type='submit' class='primary'>Turn negotiation off</button></form></section>"
             )
         else:
@@ -1537,7 +1558,7 @@ class Studio:
                 "<section class='bot'><p><span class='pill off'>Negotiation: OFF</span> "
                 "Let the bot negotiate prices. It is off, so the bot "
                 "quotes fixed prices only and never haggles.</p>"
-                "<form method='post' action='/negotiation/enable'>"
+                "<form method='post' action='/negotiation/enable" + scope_query + "'>"
                 "<button type='submit' class='primary'>Turn negotiation on</button></form></section>"
             )
 
@@ -1641,7 +1662,7 @@ class Studio:
                 digits, html.escape(display)
             )
             card += (
-                "<form method='post' action='/handoffs/resolve'>"
+                "<form method='post' action='/handoffs/resolve" + scope_query + "'>"
                 "<input type='hidden' name='handoff_id' value='{}'>"
                 "<button type='submit' class='resolve'>Resolve</button></form>"
             ).format(handoff["id"])
@@ -1716,7 +1737,7 @@ class Studio:
                 digits, html.escape(display)
             )
             card += (
-                "<form method='post' action='/missed/resolve'>"
+                "<form method='post' action='/missed/resolve" + scope_query + "'>"
                 "<input type='hidden' name='missed_id' value='{}'>"
                 "<select name='how'>"
                 "<option value='called'>Called them</option>"
@@ -1769,7 +1790,7 @@ class Studio:
             box = (
                 "<div class='replybox'>"
                 "<p class='quiet'>Only if you want to step in. The bot is already talking to them.</p>"
-                "<form method='post' action='/handoffs/{}/reply'>"
+                "<form method='post' action='/handoffs/{}/reply" + scope_query + "'>"
                 "<input type='text' name='text' placeholder='Reply to {}…'{} required>"
                 "<button type='submit' class='soft'>{}</button></form>"
             ).format(
@@ -1790,7 +1811,7 @@ class Studio:
                 )
             else:
                 box += (
-                    "<form method='post' action='/handoffs/{}/draft'>"
+                    "<form method='post' action='/handoffs/{}/draft" + scope_query + "'>"
                     "<button type='submit' class='ghost'>Draft a reply</button></form>"
                 ).format(handoff["id"])
             if not self.live:
@@ -1863,8 +1884,18 @@ class Studio:
                 )
                 reject_html = ""
                 if reject:
+                    # A GET form drops the action URL's query, so the
+                    # master scope rides as a hidden field instead.
+                    shop_field = (
+                        "<input type='hidden' name='shop' value='{}'>".format(
+                            html.escape(shop_id, quote=True)
+                        )
+                        if shop_id
+                        else ""
+                    )
                     reject_html = (
                         " <form method='get' action='/bookings/reject'>"
+                        + shop_field +
                         "<input type='hidden' name='phone' value='{}'>"
                         "<input type='hidden' name='date' value='{}'>"
                         "<input type='hidden' name='start_min' value='{}'>"
@@ -2156,9 +2187,10 @@ class Studio:
             ("setup", "Setup"),
         ]
         mock_qs = "&mock=1" if mock else ""
+        extra_qs = mock_qs + scope_qs
         nav = "<nav class='tabs'>" + "".join(
             "<a href='/?tab={}{}'{}>{}</a>".format(
-                name, mock_qs, " class='active' aria-current='page'" if name == tab else "", label
+                name, extra_qs, " class='active' aria-current='page'" if name == tab else "", label
             )
             for name, label in tab_labels
         ) + "</nav>"
@@ -2234,7 +2266,7 @@ class Studio:
                 setup_html = (
                     "<section class='setup'><h2>{}</h2>"
                     "<ul class='list'>{}</ul>"
-                    "<p><a href='/?tab=setup'>Open Setup</a> to fill in prices, times and hours.</p></section>"
+                    "<p><a href='/?tab=setup" + scope_qs + "'>Open Setup</a> to fill in prices, times and hours.</p></section>"
                 ).format(heading, "".join(lines))
             body = hero + nums + alerts_section + missed_section + setup_html + self.saving_line() + self.self_test_line()
         elif tab == "bookings":
@@ -2260,12 +2292,12 @@ class Studio:
                 if reason:
                     line += " · {}".format(html.escape(reason))
                 block_items.append(
-                    "<li>{} "
-                    "<form method='post' action='/blocks/remove'>"
-                    "<input type='hidden' name='block_id' value='{}'>"
-                    "<button type='submit' class='inline'>Open this time again</button></form></li>".format(
-                        line, block["id"]
-                    )
+                    (
+                        "<li>{} "
+                        "<form method='post' action='/blocks/remove" + scope_query + "'>"
+                        "<input type='hidden' name='block_id' value='{}'>"
+                        "<button type='submit' class='inline'>Open this time again</button></form></li>"
+                    ).format(line, block["id"])
                 )
             blocks_body = "".join(block_items) or "<li>No blocked times.</li>"
             body = (
@@ -2282,7 +2314,7 @@ class Studio:
                 "<div class='card'><p class='quiet'>When you are out, the bot "
                 "says that time is not available and offers the nearest "
                 "free times instead.</p>"
-                "<form method='post' action='/blocks/add'>"
+                "<form method='post' action='/blocks/add" + scope_query + "'>"
                 "<label>Day</label>"
                 "<input type='date' name='day' value='{}' required>"
                 "<label>From</label>"
@@ -2393,7 +2425,7 @@ class Studio:
                 body = notice_html + (
                     "<h2>Setup</h2>"
                     "{}"
-                    "<form method='post' action='/setup/save'>"
+                    "<form method='post' action='/setup/save" + scope_query + "'>"
                     "<h2>Prices and times</h2>"
                     "<ul class='list'>{}</ul>"
                     "<h2>Hours</h2>"
@@ -2424,7 +2456,7 @@ class Studio:
             "{}"
             "{}"
             "{}"
-            "<p class='foot'><a href='/export'>Export my data</a>. Download "
+            "<p class='foot'><a href='/export" + scope_query + "'>Export my data</a>. Download "
             "all leads, bookings and handoffs as one file.</p>"
             "<p class='foot'>New here? "
             "<a href='/onboard'>Set up your shop</a> and your WhatsApp starts answering customers.</p>"
@@ -2843,30 +2875,39 @@ def _onboard_confirmation_html(profile, fields):
     )
 
 
-def _reject_confirmation_html(booking):
+def _reject_confirmation_html(booking, shop_id=None):
     """The owner checks before a booking is rejected: who, what and
     when, plus two choices that stand alone. The slot stays open and
-    the customer hears nothing unless the owner ticks the box."""
+    the customer hears nothing unless the owner ticks the box. In
+    master mode the picked shop rides in the form action and the
+    keep link, the same as on the dashboard."""
     when = format_date(date.fromisoformat(booking["date"]))
     who = booking.get("name") or booking["phone"]
+    scope_qs = ""
+    scope_query = ""
+    if shop_id:
+        scope_qs = "&shop=" + quote(shop_id, safe="")
+        scope_query = "?shop=" + quote(shop_id, safe="")
     return _onboard_page(
         "Reject this booking",
-        "<header><h1>Reject this booking?</h1>"
-        "<p class='intro'>{} for {} on {} at {}. The booking is "
-        "removed and the time opens up again for other customers.</p></header>"
-        "<div class='card'><form method='post' action='/bookings/reject'>"
-        "<input type='hidden' name='phone' value='{}'>"
-        "<input type='hidden' name='date' value='{}'>"
-        "<input type='hidden' name='start_min' value='{}'>"
-        "<label class='inline'><input type='checkbox' name='block_slot' value='1'> "
-        "Block this time on the calendar</label>"
-        "<p class='quiet'>Tick this to keep the time closed, so nobody else can book it.</p>"
-        "<label class='inline'><input type='checkbox' name='inform' value='1'> "
-        "Tell the customer on WhatsApp</label>"
-        "<p class='quiet'>Sends a short message that the booking could not be kept. "
-        "When sending is off the message is recorded, not sent.</p>"
-        "<button type='submit' class='primary'>Reject this booking</button></form></div>"
-        "<p class='foot'><a href='/?tab=bookings'>Keep the booking</a></p>".format(
+        (
+            "<header><h1>Reject this booking?</h1>"
+            "<p class='intro'>{} for {} on {} at {}. The booking is "
+            "removed and the time opens up again for other customers.</p></header>"
+            "<div class='card'><form method='post' action='/bookings/reject" + scope_query + "'>"
+            "<input type='hidden' name='phone' value='{}'>"
+            "<input type='hidden' name='date' value='{}'>"
+            "<input type='hidden' name='start_min' value='{}'>"
+            "<label class='inline'><input type='checkbox' name='block_slot' value='1'> "
+            "Block this time on the calendar</label>"
+            "<p class='quiet'>Tick this to keep the time closed, so nobody else can book it.</p>"
+            "<label class='inline'><input type='checkbox' name='inform' value='1'> "
+            "Tell the customer on WhatsApp</label>"
+            "<p class='quiet'>Sends a short message that the booking could not be kept. "
+            "When sending is off the message is recorded, not sent.</p>"
+            "<button type='submit' class='primary'>Reject this booking</button></form></div>"
+            "<p class='foot'><a href='/?tab=bookings" + scope_qs + "'>Keep the booking</a></p>"
+        ).format(
             html.escape(booking["service"]),
             html.escape(who),
             html.escape(when),
@@ -2878,9 +2919,30 @@ def _reject_confirmation_html(booking):
     )
 
 
-def make_handler(studio, router=None):
+def _shop_picker_html(shops):
+    """The master login's shop list: each shop name links to its
+    dashboard. Only the master ever sees this page, so listing shop
+    names here leaks nothing the master does not already know."""
+    items = "".join(
+        "<li><a href='/?shop={}'>{}</a></li>".format(
+            quote(shop_id, safe=""), html.escape(name)
+        )
+        for shop_id, name in shops
+    )
+    return _onboard_page(
+        "Pick a shop",
+        "<header><h1>Pick a shop</h1>"
+        "<p class='intro'>You are signed in as the operator. "
+        "Choose a shop to open its dashboard.</p></header>"
+        "<ul class='list'>{}</ul>".format(items),
+    )
+
+
+def make_handler(studio, router=None, dashboard_passwords=None):
     """The HTTP handler. With a router, the webhook routes each change
-    to its shop; everything else keeps showing the default shop."""
+    to its shop, and the dashboard resolves each login to its shop;
+    everything else keeps showing the default shop. With no router
+    the single shop behaves exactly as before."""
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # keep test/demo output clean
             pass
@@ -2902,7 +2964,13 @@ def make_handler(studio, router=None):
             self.wfile.write(data)
 
         def _unauthorized(self):
-            data = b"authentication required"
+            # Plain words, because the browser prompt cannot say them:
+            # no lockout, just try again, and the human path when the
+            # password is truly lost.
+            data = (
+                b"That password did not work. Try again, or message "
+                b"Aditya on WhatsApp and he will reset it."
+            )
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="WhatsApp Studio"')
             self.send_header("Content-Type", "text/plain")
@@ -2925,18 +2993,73 @@ def make_handler(studio, router=None):
                 return None
             return self.rfile.read(length) if length else b""
 
-        def _require_auth(self):
-            """True when this request may proceed. When a dashboard
-            password is set, every path except the webhook, /health
-            and /onboard needs Basic Auth — Meta calls the webhook
-            and cannot log in, health checks must stay open, and a
-            prospect filling in the form has no password yet."""
-            if not studio.dashboard_password:
-                return True
-            if check_basic_auth(studio.dashboard_password, self.headers.get("Authorization")):
-                return True
-            self._unauthorized()
-            return False
+        def _redirect(self, location):
+            """303 back to the dashboard, keeping the master shop in
+            the URL so the next request stays in the same shop. A
+            shop login has no shop in the URL, so its redirects are
+            exactly as before."""
+            shop = getattr(self, "_master_shop", None)
+            if shop:
+                sep = "&" if "?" in location else "?"
+                location = location + sep + "shop=" + quote(shop, safe="")
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _picker_shops(self):
+            """(shop id, shop name) for every shop, default shop first,
+            for the master picker page."""
+            return [
+                (shop_id, router.studio_for_shop(shop_id).profile.name)
+                for shop_id in router.shop_ids
+            ]
+
+        def _scoped_studio(self):
+            """The Studio this request may see, the picker, or nothing.
+
+            With no router the single shop behaves exactly as before:
+            no password means open, the dashboard password means in.
+            With a router the credential picks the shop: a shop
+            password opens exactly its shop, the master password
+            opens the picker, or the shop named by ?shop=. A shop
+            password with ?shop= opens nothing. The webhook and
+            /health do not call this: they are public and use the
+            default shop, and say so where they do.
+            Returns a Studio, the string "picker", or None, after
+            sending a 401 when the credential opens nothing.
+            """
+            qs = parse_qs(urlparse(self.path).query)
+            shop = (qs.get("shop") or [""])[0] or None
+            if router is None:
+                if not studio.dashboard_password:
+                    return studio
+                if check_basic_auth(
+                    studio.dashboard_password, self.headers.get("Authorization")
+                ):
+                    return studio
+                self._unauthorized()
+                return None
+            scope = resolve_dashboard_scope(
+                router.shop_ids,
+                dashboard_passwords or {},
+                studio.dashboard_password,
+                self.headers.get("Authorization"),
+                shop,
+            )
+            if scope is None:
+                self._unauthorized()
+                return None
+            kind, picked = scope
+            if kind == "master" and picked is None:
+                self._master_shop = None
+                return "picker"
+            self._master_shop = picked if kind == "master" else None
+            scoped = router.studio_for_shop(picked)
+            if scoped is None:
+                self._unauthorized()
+                return None
+            return scoped
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -2945,15 +3068,15 @@ def make_handler(studio, router=None):
                 # whether saving works: a 503 when the database is down
                 # tells Render and Meta that the shop cannot take
                 # bookings right now, instead of quietly losing them.
+                # Generic on purpose: the check is public and the
+                # install may hold several shops, so no shop name and
+                # no per shop live state here.
                 ok = studio.db_status()
                 backend = getattr(studio.leads, "backend", "json")
                 self._send_json(
                     200 if ok else 503,
                     {
                         "status": "ok" if ok else "degraded",
-                        "business": studio.profile.name,
-                        "live": studio.live,
-                        "sending": studio.sending_state(),
                         "db": backend,
                         "db_ok": ok,
                     },
@@ -2972,12 +3095,20 @@ def make_handler(studio, router=None):
                 # The form writes nothing to the server, so there is
                 # nothing privileged behind it.
                 self._send_text(200, _onboard_form_html({}, {}), "text/html")
-            elif not self._require_auth():
+            elif (scoped := self._scoped_studio()) is None:
+                return
+            elif scoped == "picker":
+                if parsed.path == "/":
+                    self._send_text(
+                        200, _shop_picker_html(self._picker_shops()), "text/html"
+                    )
+                else:
+                    self._send_json(400, {"error": "pick a shop first"})
                 return
             elif parsed.path == "/leads":
-                self._send_json(200, {"leads": studio.leads.all_leads()})
+                self._send_json(200, {"leads": scoped.leads.all_leads()})
             elif parsed.path == "/bookings":
-                self._send_json(200, {"bookings": studio.bookings.all_bookings()})
+                self._send_json(200, {"bookings": scoped.bookings.all_bookings()})
             elif parsed.path == "/bookings/reject":
                 # The confirmation page before a reject: who, what and
                 # when, plus the two choices. Nothing is removed here.
@@ -2994,7 +3125,7 @@ def make_handler(studio, router=None):
                 if day is not None and start_min is not None:
                     booking = next(
                         (
-                            b for b in studio.bookings.bookings_on(day)
+                            b for b in scoped.bookings.bookings_on(day)
                             if b["phone"] == phone and b["start_min"] == start_min
                         ),
                         None,
@@ -3003,23 +3134,27 @@ def make_handler(studio, router=None):
                     self._send_json(404, {"error": "booking not found"})
                 else:
                     self._send_text(
-                        200, _reject_confirmation_html(booking), "text/html"
+                        200,
+                        _reject_confirmation_html(
+                            booking, getattr(self, "_master_shop", None)
+                        ),
+                        "text/html",
                     )
             elif parsed.path == "/handoffs":
-                self._send_json(200, {"handoffs": studio.handoffs.all_handoffs()})
+                self._send_json(200, {"handoffs": scoped.handoffs.all_handoffs()})
             elif parsed.path == "/regulars":
                 self._send_json(
                     200,
                     {
                         "regulars": [
                             {**r, "last_date": r["last_date"].isoformat()}
-                            for r in studio.bookings.regulars()
+                            for r in scoped.bookings.regulars()
                         ]
                     },
                 )
             elif parsed.path == "/missed":
                 self._send_json(
-                    200, {"missed": studio.missed.open_newest()}
+                    200, {"missed": scoped.missed.open_newest()}
                 )
             elif parsed.path == "/export":
                 # The owner's way out and the backup before a redeploy:
@@ -3031,20 +3166,20 @@ def make_handler(studio, router=None):
                     "exported_at": datetime.fromtimestamp(
                         time.time(), tz=IST
                     ).isoformat(),
-                    "profile": studio.profile.to_dict(),
-                    "leads": studio.leads.all_leads(),
-                    "bookings": studio.bookings.all_bookings(),
-                    "handoffs": studio.handoffs.all_handoffs(),
-                    "blocks": studio.blocks.all_blocks(),
-                    "missed": studio.missed.all_records(),
-                    "outbox": studio.outbox,
+                    "profile": scoped.profile.to_dict(),
+                    "leads": scoped.leads.all_leads(),
+                    "bookings": scoped.bookings.all_bookings(),
+                    "handoffs": scoped.handoffs.all_handoffs(),
+                    "blocks": scoped.blocks.all_blocks(),
+                    "missed": scoped.missed.all_records(),
+                    "outbox": scoped.outbox,
                     "counts": {
-                        "leads": len(studio.leads.all_leads()),
-                        "bookings": len(studio.bookings.all_bookings()),
-                        "handoffs": len(studio.handoffs.all_handoffs()),
-                        "blocks": len(studio.blocks.all_blocks()),
-                        "missed": len(studio.missed.all_records()),
-                        "outbox": len(studio.outbox),
+                        "leads": len(scoped.leads.all_leads()),
+                        "bookings": len(scoped.bookings.all_bookings()),
+                        "handoffs": len(scoped.handoffs.all_handoffs()),
+                        "blocks": len(scoped.blocks.all_blocks()),
+                        "missed": len(scoped.missed.all_records()),
+                        "outbox": len(scoped.outbox),
                     },
                 }
                 data = json.dumps(payload, indent=2).encode("utf-8")
@@ -3061,7 +3196,13 @@ def make_handler(studio, router=None):
                 qs = parse_qs(parsed.query)
                 tab = qs.get("tab", ["today"])[0]
                 mock = qs.get("mock", [""])[0] == "1"
-                self._send_text(200, studio.dashboard_html(tab, mock=mock), "text/html")
+                self._send_text(
+                    200,
+                    scoped.dashboard_html(
+                        tab, mock=mock, shop_id=getattr(self, "_master_shop", None)
+                    ),
+                    "text/html",
+                )
             else:
                 self._send_json(404, {"error": "not found"})
 
@@ -3143,35 +3284,27 @@ def make_handler(studio, router=None):
                 self.end_headers()
                 self.wfile.write(data)
                 return
-            if not self._require_auth():
+            scoped = self._scoped_studio()
+            if scoped is None:
+                return
+            if scoped == "picker":
+                self._send_json(400, {"error": "pick a shop first"})
                 return
             if parsed.path == "/sending/disable":
-                studio.disable_sending()
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped.disable_sending()
+                self._redirect("/")
                 return
             if parsed.path == "/sending/enable":
-                studio.enable_sending()
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped.enable_sending()
+                self._redirect("/")
                 return
             if parsed.path == "/negotiation/enable":
-                studio.enable_negotiation()
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped.enable_negotiation()
+                self._redirect("/")
                 return
             if parsed.path == "/negotiation/disable":
-                studio.disable_negotiation()
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped.disable_negotiation()
+                self._redirect("/")
                 return
             if parsed.path == "/setup/save":
                 # The owner saves prices, durations and hours. Blank
@@ -3183,11 +3316,8 @@ def make_handler(studio, router=None):
                 fields = parse_qs(
                     raw.decode("utf-8", errors="replace"), keep_blank_values=True
                 )
-                studio._notice = studio.apply_setup(fields)
-                self.send_response(303)
-                self.send_header("Location", "/?tab=setup")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped._notice = scoped.apply_setup(fields)
+                self._redirect("/?tab=setup")
                 return
             if parsed.path == "/blocks/add":
                 # One day at a time, no recurring blocks. A block over
@@ -3218,10 +3348,10 @@ def make_handler(studio, router=None):
                     notice = "You cannot block a day that has already gone."
                 elif day == today and end <= now_min:
                     notice = "That time has already gone."
-                elif is_closed(studio.profile.hours_today(day.weekday())):
+                elif is_closed(scoped.profile.hours_today(day.weekday())):
                     notice = "The shop is closed that day."
                 else:
-                    conflicts = studio.block_conflicts(day, start, end)
+                    conflicts = scoped.block_conflicts(day, start, end)
                     if conflicts:
                         first = conflicts[0]
                         notice = (
@@ -3233,7 +3363,7 @@ def make_handler(studio, router=None):
                             format_time(first["start_min"]),
                         )
                     else:
-                        studio.blocks.add(day, start, end, reason)
+                        scoped.blocks.add(day, start, end, reason)
                         when = "today" if day == today else format_date(day)
                         notice = "Blocked {} {} to {}".format(
                             when, format_time(start), format_time(end)
@@ -3241,11 +3371,8 @@ def make_handler(studio, router=None):
                         if reason:
                             notice += " for {}".format(reason)
                         notice += "."
-                studio._notice = notice
-                self.send_response(303)
-                self.send_header("Location", "/?tab=bookings")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped._notice = notice
+                self._redirect("/?tab=bookings")
                 return
             if parsed.path == "/blocks/remove":
                 length = int(self.headers.get("Content-Length") or 0)
@@ -3256,16 +3383,13 @@ def make_handler(studio, router=None):
                 except ValueError:
                     block_id = None
                 removed = (
-                    studio.blocks.remove(block_id) if block_id is not None else None
+                    scoped.blocks.remove(block_id) if block_id is not None else None
                 )
                 if removed is None:
                     self._send_json(404, {"error": "block not found"})
                     return
-                studio._notice = "Opened that time again."
-                self.send_response(303)
-                self.send_header("Location", "/?tab=bookings")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped._notice = "Opened that time again."
+                self._redirect("/?tab=bookings")
                 return
             if parsed.path == "/bookings/reject":
                 # The owner confirmed on the reject page: remove the
@@ -3287,7 +3411,7 @@ def make_handler(studio, router=None):
                 if day is None or start_min is None:
                     self._send_json(404, {"error": "booking not found"})
                     return
-                result = studio.reject_booking(
+                result = scoped.reject_booking(
                     phone,
                     day,
                     start_min,
@@ -3311,18 +3435,15 @@ def make_handler(studio, router=None):
                 if result["blocked"]:
                     notice += " Blocked that time on the calendar."
                 if result["informed"]:
-                    if studio.live:
+                    if scoped.live:
                         notice += " {} has been told on WhatsApp.".format(who)
                     else:
                         notice += (
                             " The message was recorded, not sent, "
                             "because sending is off."
                         )
-                studio._notice = notice
-                self.send_response(303)
-                self.send_header("Location", "/?tab=bookings")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped._notice = notice
+                self._redirect("/?tab=bookings")
                 return
             if parsed.path == "/missed/resolve":
                 length = int(self.headers.get("Content-Length") or 0)
@@ -3335,14 +3456,11 @@ def make_handler(studio, router=None):
                 how = (fields.get("how") or [""])[0]
                 if (
                     missed_id is None
-                    or studio.missed.resolve(missed_id, how) is None
+                    or scoped.missed.resolve(missed_id, how) is None
                 ):
                     self._send_json(404, {"error": "missed record not found"})
                     return
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                self._redirect("/")
                 return
             if parsed.path == "/handoffs/resolve":
                 length = int(self.headers.get("Content-Length") or 0)
@@ -3352,15 +3470,12 @@ def make_handler(studio, router=None):
                     handoff_id = int((fields.get("handoff_id") or [""])[0])
                 except ValueError:
                     handoff_id = None
-                if handoff_id is None or studio.handoffs.resolve(handoff_id) is None:
+                if handoff_id is None or scoped.handoffs.resolve(handoff_id) is None:
                     self._send_json(404, {"error": "handoff not found"})
                     return
-                studio._drafts.pop(handoff_id, None)
-                studio._draft_failed.discard(handoff_id)
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped._drafts.pop(handoff_id, None)
+                scoped._draft_failed.discard(handoff_id)
+                self._redirect("/")
                 return
             if parsed.path.startswith("/handoffs/") and parsed.path.endswith("/draft"):
                 # The owner asked the brain for a draft. It only prefills
@@ -3373,7 +3488,7 @@ def make_handler(studio, router=None):
                     return
                 handoff = next(
                     (
-                        h for h in studio.handoffs.all_handoffs()
+                        h for h in scoped.handoffs.all_handoffs()
                         if h["id"] == handoff_id and h["status"] == "open"
                     ),
                     None,
@@ -3381,18 +3496,15 @@ def make_handler(studio, router=None):
                 if handoff is None:
                     self._send_json(404, {"error": "handoff not found"})
                     return
-                draft = studio.draft_reply(handoff["phone"])
+                draft = scoped.draft_reply(handoff["phone"])
                 if draft is None:
-                    if studio.llm is not None:
-                        studio._draft_failed.add(handoff_id)
-                    studio._drafts.pop(handoff_id, None)
+                    if scoped.llm is not None:
+                        scoped._draft_failed.add(handoff_id)
+                    scoped._drafts.pop(handoff_id, None)
                 else:
-                    studio._drafts[handoff_id] = draft
-                    studio._draft_failed.discard(handoff_id)
-                self.send_response(303)
-                self.send_header("Location", "/?tab=replies")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                    scoped._drafts[handoff_id] = draft
+                    scoped._draft_failed.discard(handoff_id)
+                self._redirect("/?tab=replies")
                 return
             if parsed.path.startswith("/handoffs/") and parsed.path.endswith("/reply"):
                 # The owner replies from the dashboard: the text goes to
@@ -3407,7 +3519,7 @@ def make_handler(studio, router=None):
                     return
                 handoff = next(
                     (
-                        h for h in studio.handoffs.all_handoffs()
+                        h for h in scoped.handoffs.all_handoffs()
                         if h["id"] == handoff_id and h["status"] == "open"
                     ),
                     None,
@@ -3429,24 +3541,24 @@ def make_handler(studio, router=None):
                     "handoff": handoff_id,
                     "ts": int(time.time()),
                 }
-                studio.outbox.append(entry)
-                studio._dispatch(entry)
-                studio._save_outbox()
-                studio.handoffs.resolve(handoff_id)
+                scoped.outbox.append(entry)
+                scoped._dispatch(entry)
+                scoped._save_outbox()
+                scoped.handoffs.resolve(handoff_id)
                 # The owner answered, so the question the bot could
                 # not answer is answered too.
-                studio.missed.resolve_for_handoff(handoff_id, "answered")
-                studio._drafts.pop(handoff_id, None)
-                studio._draft_failed.discard(handoff_id)
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                scoped.missed.resolve_for_handoff(handoff_id, "answered")
+                scoped._drafts.pop(handoff_id, None)
+                scoped._draft_failed.discard(handoff_id)
+                self._redirect("/")
                 return
             self._send_json(404, {"error": "not found"})
 
     return Handler
 
 
-def make_server(studio, host="127.0.0.1", port=0, router=None):
-    return ThreadingHTTPServer((host, port), make_handler(studio, router=router))
+def make_server(studio, host="127.0.0.1", port=0, router=None, dashboard_passwords=None):
+    return ThreadingHTTPServer(
+        (host, port),
+        make_handler(studio, router=router, dashboard_passwords=dashboard_passwords),
+    )

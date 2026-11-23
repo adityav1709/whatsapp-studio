@@ -256,6 +256,16 @@ class ShopRouter:
             return self.default_studio
         return self._studios.get(number_id)
 
+    def studio_for_shop(self, shop_id):
+        """The Studio for a shop id, or None when no shop has it. The
+        dashboard gate resolves a login to a shop id, then asks here,
+        so a request never touches a shop through a number id it was
+        not given."""
+        for number_id, entry in self.registry.items():
+            if entry["shop"] == shop_id:
+                return self._studios[number_id]
+        return None
+
     def handle_webhook_payload(self, payload):
         """Route each change to its shop and let that shop answer it.
 

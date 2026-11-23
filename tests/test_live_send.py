@@ -390,15 +390,20 @@ class TestLiveSendHttp(unittest.TestCase):
         with urllib.request.urlopen(req) as resp:
             return resp.status
 
-    def test_health_reports_live_flag_without_token(self):
+    def test_health_stays_generic_when_live(self):
+        # /health is public and the install may hold several shops,
+        # so it carries no shop name and no per shop live state.
         status, body = self._get("/health")
         self.assertEqual(status, 200)
         data = json.loads(body)
-        self.assertTrue(data["live"])
-        self.assertEqual(data["sending"], "live")
+        self.assertEqual(data["status"], "ok")
+        self.assertTrue(data["db_ok"])
+        self.assertNotIn("business", data)
+        self.assertNotIn("live", data)
+        self.assertNotIn("sending", data)
         self.assertNotIn("tok", body)
 
-    def test_health_reports_demo_when_no_sender(self):
+    def test_health_stays_generic_when_demo(self):
         demo = make_studio(self.tmp.name, sender=None, dry_run=False)
         httpd = make_server(demo, port=0)
         port = httpd.server_address[1]
@@ -407,8 +412,10 @@ class TestLiveSendHttp(unittest.TestCase):
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as resp:
                 data = json.loads(resp.read())
-            self.assertFalse(data["live"])
-            self.assertEqual(data["sending"], "demo")
+            self.assertEqual(data["status"], "ok")
+            self.assertNotIn("business", data)
+            self.assertNotIn("live", data)
+            self.assertNotIn("sending", data)
         finally:
             httpd.shutdown()
             httpd.server_close()
