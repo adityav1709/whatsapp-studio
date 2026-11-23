@@ -163,6 +163,10 @@ class Studio:
         # the dashboard and the bot stops haggling at once. In memory
         # like the sending kill switch, so a restart turns it back on.
         self.negotiation_on = True
+        # Onboarding pings already sent, phone number to IST date: one
+        # ping per number per day, in memory only. The form stores
+        # nothing, so a restart forgets who was pinged.
+        self._onboard_pinged = {}
         # One shot notice for the dashboard, set by a form handler and
         # shown once on the next page render, then cleared.
         self._notice = None
@@ -399,6 +403,23 @@ class Studio:
                 "sits" if closed_count == 1 else "sit",
             )
         return notice
+
+    def onboard_ping_due(self, phone, today=None):
+        """One ping per phone number per day for onboarding submissions.
+        A refresh re-submits the form and "Change something" then
+        resubmit is the same shop twice; neither should buzz Aditya
+        again. Returns (due, seen_before): a repeat on a later day
+        still pings, marked as seen before. The dict is capped so a
+        long lived process cannot grow it without limit."""
+        day = (today or india_today()).isoformat()
+        last = self._onboard_pinged.get(phone)
+        if last == day:
+            return False, False
+        seen_before = last is not None
+        if len(self._onboard_pinged) >= 500:
+            self._onboard_pinged.pop(next(iter(self._onboard_pinged)))
+        self._onboard_pinged[phone] = day
+        return True, seen_before
 
     def self_test_line(self):
         """One quiet line inviting the owner to test the bot himself:
@@ -2774,8 +2795,10 @@ def _onboard_form_html(fields, errors):
         "<div class='field'><label>Your WhatsApp number "
         "<input type='tel' name='phone' inputmode='tel' value='{}'></label>{}"
         "<p class='quiet'>The number your customers already message. "
-        "Only Aditya sees it, and nothing goes live until you send him "
-        "your shop file.</p>"
+        "Only Aditya sees it. When you press 'See my receptionist', "
+        "we will let him know you set up your shop, so he can message "
+        "you on WhatsApp to switch it on. No calls, no spam, nothing "
+        "goes live until you say so.</p>"
         "<label>Type it again "
         "<input type='tel' name='phone_confirm' inputmode='tel' value='{}'></label>{}"
         "<p class='quiet'>A wrong number means your receptionist answers from nowhere.</p>"
@@ -2846,8 +2869,9 @@ def _onboard_confirmation_html(profile, fields):
         "<div class='thread'><div class='msg in'><p>{}</p></div>"
         "<div class='msg out'><p>{}</p></div></div>"
         "<h2>What happens next</h2>"
-        "<div class='card'><p>Send this file to Aditya on WhatsApp and "
-        "he will switch your receptionist on. Until then nothing "
+        "<div class='card'><p>Aditya knows you set up your shop and will "
+        "message you on WhatsApp. When he does, send him this file. "
+        "He needs it to switch your receptionist on. Until then nothing "
         "changes for your customers. Your number works exactly as it "
         "does today.</p></div>"
         "<div class='field'><form method='post' action='/onboard/download'>{}"
@@ -2992,6 +3016,17 @@ def make_handler(studio, router=None, dashboard_passwords=None):
                 self._send_json(413, {"error": "body too large"})
                 return None
             return self.rfile.read(length) if length else b""
+
+        def _ping_onboard(self, profile, seen_before):
+            # Runs on a daemon thread: a slow Telegram must never
+            # delay the confirmation page, and a failed ping must
+            # never break it. The notifier already swallows its own
+            # failures; this guards against a future notifier whose
+            # method raises before it gets that far.
+            try:
+                studio.notifier.notify_onboard(profile, seen_before)
+            except Exception:
+                pass
 
         def _redirect(self, location):
             """303 back to the dashboard, keeping the master shop in
@@ -3252,6 +3287,17 @@ def make_handler(studio, router=None, dashboard_passwords=None):
                         200, _onboard_form_html(fields, errors), "text/html"
                     )
                     return
+                # A valid submit is the moment she is interested: ping
+                # Aditya, once per number per day, on a daemon thread
+                # so the confirmation page never waits on Telegram.
+                due, seen_before = studio.onboard_ping_due(profile["phone"])
+                if due:
+                    thread = threading.Thread(
+                        target=self._ping_onboard,
+                        args=(profile, seen_before),
+                        daemon=True,
+                    )
+                    thread.start()
                 self._send_text(
                     200, _onboard_confirmation_html(profile, fields), "text/html"
                 )
