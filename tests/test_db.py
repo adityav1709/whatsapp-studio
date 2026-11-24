@@ -257,9 +257,9 @@ class TestPgLeadStore(unittest.TestCase):
         # The wamid claim runs before the lead is even looked up, so
         # a racing redelivery loses the claim first.
         self.assertIn("seen_wamids", cursor.executed[0][0])
-        self.assertIn("ON CONFLICT (wamid)", cursor.executed[0][0])
+        self.assertIn("ON CONFLICT (shop_id, wamid)", cursor.executed[0][0])
         self.assertIn("FOR UPDATE", cursor.executed[1][0])
-        self.assertIn("ON CONFLICT (phone)", cursor.executed[2][0])
+        self.assertIn("ON CONFLICT (shop_id, phone)", cursor.executed[2][0])
 
     def test_duplicate_wamid_raises_and_records_nothing(self):
         cursor = FakeCursor()
@@ -621,8 +621,11 @@ class TestPgOutboxStore(unittest.TestCase):
         PgOutboxStore(FakePool(cursor)).save(entries)
         self.assertEqual(len(cursor.executed), 101)
         self.assertIn("DELETE FROM outbox", cursor.executed[0][0])
-        self.assertEqual(cursor.executed[1][1][1], "msg 1")
-        self.assertEqual(cursor.executed[-1][1][1], "msg 100")
+        # The delete is scoped to this shop, and every insert carries
+        # the shop id first, so the body sits one param later now.
+        self.assertIn("WHERE shop_id = %s", cursor.executed[0][0])
+        self.assertEqual(cursor.executed[1][1][2], "msg 1")
+        self.assertEqual(cursor.executed[-1][1][2], "msg 100")
 
     def test_save_empty_only_deletes(self):
         cursor = FakeCursor()
@@ -665,10 +668,17 @@ class TestBuildStores(unittest.TestCase):
         pool = FakePool()
         with mock.patch(
             "whatsapp_studio.db.connect_pool", return_value=pool
-        ) as connect, mock.patch("whatsapp_studio.db.ensure_schema") as schema:
+        ) as connect, mock.patch(
+            "whatsapp_studio.db.ensure_schema"
+        ) as schema, mock.patch(
+            "whatsapp_studio.db.migrate_schema"
+        ) as migrate:
             stores = build_stores("postgres://fake", "/tmp")
         connect.assert_called_once_with("postgres://fake")
         schema.assert_called_once_with(pool)
+        # The migration runs on every Postgres boot, stamping old
+        # rows with the single-shop id.
+        migrate.assert_called_once_with(pool, "default")
         self.assertEqual(stores.leads.backend, "postgres")
         self.assertEqual(stores.bookings.backend, "postgres")
         self.assertEqual(stores.outbox.backend, "postgres")

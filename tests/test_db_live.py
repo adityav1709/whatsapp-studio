@@ -139,6 +139,69 @@ class TestPostgresLive(unittest.TestCase):
         self.assertEqual(loaded[1]["send_status"], "sent")
         self.assertEqual(loaded[1]["wamid"], "wamid.out.1")
 
+    def test_two_shops_share_one_database_without_seeing_each_other(self):
+        """The check that lifts the multishop boot refusal: two store
+        sets, different shop ids, one schema. Same phone, same slot,
+        same wamid in both, and neither shop sees the other's rows.
+        Runs only where a real database exists; the FakePool tests
+        prove the SQL text, this proves the database agrees."""
+        other = build_stores(
+            URL, options=f"-c search_path={SCHEMA}", shop_id="glow"
+        )
+        try:
+            service = Service("Haircut", 499, 30)
+            # Same slot in both shops: capacity is per shop, so both
+            # bookings land.
+            first = self.stores.bookings.book(
+                PHONE, "Priya", service, DAY, 660
+            )
+            second = other.bookings.book(
+                PHONE, "Priya", service, DAY, 660
+            )
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            self.assertNotEqual(first["id"], second["id"])
+            self.assertEqual(len(self.stores.bookings.all_bookings()), 1)
+            self.assertEqual(len(other.bookings.all_bookings()), 1)
+            # A cancel in one shop leaves the other's booking alone.
+            self.assertEqual(
+                self.stores.bookings.cancel_latest(PHONE)["id"], first["id"]
+            )
+            self.assertEqual(len(other.bookings.all_bookings()), 1)
+            # Same phone, same wamid, two separate leads: one row per
+            # phone per shop, and dedup is per shop, not global.
+            self.stores.leads.record_message(
+                PHONE, "hi", "greeting", "Priya", wamid="wamid.two.1"
+            )
+            other.leads.record_message(
+                PHONE, "hi", "greeting", "Priya", wamid="wamid.two.1"
+            )
+            self.assertEqual(len(self.stores.leads.all_leads()), 1)
+            self.assertEqual(len(other.leads.all_leads()), 1)
+            self.assertEqual(
+                self.stores.leads.get(PHONE)["message_count"], 1
+            )
+            self.assertEqual(other.leads.get(PHONE)["message_count"], 1)
+            # A block in one shop does not close the other.
+            self.stores.blocks.add(DAY, 600, 660, "lunch")
+            self.assertTrue(self.stores.blocks.is_blocked(DAY, 630, 30))
+            self.assertFalse(other.blocks.is_blocked(DAY, 630, 30))
+            # One shop saving its outbox must not wipe the other's.
+            self.stores.outbox.save([
+                {"to": PHONE, "body": "Hi Priya", "intent": None, "ts": 1000},
+            ])
+            other.outbox.save([
+                {"to": PHONE, "body": "Hi from Glow", "intent": None, "ts": 1001},
+            ])
+            self.assertEqual(
+                [e["body"] for e in self.stores.outbox.load()], ["Hi Priya"]
+            )
+            self.assertEqual(
+                [e["body"] for e in other.outbox.load()], ["Hi from Glow"]
+            )
+        finally:
+            other.pool.close()
+
     def test_today_counts(self):
         # A booking today shows up in the dashboard's numbers.
         service = Service("Haircut", 499, 30)

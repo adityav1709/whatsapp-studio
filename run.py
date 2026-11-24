@@ -62,7 +62,11 @@ def main():
             "DEMO_MODE=1 refuses to run against a real database."
             " Unset DEMO_MODE or DATABASE_URL and restart."
         )
-    stores = build_stores(database_url, BASE / "data")
+    # No store set is built here: with a registry the router builds
+    # one per shop, and building one first would run the shop_id
+    # migration under the wrong id before the default shop is known.
+    # Without a registry the single shop is built below, under the
+    # default shop id.
     llm = client_from_env()
     # A registry file means a second shop: the router builds one Studio
     # per shop, default shop included, each reading its own stores
@@ -104,6 +108,7 @@ def main():
                     )
                 )
     else:
+        stores = build_stores(database_url, BASE / "data")
         studio = Studio(
             profile,
             stores.leads,

@@ -126,6 +126,13 @@ def _counts(*values):
     return [{"one": {"count": value}} for value in values]
 
 
+def _no_collisions():
+    """Scripted id-collision answers: no imported id exists yet.
+    The collision check runs right after the counts, one query per
+    table with preserved ids (handoffs, blocks, missed)."""
+    return [{"all": []}, {"all": []}, {"all": []}]
+
+
 def _spot_rows():
     """The rows the spot check reads back: the fixture records as
     Postgres would return them."""
@@ -210,14 +217,14 @@ class TestImportJson(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data = _write_fixtures(tmp)
             cursor = FakeCursor()
-            cursor.script(*_counts(0, 0, 0, 0, 0, 0, 0))
+            cursor.script(*_counts(0, 0, 0, 0, 0, 0, 0), *_no_collisions())
             pool = FakePool(cursor)
             result, output = self._run_main(pool, [
                 "--dry-run", "--data-dir", str(data),
                 "--database-url", "postgres://fake",
             ])
             self.assertEqual(result, 0)
-            self.assertIn("Would import:", output)
+            self.assertIn("Would import for shop default:", output)
             self.assertIn("leads: 1", output)
             self.assertIn("seen_wamids: 1", output)
             self.assertNotIn("INSERT", " ".join(
@@ -244,6 +251,7 @@ class TestImportJson(unittest.TestCase):
             )
             cursor.script(
                 *_counts(0, 0, 0, 0, 0, 0, 0),
+                *_no_collisions(),
                 *[{} for _ in range(import_statements)],
                 *_spot_rows(),
                 *_counts(1, 1, 1, 1, 1, 2, 1),
@@ -273,7 +281,7 @@ class TestImportJson(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data = _write_fixtures(tmp)
             cursor = FakeCursor()
-            cursor.script(*_counts(0, 0, 2, 0, 0, 0, 0))
+            cursor.script(*_counts(0, 0, 2, 0, 0, 0, 0), *_no_collisions())
             pool = FakePool(cursor)
             result, output = self._run_main(pool, [
                 "--confirm", "--data-dir", str(data),
@@ -290,6 +298,7 @@ class TestImportJson(unittest.TestCase):
             cursor = FakeCursor()
             cursor.script(
                 *_counts(1, 1, 1, 1, 1, 2, 1),
+                *_no_collisions(),
                 *_spot_rows(),
             )
             pool = FakePool(cursor)
@@ -306,6 +315,7 @@ class TestImportJson(unittest.TestCase):
             cursor = FakeCursor()
             cursor.script(
                 *_counts(5, 1, 1, 1, 1, 2, 1),
+                *_no_collisions(),
                 *_spot_rows(),
             )
             pool = FakePool(cursor)
@@ -321,7 +331,7 @@ class TestImportJson(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data = _write_fixtures(tmp)
             cursor = FakeCursor()
-            cursor.script(*_counts(0, 0, 0, 0, 0, 0, 0))
+            cursor.script(*_counts(0, 0, 0, 0, 0, 0, 0), *_no_collisions())
             pool = FakePool(cursor)
             result, output = self._run_main(pool, [
                 "--verify", "--data-dir", str(data),
@@ -329,6 +339,50 @@ class TestImportJson(unittest.TestCase):
             ])
             self.assertEqual(result, 1)
             self.assertIn("Nothing to verify", output)
+
+    def test_refuses_when_an_imported_id_already_exists(self):
+        # The fixture handoff carries id 1. Another shop already
+        # has a handoff with id 1, so the import must refuse rather
+        # than overwrite it: ids are global across shops.
+        with tempfile.TemporaryDirectory() as tmp:
+            data = _write_fixtures(tmp)
+            cursor = FakeCursor()
+            cursor.script(
+                *_counts(0, 0, 0, 0, 0, 0, 0),
+                {"all": [{"id": 1}]},
+                {"all": []},
+                {"all": []},
+            )
+            pool = FakePool(cursor)
+            result, output = self._run_main(pool, [
+                "--confirm", "--data-dir", str(data),
+                "--database-url", "postgres://fake",
+            ])
+            self.assertEqual(result, 1)
+            self.assertIn("Refusing", output)
+            self.assertIn("already exist", output)
+            self.assertNotIn("INSERT", " ".join(
+                sql for sql, _ in cursor.executed))
+
+    def test_shop_id_flag_scopes_the_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = _write_fixtures(tmp)
+            cursor = FakeCursor()
+            cursor.script(*_counts(0, 0, 0, 0, 0, 0, 0), *_no_collisions())
+            pool = FakePool(cursor)
+            result, output = self._run_main(pool, [
+                "--dry-run", "--data-dir", str(data),
+                "--database-url", "postgres://fake",
+                "--shop-id", "snips",
+            ])
+            self.assertEqual(result, 0)
+            self.assertIn("Would import for shop snips:", output)
+            count_params = [
+                params for sql, params in cursor.executed
+                if sql.startswith("SELECT COUNT(*)")
+            ]
+            self.assertEqual(len(count_params), 7)
+            self.assertTrue(all(p == ("snips",) for p in count_params))
 
 
 if __name__ == "__main__":

@@ -7,9 +7,13 @@ Usage:
 
 Rules, all deliberate. Demo phones (9198100000*) are never imported:
 they are sample customers, not real ones. The import runs in one
-transaction and refuses unless every table is empty, so a second run
-cannot double the data and a failed run leaves nothing behind.
---dry-run prints what would be imported and writes nothing.
+transaction and refuses unless every table is empty for this shop, so
+a second run cannot double the data and a failed run leaves nothing
+behind. --shop-id names the shop the rows belong to (default
+"default", the single-shop id); a second shop imports its own JSON
+files under its own id, and the import refuses when an imported id
+already exists in a table for any shop, since ids are global across
+shops. --dry-run prints what would be imported and writes nothing.
 --confirm is required to write. --verify only checks: it compares
 the counts and a sample of records, Postgres against the JSON
 files, and writes nothing.
@@ -34,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from whatsapp_studio.blocks import BlockStore
 from whatsapp_studio.bookings import BookingStore
 from whatsapp_studio.db import (
+    DEFAULT_SHOP_ID,
     TABLES,
     JsonOutboxStore,
     connect_pool,
@@ -83,12 +88,40 @@ def filter_demo(data):
     return out, dropped
 
 
-def table_counts(cur):
+def table_counts(cur, shop_id):
     counts = {}
     for table in TABLES:
-        cur.execute(f"SELECT COUNT(*) FROM {table}")
+        cur.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE shop_id = %s",
+            (shop_id,),
+        )
         counts[table] = cur.fetchone()["count"]
     return counts
+
+
+def id_collisions(cur, data):
+    """Ids the JSON files would reuse that already exist in a table,
+    for any shop. Ids are global across shops, so a second shop's
+    export starting at 1 would collide with the first shop's rows;
+    the old global empty-table guard accidentally prevented this,
+    the per-shop guard does not. Returns {table: [id, ...]}."""
+    collisions = {}
+    for key, table in (
+        ("handoffs", "handoffs"),
+        ("blocks", "blocks"),
+        ("missed", "missed"),
+    ):
+        ids = [record["id"] for record in data[key]]
+        if not ids:
+            continue
+        cur.execute(
+            f"SELECT id FROM {table} WHERE id = ANY(%s)",
+            (ids,),
+        )
+        found = sorted(row["id"] for row in cur.fetchall())
+        if found:
+            collisions[table] = found
+    return collisions
 
 
 def _outbox_expected(entry):
@@ -112,17 +145,21 @@ def _outbox_expected(entry):
     return expected
 
 
-def import_all(cur, data):
+def import_all(cur, data, shop_id):
     """Every insert, in one transaction. The caller owns the
-    transaction: on any error nothing lands."""
+    transaction: on any error nothing lands. Every row is stamped
+    with shop_id: the import is how a shop's JSON files land in the
+    shared tables, so a row without it would be invisible to the
+    shop that made it."""
     for lead in data["leads"]:
         # Leads are keyed by phone, not by id: there is no id to
         # preserve and no sequence to move.
         cur.execute(
-            "INSERT INTO leads (phone, name, first_seen, last_seen,"
+            "INSERT INTO leads (shop_id, phone, name, first_seen, last_seen,"
             " message_count, intents, messages)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)",
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
             (
+                shop_id,
                 lead["phone"],
                 lead["name"],
                 lead["first_seen"],
@@ -135,16 +172,17 @@ def import_all(cur, data):
         for message in lead["messages"]:
             if message.get("wamid"):
                 cur.execute(
-                    "INSERT INTO seen_wamids (wamid, phone, received_ts)"
-                    " VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-                    (message["wamid"], lead["phone"], message["ts"]),
+                    "INSERT INTO seen_wamids (shop_id, wamid, phone, received_ts)"
+                    " VALUES (%s, %s, %s, %s) ON CONFLICT (shop_id, wamid) DO NOTHING",
+                    (shop_id, message["wamid"], lead["phone"], message["ts"]),
                 )
     for booking in data["bookings"]:
         cur.execute(
-            "INSERT INTO bookings (phone, name, service, price,"
+            "INSERT INTO bookings (shop_id, phone, name, service, price,"
             " date, start_min, duration_min, created_ts)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
+                shop_id,
                 booking["phone"],
                 booking["name"],
                 booking["service"],
@@ -157,10 +195,11 @@ def import_all(cur, data):
         )
     for handoff in data["handoffs"]:
         cur.execute(
-            "INSERT INTO handoffs (id, phone, name, reason, trigger,"
+            "INSERT INTO handoffs (shop_id, id, phone, name, reason, trigger,"
             " opened_at, resolved_at, status)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
+                shop_id,
                 handoff["id"],
                 handoff["phone"],
                 handoff["name"],
@@ -173,10 +212,11 @@ def import_all(cur, data):
         )
     for block in data["blocks"]:
         cur.execute(
-            "INSERT INTO blocks (id, date, start_min, end_min,"
+            "INSERT INTO blocks (shop_id, id, date, start_min, end_min,"
             " reason, created_ts)"
-            " VALUES (%s, %s, %s, %s, %s, %s)",
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
+                shop_id,
                 block["id"],
                 date.fromisoformat(block["date"]),
                 block["start_min"],
@@ -188,13 +228,14 @@ def import_all(cur, data):
     for record in data["missed"]:
         if record["kind"] == "refused":
             cur.execute(
-                "INSERT INTO missed (id, kind, phone, name, created_ts,"
+                "INSERT INTO missed (shop_id, id, kind, phone, name, created_ts,"
                 " last_seen_ts, occurrences, status, resolved_at,"
                 " resolved_how, service, date, start_min, reason,"
                 " alternatives, trigger)"
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
-                " %s, %s, %s, %s, %s, %s)",
+                " %s, %s, %s, %s, %s, %s, %s)",
                 (
+                    shop_id,
                     record["id"],
                     record["kind"],
                     record["phone"],
@@ -217,12 +258,13 @@ def import_all(cur, data):
             )
         else:
             cur.execute(
-                "INSERT INTO missed (id, kind, phone, name, created_ts,"
+                "INSERT INTO missed (shop_id, id, kind, phone, name, created_ts,"
                 " last_seen_ts, occurrences, status, resolved_at,"
                 " resolved_how, question, reason, handoff_id)"
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
-                " %s, %s, %s)",
+                " %s, %s, %s, %s)",
                 (
+                    shop_id,
                     record["id"],
                     record["kind"],
                     record["phone"],
@@ -241,10 +283,11 @@ def import_all(cur, data):
     for entry in data["outbox"]:
         expected = _outbox_expected(entry)
         cur.execute(
-            "INSERT INTO outbox (recipient, body, intent, ts,"
+            "INSERT INTO outbox (shop_id, recipient, body, intent, ts,"
             " handoff_id, send_status, wamid, send_error, truncated)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
+                shop_id,
                 expected["to"],
                 expected["body"],
                 expected["intent"],
@@ -263,12 +306,14 @@ def import_all(cur, data):
         )
 
 
-def spot_check(cur, data):
+def spot_check(cur, data, shop_id):
     """Compare a sample of rows, Postgres against the JSON files.
     Both sides are sorted by a stable key before comparing, since
     the JSON stores and the SQL orderings do not agree with each
-    other. Returns a list of mismatch descriptions; empty means
-    they match."""
+    other. Only this shop's rows are read: another shop's rows
+    would fail the comparison for records this shop never had.
+    Returns a list of mismatch descriptions; empty means they
+    match."""
     from whatsapp_studio.db import (
         block_from_row,
         booking_from_row,
@@ -280,29 +325,29 @@ def spot_check(cur, data):
 
     mismatches = []
     checks = (
-        ("leads", "SELECT * FROM leads ORDER BY last_seen DESC LIMIT 3",
+        ("leads", "SELECT * FROM leads WHERE shop_id = %s ORDER BY last_seen DESC LIMIT 3",
          lead_from_row, data["leads"][:3], lambda r: r,
          lambda r: r["phone"]),
-        ("bookings", "SELECT * FROM bookings ORDER BY date, start_min LIMIT 3",
+        ("bookings", "SELECT * FROM bookings WHERE shop_id = %s ORDER BY date, start_min LIMIT 3",
          booking_from_row, data["bookings"][:3],
          lambda r: {k: v for k, v in r.items() if k != "id"},
          lambda r: (r["date"], r["start_min"], r["phone"])),
-        ("handoffs", "SELECT * FROM handoffs"
+        ("handoffs", "SELECT * FROM handoffs WHERE shop_id = %s"
          " ORDER BY status <> 'open', opened_at DESC LIMIT 3",
          handoff_from_row, data["handoffs"][:3], lambda r: r,
          lambda r: r["id"]),
-        ("blocks", "SELECT * FROM blocks ORDER BY date, start_min LIMIT 3",
+        ("blocks", "SELECT * FROM blocks WHERE shop_id = %s ORDER BY date, start_min LIMIT 3",
          block_from_row, data["blocks"][:3], lambda r: r,
          lambda r: r["id"]),
-        ("missed", "SELECT * FROM missed ORDER BY created_ts DESC LIMIT 3",
+        ("missed", "SELECT * FROM missed WHERE shop_id = %s ORDER BY created_ts DESC LIMIT 3",
          missed_from_row, data["missed"][:3], lambda r: r,
          lambda r: r["id"]),
-        ("outbox", "SELECT * FROM outbox ORDER BY ts, id LIMIT 3",
+        ("outbox", "SELECT * FROM outbox WHERE shop_id = %s ORDER BY ts, id LIMIT 3",
          outbox_from_row, [_outbox_expected(e) for e in data["outbox"][:3]],
          lambda r: r, lambda r: (r["ts"], r["to"])),
     )
     for name, query, convert, expected, normalize, sort_key in checks:
-        cur.execute(query)
+        cur.execute(query, (shop_id,))
         rows = sorted(
             (normalize(convert(row)) for row in cur.fetchall()),
             key=sort_key,
@@ -323,6 +368,9 @@ def main(argv=None):
                         help="directory holding the JSON files")
     parser.add_argument("--database-url", default=None,
                         help="Postgres URL (default: DATABASE_URL)")
+    parser.add_argument("--shop-id", default=DEFAULT_SHOP_ID,
+                        help="shop the rows belong to"
+                        f" (default: {DEFAULT_SHOP_ID})")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--dry-run", action="store_true",
                        help="print what would be imported, write nothing")
@@ -356,12 +404,17 @@ def main(argv=None):
 
     pool = connect_pool(database_url)
     ensure_schema(pool)
+    shop_id = args.shop_id
+    if not shop_id.strip():
+        print("Refusing: --shop-id is blank.")
+        return 1
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            counts = table_counts(cur)
+            counts = table_counts(cur, shop_id)
+            collisions = id_collisions(cur, data)
     nonempty = {t: c for t, c in counts.items() if c}
     if args.dry_run:
-        print("Would import:")
+        print(f"Would import for shop {shop_id}:")
         for key in ("leads", "bookings", "handoffs", "blocks", "missed", "outbox"):
             print(f"  {key}: {len(data[key])}")
         wamids = sum(
@@ -370,9 +423,14 @@ def main(argv=None):
         )
         print(f"  seen_wamids: {wamids}")
         if nonempty:
-            print("Tables are NOT empty:", ", ".join(
+            print(f"Tables are NOT empty for shop {shop_id}:", ", ".join(
                 f"{t} {c}" for t, c in sorted(nonempty.items())))
             print("The import would refuse. Empty the tables first.")
+        if collisions:
+            print("Id collisions with other shops' rows:",
+                  ", ".join(
+                      f"{t} {ids}" for t, ids in sorted(collisions.items())))
+            print("The import would refuse. Those ids already exist.")
         return 0
     if args.verify:
         if not nonempty:
@@ -397,7 +455,7 @@ def main(argv=None):
         ]
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                problems += spot_check(cur, data)
+                problems += spot_check(cur, data, shop_id)
         if problems:
             print("Verify FAILED:")
             for problem in problems:
@@ -406,20 +464,25 @@ def main(argv=None):
         print("Verify passed: counts and sample records match the JSON files.")
         return 0
     if nonempty:
-        print("Refusing: tables are not empty:",
+        print(f"Refusing: tables are not empty for shop {shop_id}:",
               ", ".join(f"{t} {c}" for t, c in sorted(nonempty.items())))
-        print("The import only runs into empty tables. Empty them first,")
+        print("The import only runs into empty tables for this shop. Empty them first,")
         print("or point DATABASE_URL at a fresh database.")
+        return 1
+    if collisions:
+        print("Refusing: these ids already exist in the tables, for another shop:",
+              ", ".join(f"{t} {ids}" for t, ids in sorted(collisions.items())))
+        print("Ids are global across shops. Reassign them in the JSON files first.")
         return 1
     try:
         with pool.connection() as conn:
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    import_all(cur, data)
-                    mismatches = spot_check(cur, data)
+                    import_all(cur, data, shop_id)
+                    mismatches = spot_check(cur, data, shop_id)
                     if mismatches:
                         raise ValueError("\n".join(mismatches))
-                    counts = table_counts(cur)
+                    counts = table_counts(cur, shop_id)
     except ValueError as exc:
         # Raised inside the transaction, so nothing landed.
         print("Spot check failed, rolled back:")

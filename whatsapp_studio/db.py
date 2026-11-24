@@ -8,6 +8,14 @@ store never had. One table per store, plus seen_wamids for webhook
 dedup and the outbox. Epoch seconds stay epoch seconds and dates
 stay dates, so no time logic anywhere else changes.
 
+Every table carries a shop_id column, and every store instance
+belongs to one shop: many shops share one database and never see
+each other's rows. Leads are keyed by (shop_id, phone) and dedup
+records by (shop_id, wamid), so the same customer at two shops is
+two separate leads. The first boot runs migrate_schema, which adds
+the column to databases created before it existed and stamps their
+rows with the shop that was live on them.
+
 psycopg is imported lazily, inside connect_pool only. Importing this
 module, running the JSON path, and running the existing tests all work
 with psycopg not installed.
@@ -39,25 +47,30 @@ _DEMO_PREFIX = "9198100000"
 SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS leads (
-        phone TEXT PRIMARY KEY,
+        shop_id TEXT NOT NULL,
+        phone TEXT NOT NULL,
         name TEXT NOT NULL DEFAULT '',
         first_seen BIGINT NOT NULL,
         last_seen BIGINT NOT NULL,
         message_count INTEGER NOT NULL DEFAULT 0,
         intents TEXT[] NOT NULL DEFAULT '{}',
-        messages JSONB NOT NULL DEFAULT '[]'
+        messages JSONB NOT NULL DEFAULT '[]',
+        PRIMARY KEY (shop_id, phone)
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS seen_wamids (
-        wamid TEXT PRIMARY KEY,
+        shop_id TEXT NOT NULL,
+        wamid TEXT NOT NULL,
         phone TEXT NOT NULL,
-        received_ts BIGINT NOT NULL
+        received_ts BIGINT NOT NULL,
+        PRIMARY KEY (shop_id, wamid)
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS bookings (
         id BIGSERIAL PRIMARY KEY,
+        shop_id TEXT NOT NULL,
         phone TEXT NOT NULL,
         name TEXT NOT NULL DEFAULT '',
         service TEXT NOT NULL,
@@ -68,13 +81,14 @@ SCHEMA = [
         created_ts BIGINT NOT NULL
     )
     """,
-    "CREATE INDEX IF NOT EXISTS bookings_date_start_idx "
-    "ON bookings (date, start_min)",
-    "CREATE INDEX IF NOT EXISTS bookings_phone_date_idx "
-    "ON bookings (phone, date, start_min)",
+    "CREATE INDEX IF NOT EXISTS bookings_shop_date_start_idx "
+    "ON bookings (shop_id, date, start_min)",
+    "CREATE INDEX IF NOT EXISTS bookings_shop_phone_date_idx "
+    "ON bookings (shop_id, phone, date, start_min)",
     """
     CREATE TABLE IF NOT EXISTS handoffs (
         id BIGSERIAL PRIMARY KEY,
+        shop_id TEXT NOT NULL,
         phone TEXT NOT NULL,
         name TEXT NOT NULL DEFAULT '',
         reason TEXT NOT NULL,
@@ -84,13 +98,14 @@ SCHEMA = [
         status TEXT NOT NULL CHECK (status IN ('open', 'resolved'))
     )
     """,
-    "CREATE INDEX IF NOT EXISTS handoffs_phone_status_idx "
-    "ON handoffs (phone, status)",
-    "CREATE INDEX IF NOT EXISTS handoffs_status_opened_idx "
-    "ON handoffs (status, opened_at DESC)",
+    "CREATE INDEX IF NOT EXISTS handoffs_shop_phone_status_idx "
+    "ON handoffs (shop_id, phone, status)",
+    "CREATE INDEX IF NOT EXISTS handoffs_shop_status_opened_idx "
+    "ON handoffs (shop_id, status, opened_at DESC)",
     """
     CREATE TABLE IF NOT EXISTS blocks (
         id BIGSERIAL PRIMARY KEY,
+        shop_id TEXT NOT NULL,
         date DATE NOT NULL,
         start_min INTEGER NOT NULL,
         end_min INTEGER NOT NULL,
@@ -98,11 +113,12 @@ SCHEMA = [
         created_ts BIGINT NOT NULL
     )
     """,
-    "CREATE INDEX IF NOT EXISTS blocks_date_start_idx "
-    "ON blocks (date, start_min)",
+    "CREATE INDEX IF NOT EXISTS blocks_shop_date_start_idx "
+    "ON blocks (shop_id, date, start_min)",
     """
     CREATE TABLE IF NOT EXISTS missed (
         id BIGSERIAL PRIMARY KEY,
+        shop_id TEXT NOT NULL,
         kind TEXT NOT NULL CHECK (kind IN ('refused', 'unanswered')),
         phone TEXT NOT NULL,
         name TEXT NOT NULL DEFAULT '',
@@ -123,13 +139,14 @@ SCHEMA = [
         handoff_id BIGINT
     )
     """,
-    "CREATE INDEX IF NOT EXISTS missed_phone_status_idx "
-    "ON missed (phone, status)",
-    "CREATE INDEX IF NOT EXISTS missed_status_created_idx "
-    "ON missed (status, created_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS missed_shop_phone_status_idx "
+    "ON missed (shop_id, phone, status)",
+    "CREATE INDEX IF NOT EXISTS missed_shop_status_created_idx "
+    "ON missed (shop_id, status, created_ts DESC)",
     """
     CREATE TABLE IF NOT EXISTS outbox (
         id BIGSERIAL PRIMARY KEY,
+        shop_id TEXT NOT NULL,
         recipient TEXT NOT NULL,
         body TEXT NOT NULL,
         intent TEXT,
@@ -141,13 +158,32 @@ SCHEMA = [
         truncated BOOLEAN NOT NULL DEFAULT FALSE
     )
     """,
-    "CREATE INDEX IF NOT EXISTS outbox_recipient_ts_idx "
-    "ON outbox (recipient, ts)",
+    "CREATE INDEX IF NOT EXISTS outbox_shop_recipient_ts_idx "
+    "ON outbox (shop_id, recipient, ts)",
 ]
 
 # Tables the import refuses to touch unless they are empty.
 TABLES = ("leads", "seen_wamids", "bookings", "handoffs", "blocks",
           "missed", "outbox")
+
+# The shop id a single-shop install writes under. A registry names
+# its own shops; the default shop in a registry must carry the same
+# id the rows were stamped with (see migrate_schema).
+DEFAULT_SHOP_ID = "default"
+
+# Indexes the scoped ones replace. The migration drops these after
+# the shop-prefixed indexes land, so a scoped query never plans
+# against an index that still spans every shop.
+_OLD_INDEXES = (
+    "bookings_date_start_idx",
+    "bookings_phone_date_idx",
+    "handoffs_phone_status_idx",
+    "handoffs_status_opened_idx",
+    "blocks_date_start_idx",
+    "missed_phone_status_idx",
+    "missed_status_created_idx",
+    "outbox_recipient_ts_idx",
+)
 
 
 def _atomic_write(path, text):
@@ -212,6 +248,70 @@ def ensure_schema(pool):
             with conn.cursor() as cur:
                 for statement in SCHEMA:
                     cur.execute(statement)
+
+
+def migrate_schema(pool, default_shop_id):
+    """The first real migration: add shop_id to every table.
+
+    Runs once per boot, in one transaction, after ensure_schema. A
+    database created by the new SCHEMA already has the column, the
+    composite keys and the scoped indexes, so every statement below
+    is a no-op there. A database created by the old DDL gets the
+    column added, its existing rows stamped with default_shop_id,
+    the column made NOT NULL, the two single-column primary keys
+    rebuilt as (shop_id, ...), the scoped indexes created and the
+    old unscoped ones dropped.
+
+    default_shop_id is the id the rows already in the database
+    belong to: the registry's default shop when a registry exists,
+    DEFAULT_SHOP_ID when there is none. It is passed in, never
+    guessed here: stamping rows with the wrong id would make them
+    invisible to the shop that made them, with no error. A blank id
+    refuses outright. A failed run rolls the whole transaction back,
+    so a boot that crashes halfway is safe to retry.
+    """
+    if not (default_shop_id or "").strip():
+        raise ValueError("migrate_schema needs a shop id to stamp old rows with.")
+    with pool.connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for table in TABLES:
+                    cur.execute(
+                        f"ALTER TABLE {table}"
+                        " ADD COLUMN IF NOT EXISTS shop_id TEXT"
+                    )
+                for table in TABLES:
+                    cur.execute(
+                        f"UPDATE {table} SET shop_id = %s"
+                        " WHERE shop_id IS NULL",
+                        (default_shop_id,),
+                    )
+                for table in TABLES:
+                    cur.execute(
+                        f"ALTER TABLE {table}"
+                        " ALTER COLUMN shop_id SET NOT NULL"
+                    )
+                    cur.execute(
+                        f"ALTER TABLE {table}"
+                        " ALTER COLUMN shop_id DROP DEFAULT"
+                    )
+                for table, key in (
+                    ("leads", "phone"),
+                    ("seen_wamids", "wamid"),
+                ):
+                    cur.execute(
+                        f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS"
+                        f" {table}_pkey"
+                    )
+                    cur.execute(
+                        f"ALTER TABLE {table} ADD PRIMARY KEY"
+                        f" (shop_id, {key})"
+                    )
+                for statement in SCHEMA:
+                    if "CREATE INDEX" in statement:
+                        cur.execute(statement)
+                for index in _OLD_INDEXES:
+                    cur.execute(f"DROP INDEX IF EXISTS {index}")
 
 
 def check_db(pool):
@@ -344,12 +444,22 @@ class _PgStore:
     """One pool, shared by every store. A store method checks a
     connection out, does its work in one transaction, and returns it.
     Never one shared connection: a psycopg connection is not safe for
-    two threads at once."""
+    two threads at once.
+
+    Every store instance belongs to one shop, set at construction and
+    never changed after. The shop id rides in every statement, so
+    forgetting a filter is a construction-time impossibility rather
+    than a per-call discipline. A blank id refuses here, at
+    construction, never at the first query."""
 
     backend = "postgres"
 
-    def __init__(self, pool):
+    def __init__(self, pool, shop_id=None):
         self._pool = pool
+        shop_id = shop_id if shop_id is not None else DEFAULT_SHOP_ID
+        if not shop_id.strip():
+            raise ValueError("A Postgres store needs a shop id.")
+        self._shop_id = shop_id
 
     def ping(self):
         return check_db(self._pool)
@@ -375,16 +485,16 @@ class PgLeadStore(_PgStore):
                 with self._cursor(conn) as cur:
                     if wamid:
                         cur.execute(
-                            "INSERT INTO seen_wamids (wamid, phone, received_ts)"
-                            " VALUES (%s, %s, %s)"
-                            " ON CONFLICT (wamid) DO NOTHING RETURNING wamid",
-                            (wamid, phone, now),
+                            "INSERT INTO seen_wamids (shop_id, wamid, phone, received_ts)"
+                            " VALUES (%s, %s, %s, %s)"
+                            " ON CONFLICT (shop_id, wamid) DO NOTHING RETURNING wamid",
+                            (self._shop_id, wamid, phone, now),
                         )
                         if cur.fetchone() is None:
                             raise DuplicateMessageError(wamid)
                     cur.execute(
-                        "SELECT * FROM leads WHERE phone = %s FOR UPDATE",
-                        (phone,),
+                        "SELECT * FROM leads WHERE shop_id = %s AND phone = %s FOR UPDATE",
+                        (self._shop_id, phone),
                     )
                     row = cur.fetchone()
                     if row is None:
@@ -411,10 +521,10 @@ class PgLeadStore(_PgStore):
                     lead["messages"] = lead["messages"][-50:]
                     cur.execute(
                         "INSERT INTO leads"
-                        " (phone, name, first_seen, last_seen,"
+                        " (shop_id, phone, name, first_seen, last_seen,"
                         " message_count, intents, messages)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)"
-                        " ON CONFLICT (phone) DO UPDATE SET"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)"
+                        " ON CONFLICT (shop_id, phone) DO UPDATE SET"
                         " name = EXCLUDED.name,"
                         " last_seen = EXCLUDED.last_seen,"
                         " message_count = EXCLUDED.message_count,"
@@ -422,6 +532,7 @@ class PgLeadStore(_PgStore):
                         " messages = EXCLUDED.messages"
                         " RETURNING *",
                         (
+                            self._shop_id,
                             lead["phone"],
                             lead["name"],
                             lead["first_seen"],
@@ -440,9 +551,9 @@ class PgLeadStore(_PgStore):
             with conn.transaction():
                 with self._cursor(conn) as cur:
                     cur.execute(
-                        "UPDATE leads SET name = %s WHERE phone = %s"
+                        "UPDATE leads SET name = %s WHERE shop_id = %s AND phone = %s"
                         " RETURNING *",
-                        (name, phone),
+                        (name, self._shop_id, phone),
                     )
                     row = cur.fetchone()
         return lead_from_row(row) if row else None
@@ -453,20 +564,27 @@ class PgLeadStore(_PgStore):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
                 cur.execute(
-                    "SELECT 1 FROM seen_wamids WHERE wamid = %s", (wamid,)
+                    "SELECT 1 FROM seen_wamids WHERE shop_id = %s AND wamid = %s",
+                    (self._shop_id, wamid),
                 )
                 return cur.fetchone() is not None
 
     def all_leads(self):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
-                cur.execute("SELECT * FROM leads ORDER BY last_seen DESC")
+                cur.execute(
+                    "SELECT * FROM leads WHERE shop_id = %s ORDER BY last_seen DESC",
+                    (self._shop_id,),
+                )
                 return [lead_from_row(row) for row in cur.fetchall()]
 
     def get(self, phone):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
-                cur.execute("SELECT * FROM leads WHERE phone = %s", (phone,))
+                cur.execute(
+                    "SELECT * FROM leads WHERE shop_id = %s AND phone = %s",
+                    (self._shop_id, phone),
+                )
                 row = cur.fetchone()
         return lead_from_row(row) if row else None
 
@@ -483,9 +601,9 @@ class PgBookingStore(_PgStore):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
                 cur.execute(
-                    "SELECT * FROM bookings WHERE date = %s"
+                    "SELECT * FROM bookings WHERE shop_id = %s AND date = %s"
                     " ORDER BY start_min",
-                    (day,),
+                    (self._shop_id, day),
                 )
                 return [booking_from_row(row) for row in cur.fetchall()]
 
@@ -493,7 +611,9 @@ class PgBookingStore(_PgStore):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
                 cur.execute(
-                    "SELECT * FROM bookings ORDER BY date, start_min"
+                    "SELECT * FROM bookings WHERE shop_id = %s"
+                    " ORDER BY date, start_min",
+                    (self._shop_id,),
                 )
                 return [booking_from_row(row) for row in cur.fetchall()]
 
@@ -548,21 +668,22 @@ class PgBookingStore(_PgStore):
             with conn.transaction():
                 with self._cursor(conn) as cur:
                     cur.execute(
-                        "SELECT id FROM bookings WHERE date = %s"
+                        "SELECT id FROM bookings WHERE shop_id = %s AND date = %s"
                         " AND start_min < %s"
                         " AND start_min + duration_min > %s"
                         " FOR UPDATE",
-                        (day, end, start_min),
+                        (self._shop_id, day, end, start_min),
                     )
                     if len(cur.fetchall()) >= service.capacity:
                         return None
                     cur.execute(
                         "INSERT INTO bookings"
-                        " (phone, name, service, price, date,"
+                        " (shop_id, phone, name, service, price, date,"
                         " start_min, duration_min, created_ts)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " RETURNING *",
                         (
+                            self._shop_id,
                             phone,
                             name or "",
                             service.name,
@@ -577,9 +698,9 @@ class PgBookingStore(_PgStore):
 
     def _latest_upcoming(self, cur, phone):
         cur.execute(
-            "SELECT * FROM bookings WHERE phone = %s AND date >= %s"
+            "SELECT * FROM bookings WHERE shop_id = %s AND phone = %s AND date >= %s"
             " ORDER BY date DESC, start_min DESC LIMIT 1 FOR UPDATE",
-            (phone, india_today()),
+            (self._shop_id, phone, india_today()),
         )
         row = cur.fetchone()
         return booking_from_row(row) if row else None
@@ -592,8 +713,8 @@ class PgBookingStore(_PgStore):
                     if latest is None:
                         return None
                     cur.execute(
-                        "DELETE FROM bookings WHERE id = %s RETURNING *",
-                        (latest["id"],),
+                        "DELETE FROM bookings WHERE id = %s AND shop_id = %s RETURNING *",
+                        (latest["id"], self._shop_id),
                     )
                     return booking_from_row(cur.fetchone())
 
@@ -606,17 +727,17 @@ class PgBookingStore(_PgStore):
             with conn.transaction():
                 with self._cursor(conn) as cur:
                     cur.execute(
-                        "SELECT * FROM bookings WHERE phone = %s"
+                        "SELECT * FROM bookings WHERE shop_id = %s AND phone = %s"
                         " AND date = %s AND start_min = %s"
                         " ORDER BY id LIMIT 1 FOR UPDATE",
-                        (phone, day, start_min),
+                        (self._shop_id, phone, day, start_min),
                     )
                     row = cur.fetchone()
                     if row is None:
                         return None
                     cur.execute(
-                        "DELETE FROM bookings WHERE id = %s RETURNING *",
-                        (row["id"],),
+                        "DELETE FROM bookings WHERE id = %s AND shop_id = %s RETURNING *",
+                        (row["id"], self._shop_id),
                     )
                     return booking_from_row(cur.fetchone())
 
@@ -628,9 +749,9 @@ class PgBookingStore(_PgStore):
                     if latest is None:
                         return None
                     cur.execute(
-                        "UPDATE bookings SET name = %s WHERE id = %s"
+                        "UPDATE bookings SET name = %s WHERE id = %s AND shop_id = %s"
                         " RETURNING *",
-                        (name, latest["id"]),
+                        (name, latest["id"], self._shop_id),
                     )
                     return booking_from_row(cur.fetchone())
 
@@ -647,11 +768,11 @@ class PgBookingStore(_PgStore):
                     if latest is None:
                         return None, None
                     cur.execute(
-                        "SELECT id FROM bookings WHERE date = %s"
+                        "SELECT id FROM bookings WHERE shop_id = %s AND date = %s"
                         " AND start_min < %s"
                         " AND start_min + duration_min > %s"
                         " FOR UPDATE",
-                        (day, end, start_min),
+                        (self._shop_id, day, end, start_min),
                     )
                     others = [
                         row for row in cur.fetchall()
@@ -660,15 +781,17 @@ class PgBookingStore(_PgStore):
                     if len(others) >= service.capacity:
                         return None, None
                     cur.execute(
-                        "DELETE FROM bookings WHERE id = %s", (latest["id"],)
+                        "DELETE FROM bookings WHERE id = %s AND shop_id = %s",
+                        (latest["id"], self._shop_id),
                     )
                     cur.execute(
                         "INSERT INTO bookings"
-                        " (phone, name, service, price, date,"
+                        " (shop_id, phone, name, service, price, date,"
                         " start_min, duration_min, created_ts)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " RETURNING *",
                         (
+                            self._shop_id,
                             phone,
                             name or "",
                             service.name,
@@ -695,11 +818,12 @@ class PgHandoffStore(_PgStore):
                         return existing
                     cur.execute(
                         "INSERT INTO handoffs"
-                        " (phone, name, reason, trigger, opened_at,"
+                        " (shop_id, phone, name, reason, trigger, opened_at,"
                         " resolved_at, status)"
-                        " VALUES (%s, %s, %s, %s, %s, NULL, 'open')"
+                        " VALUES (%s, %s, %s, %s, %s, %s, NULL, 'open')"
                         " RETURNING *",
                         (
+                            self._shop_id,
                             phone,
                             name or "",
                             reason,
@@ -711,9 +835,9 @@ class PgHandoffStore(_PgStore):
 
     def _open_for(self, cur, phone):
         cur.execute(
-            "SELECT * FROM handoffs WHERE phone = %s AND status = 'open'"
+            "SELECT * FROM handoffs WHERE shop_id = %s AND phone = %s AND status = 'open'"
             " LIMIT 1",
-            (phone,),
+            (self._shop_id, phone),
         )
         row = cur.fetchone()
         return handoff_from_row(row) if row else None
@@ -730,9 +854,9 @@ class PgHandoffStore(_PgStore):
                     cur.execute(
                         "UPDATE handoffs SET status = 'resolved',"
                         " resolved_at = %s"
-                        " WHERE id = %s AND status = 'open'"
+                        " WHERE id = %s AND shop_id = %s AND status = 'open'"
                         " RETURNING *",
-                        (int(time.time()), handoff_id),
+                        (int(time.time()), handoff_id, self._shop_id),
                     )
                     row = cur.fetchone()
         return handoff_from_row(row) if row else None
@@ -741,8 +865,9 @@ class PgHandoffStore(_PgStore):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
                 cur.execute(
-                    "SELECT * FROM handoffs"
-                    " ORDER BY status <> 'open', opened_at DESC"
+                    "SELECT * FROM handoffs WHERE shop_id = %s"
+                    " ORDER BY status <> 'open', opened_at DESC",
+                    (self._shop_id,),
                 )
                 return [handoff_from_row(row) for row in cur.fetchall()]
 
@@ -756,9 +881,10 @@ class PgBlockStore(_PgStore):
                 with self._cursor(conn) as cur:
                     cur.execute(
                         "INSERT INTO blocks"
-                        " (date, start_min, end_min, reason, created_ts)"
-                        " VALUES (%s, %s, %s, %s, %s) RETURNING *",
+                        " (shop_id, date, start_min, end_min, reason, created_ts)"
+                        " VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
                         (
+                            self._shop_id,
                             day,
                             start_min,
                             end_min,
@@ -773,8 +899,8 @@ class PgBlockStore(_PgStore):
             with conn.transaction():
                 with self._cursor(conn) as cur:
                     cur.execute(
-                        "DELETE FROM blocks WHERE id = %s RETURNING *",
-                        (block_id,),
+                        "DELETE FROM blocks WHERE id = %s AND shop_id = %s RETURNING *",
+                        (block_id, self._shop_id),
                     )
                     row = cur.fetchone()
         return block_from_row(row) if row else None
@@ -783,7 +909,8 @@ class PgBlockStore(_PgStore):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
                 cur.execute(
-                    "SELECT * FROM blocks ORDER BY date, start_min"
+                    "SELECT * FROM blocks WHERE shop_id = %s ORDER BY date, start_min",
+                    (self._shop_id,),
                 )
                 return [block_from_row(row) for row in cur.fetchall()]
 
@@ -792,9 +919,9 @@ class PgBlockStore(_PgStore):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
                 cur.execute(
-                    "SELECT * FROM blocks WHERE date = %s"
+                    "SELECT * FROM blocks WHERE shop_id = %s AND date = %s"
                     " ORDER BY date, start_min",
-                    (key,),
+                    (self._shop_id, key),
                 )
                 return [block_from_row(row) for row in cur.fetchall()]
 
@@ -825,12 +952,16 @@ class PgMissedStore(_PgStore):
         cutoff = int(time.time()) - self._RETENTION_DAYS * 86400
         cur.execute(
             "DELETE FROM missed"
-            " WHERE status = 'resolved'"
+            " WHERE shop_id = %s AND status = 'resolved'"
             " AND (resolved_at IS NULL OR resolved_at < %s)",
-            (cutoff,),
+            (self._shop_id, cutoff),
         )
 
     def _bump_or_insert(self, cur, record, match):
+        # The shop is part of the match itself, not bolted on after:
+        # without it the FOR UPDATE lock would lock another shop's
+        # open record for the same phone and service.
+        match = {"shop_id": self._shop_id, **match}
         clauses = []
         values = []
         for column, value in match.items():
@@ -851,29 +982,31 @@ class PgMissedStore(_PgStore):
             cur.execute(
                 "UPDATE missed SET occurrences = occurrences + 1,"
                 " last_seen_ts = %s, trigger = %s, alternatives = %s"
-                " WHERE id = %s RETURNING *",
+                " WHERE id = %s AND shop_id = %s RETURNING *",
                 (
                     record["last_seen_ts"],
                     record.get("trigger", ""),
                     record.get("alternatives", []),
                     existing["id"],
+                    self._shop_id,
                 ),
             )
             return missed_from_row(cur.fetchone())
         fields = (
-            "kind", "phone", "name", "created_ts", "last_seen_ts",
+            "shop_id", "kind", "phone", "name", "created_ts", "last_seen_ts",
             "occurrences", "status", "resolved_at", "resolved_how",
             "service", "date", "start_min", "reason", "alternatives",
             "trigger", "question", "handoff_id",
         )
+        record = {"shop_id": self._shop_id, **record}
         cur.execute(
             "INSERT INTO missed"
-            " (kind, phone, name, created_ts, last_seen_ts,"
+            " (shop_id, kind, phone, name, created_ts, last_seen_ts,"
             " occurrences, status, resolved_at, resolved_how,"
             " service, date, start_min, reason, alternatives,"
             " trigger, question, handoff_id)"
             " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,"
-            " %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+            " %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
             tuple(record.get(f) for f in fields),
         )
         return missed_from_row(cur.fetchone())
@@ -956,9 +1089,9 @@ class PgMissedStore(_PgStore):
                     )
                     if handoff_id is not None and out["handoff_id"] is None:
                         cur.execute(
-                            "UPDATE missed SET handoff_id = %s WHERE id = %s"
+                            "UPDATE missed SET handoff_id = %s WHERE id = %s AND shop_id = %s"
                             " RETURNING *",
-                            (handoff_id, out["id"]),
+                            (handoff_id, out["id"], self._shop_id),
                         )
                         out = missed_from_row(cur.fetchone())
                     self._prune(cur)
@@ -973,9 +1106,9 @@ class PgMissedStore(_PgStore):
                     cur.execute(
                         "UPDATE missed SET status = 'resolved',"
                         " resolved_at = %s, resolved_how = %s"
-                        " WHERE id = %s AND status = 'open'"
+                        " WHERE id = %s AND shop_id = %s AND status = 'open'"
                         " RETURNING *",
-                        (int(time.time()), how, record_id),
+                        (int(time.time()), how, record_id, self._shop_id),
                     )
                     row = cur.fetchone()
                     if row is not None:
@@ -989,9 +1122,9 @@ class PgMissedStore(_PgStore):
                     cur.execute(
                         "UPDATE missed SET status = 'resolved',"
                         " resolved_at = %s, resolved_how = 'booked'"
-                        " WHERE status = 'open' AND kind = 'refused'"
+                        " WHERE shop_id = %s AND status = 'open' AND kind = 'refused'"
                         " AND phone = %s AND service = %s",
-                        (int(time.time()), phone, service),
+                        (int(time.time()), self._shop_id, phone, service),
                     )
                     if cur.rowcount:
                         self._prune(cur)
@@ -1005,9 +1138,9 @@ class PgMissedStore(_PgStore):
                     cur.execute(
                         "UPDATE missed SET status = 'resolved',"
                         " resolved_at = %s, resolved_how = %s"
-                        " WHERE status = 'open' AND kind = 'unanswered'"
+                        " WHERE shop_id = %s AND status = 'open' AND kind = 'unanswered'"
                         " AND handoff_id = %s",
-                        (int(time.time()), how, handoff_id),
+                        (int(time.time()), how, self._shop_id, handoff_id),
                     )
                     if cur.rowcount:
                         self._prune(cur)
@@ -1016,7 +1149,8 @@ class PgMissedStore(_PgStore):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
                 cur.execute(
-                    "SELECT * FROM missed ORDER BY created_ts DESC"
+                    "SELECT * FROM missed WHERE shop_id = %s ORDER BY created_ts DESC",
+                    (self._shop_id,),
                 )
                 return [missed_from_row(row) for row in cur.fetchall()]
 
@@ -1024,9 +1158,9 @@ class PgMissedStore(_PgStore):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
                 cur.execute(
-                    "SELECT * FROM missed WHERE status = 'open'"
+                    "SELECT * FROM missed WHERE shop_id = %s AND status = 'open'"
                     " ORDER BY created_ts DESC LIMIT %s",
-                    (limit,),
+                    (self._shop_id, limit),
                 )
                 return [missed_from_row(row) for row in cur.fetchall()]
 
@@ -1085,7 +1219,8 @@ class PgOutboxStore(_PgStore):
         with self._pool.connection() as conn:
             with self._cursor(conn) as cur:
                 cur.execute(
-                    "SELECT * FROM outbox ORDER BY ts, id"
+                    "SELECT * FROM outbox WHERE shop_id = %s ORDER BY ts, id",
+                    (self._shop_id,),
                 )
                 rows = [outbox_from_row(row) for row in cur.fetchall()]
         return rows[-100:]
@@ -1095,14 +1230,20 @@ class PgOutboxStore(_PgStore):
         with self._pool.connection() as conn:
             with conn.transaction():
                 with self._cursor(conn) as cur:
-                    cur.execute("DELETE FROM outbox")
+                    # Scoped: the old unscoped DELETE wiped every
+                    # shop's queued replies the moment one shop saved.
+                    cur.execute(
+                        "DELETE FROM outbox WHERE shop_id = %s",
+                        (self._shop_id,),
+                    )
                     for entry in entries:
                         cur.execute(
                             "INSERT INTO outbox"
-                            " (recipient, body, intent, ts, handoff_id,"
+                            " (shop_id, recipient, body, intent, ts, handoff_id,"
                             " send_status, wamid, send_error, truncated)"
-                            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                             (
+                                self._shop_id,
                                 entry.get("to", ""),
                                 entry.get("body") or "",
                                 entry.get("intent"),
@@ -1116,12 +1257,18 @@ class PgOutboxStore(_PgStore):
                         )
 
 
-def build_stores(database_url=None, data_dir=None, **pool_kwargs):
+def build_stores(database_url=None, data_dir=None, shop_id=None, **pool_kwargs):
     """All six stores plus the outbox, on one backend. A DATABASE_URL
-    means Postgres: one pool, schema created, Postgres stores. Without
-    one it means the JSON files exactly as run.py builds them today,
-    and no database is needed. Local dev, demo mode, and every
-    existing test keep working with no database and no new install."""
+    means Postgres: one pool, schema created, the shop_id migration
+    run, Postgres stores scoped to shop_id. Without one it means the
+    JSON files exactly as run.py builds them today, and no database
+    is needed. Local dev, demo mode, and every existing test keep
+    working with no database and no new install.
+
+    shop_id is the shop these stores belong to. None means the
+    single-shop install, which writes under DEFAULT_SHOP_ID. A
+    registry passes each shop's own id, so two shops on one database
+    never see each other's rows."""
     from .blocks import BlockStore
     from .bookings import BookingStore
     from .handoffs import HandoffStore
@@ -1129,15 +1276,19 @@ def build_stores(database_url=None, data_dir=None, **pool_kwargs):
     from .missed import MissedStore
 
     if database_url:
+        shop_id = shop_id if shop_id is not None else DEFAULT_SHOP_ID
+        if not shop_id.strip():
+            raise ValueError("A Postgres store set needs a shop id.")
         pool = connect_pool(database_url, **pool_kwargs)
         ensure_schema(pool)
+        migrate_schema(pool, shop_id)
         return SimpleNamespace(
-            leads=PgLeadStore(pool),
-            bookings=PgBookingStore(pool),
-            handoffs=PgHandoffStore(pool),
-            blocks=PgBlockStore(pool),
-            missed=PgMissedStore(pool),
-            outbox=PgOutboxStore(pool),
+            leads=PgLeadStore(pool, shop_id),
+            bookings=PgBookingStore(pool, shop_id),
+            handoffs=PgHandoffStore(pool, shop_id),
+            blocks=PgBlockStore(pool, shop_id),
+            missed=PgMissedStore(pool, shop_id),
+            outbox=PgOutboxStore(pool, shop_id),
             pool=pool,
         )
     data = Path(data_dir) if data_dir else None

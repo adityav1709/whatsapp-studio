@@ -154,12 +154,16 @@ class ShopRouter:
         self.llm = llm
         self.verify_token = verify_token
         shop_ids = {entry["shop"] for entry in registry.values()}
-        # Postgres has no shop column yet, so a second shop on Postgres
-        # would mix two shops rows in one table. Refuse that boot.
+        # The column has landed, but the second shop on Postgres
+        # stays held until the two-shop isolation checks pass
+        # against a real database. Lifting this before then would
+        # serve a second shop on tables whose scoping is only
+        # proven by fake-driver tests.
         if database_url and len(shop_ids) > 1:
             raise RuntimeError(
-                "Many shops refuses Postgres until the shop id column lands."
-                " Serve one shop on Postgres, or run the JSON stores."
+                "Many shops on Postgres is held until the two-shop"
+                " isolation checks pass. Serve one shop on Postgres,"
+                " or run the JSON stores."
             )
         self._default_number_id = self._find_default_number_id()
         self._studios = {}
@@ -208,6 +212,7 @@ class ShopRouter:
         stores = build_stores(
             self.database_url,
             self._shop_data_dir(entry["shop"]),
+            shop_id=entry["shop"],
         )
         token = os.environ.get("WHATSAPP_TOKEN")
         sender = WhatsAppSender(token, number_id) if token else None
@@ -227,7 +232,16 @@ class ShopRouter:
         )
 
     def _build_shops(self):
-        for number_id, entry in self.registry.items():
+        # The default shop is built first, on purpose: its
+        # build_stores call runs the shop_id migration, and the
+        # backfill must stamp the old rows with the default shop's
+        # id, not whichever shop happened to come first in the
+        # registry. Later shops re-run the migration as a no-op.
+        ordered = sorted(
+            self.registry.items(),
+            key=lambda item: item[0] != self._default_number_id,
+        )
+        for number_id, entry in ordered:
             # The default shop reads demo mode from the environment, so
             # the live single shop behaves exactly as before. A second
             # shop never seeds demo data: sample customers belong to
