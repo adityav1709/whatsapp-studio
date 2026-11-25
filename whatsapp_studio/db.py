@@ -219,6 +219,12 @@ def connect_pool(database_url, tries=3, **kwargs):
     database would serve a shop that cannot see its bookings."""
     from psycopg_pool import ConnectionPool
 
+    # psycopg_pool takes connection parameters in kwargs, not as
+    # pool arguments: passing connect_timeout at the top level is
+    # rejected by every version the requirements pin.
+    connection_kwargs = {"connect_timeout": 5}
+    connection_kwargs.update(kwargs.pop("kwargs", {}) or {})
+    connection_kwargs.update(kwargs)
     last = None
     for attempt in range(tries):
         try:
@@ -226,9 +232,8 @@ def connect_pool(database_url, tries=3, **kwargs):
                 database_url,
                 min_size=1,
                 max_size=4,
-                connect_timeout=5,
+                kwargs=connection_kwargs,
                 open=True,
-                **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - retried, then raised
             last = exc
