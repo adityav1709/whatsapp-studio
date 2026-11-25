@@ -63,7 +63,7 @@ class TestVisualSystem(unittest.TestCase):
             replies = studio.dashboard_html("replies")
             self.assertIn("Reply to a customer", replies)
             self.assertIn("Record reply, sending is off", replies)
-            self.assertIn("Drafts need an LLM key", replies)
+            self.assertIn("No draft for now.", replies)
             convo = studio.dashboard_html("conversation")
             self.assertIn("Conversation", convo)
             self.assertIn("class='msg in'", convo)
