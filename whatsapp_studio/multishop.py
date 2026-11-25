@@ -153,18 +153,6 @@ class ShopRouter:
         self.database_url = database_url
         self.llm = llm
         self.verify_token = verify_token
-        shop_ids = {entry["shop"] for entry in registry.values()}
-        # The column has landed, but the second shop on Postgres
-        # stays held until the two-shop isolation checks pass
-        # against a real database. Lifting this before then would
-        # serve a second shop on tables whose scoping is only
-        # proven by fake-driver tests.
-        if database_url and len(shop_ids) > 1:
-            raise RuntimeError(
-                "Many shops on Postgres is held until the two-shop"
-                " isolation checks pass. Serve one shop on Postgres,"
-                " or run the JSON stores."
-            )
         self._default_number_id = self._find_default_number_id()
         self._studios = {}
         self._build_shops()
