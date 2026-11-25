@@ -135,7 +135,11 @@ class TestMockPreviewHttp(unittest.TestCase):
             "Hi Amit, sorry about the delay. The team will call you about the refund today."
         ))
         _pin_created_times(self.studio, _afternoon_today())
-        self.httpd = make_server(self.studio, port=0)
+        # The page renders with the same pinned afternoon, not the
+        # live clock: after closing, last night's booking falls out
+        # of the most recent closed stretch and the moments line
+        # would vanish, failing the suite only at night.
+        self.httpd = make_server(self.studio, port=0, now=_afternoon_today())
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
