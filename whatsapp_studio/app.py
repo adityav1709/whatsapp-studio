@@ -3048,11 +3048,13 @@ def _shop_picker_html(shops):
     )
 
 
-def make_handler(studio, router=None, dashboard_passwords=None):
+def make_handler(studio, router=None, dashboard_passwords=None, now=None):
     """The HTTP handler. With a router, the webhook routes each change
     to its shop, and the dashboard resolves each login to its shop;
     everything else keeps showing the default shop. With no router
-    the single shop behaves exactly as before."""
+    the single shop behaves exactly as before. A pinned `now` fixes
+    the clock the dashboard renders with, so a test can hold the page
+    at one hour of the day; live servers never pass one."""
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # keep test/demo output clean
             pass
@@ -3320,7 +3322,7 @@ def make_handler(studio, router=None, dashboard_passwords=None):
                 self._send_text(
                     200,
                     scoped.dashboard_html(
-                        tab, mock=mock, shop_id=getattr(self, "_master_shop", None)
+                        tab, now=now, mock=mock, shop_id=getattr(self, "_master_shop", None)
                     ),
                     "text/html",
                 )
@@ -3686,8 +3688,8 @@ def make_handler(studio, router=None, dashboard_passwords=None):
     return Handler
 
 
-def make_server(studio, host="127.0.0.1", port=0, router=None, dashboard_passwords=None):
+def make_server(studio, host="127.0.0.1", port=0, router=None, dashboard_passwords=None, now=None):
     return ThreadingHTTPServer(
         (host, port),
-        make_handler(studio, router=router, dashboard_passwords=dashboard_passwords),
+        make_handler(studio, router=router, dashboard_passwords=dashboard_passwords, now=now),
     )
