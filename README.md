@@ -405,9 +405,9 @@ each is on at startup. `GET /webhook` (Meta's verification) and
 - Many shops on Postgres: the shop_id column is in place (every table,
   every query scoped, composite keys on leads and dedup, the outbox
   save scoped, a migration that stamps old rows with the shop that
-  was live on them). The boot refusal for a second shop on Postgres
-  stays until the two-shop isolation test in tests/test_db_live.py
-  passes against a real database; run it with
+  was live on them). The two-shop isolation test in
+  tests/test_db_live.py passes against a real Postgres, so a second
+  shop boots on the same database; run it with
   WHATSAPP_STUDIO_TEST_DATABASE_URL set, never against the live
   database. Adding a registry to an install that already has Postgres
   rows: the registry's default shop must carry the id those rows were
@@ -433,7 +433,6 @@ shop id and profile file:
 The entry whose profile file matches `PROFILE_PATH` is the default
 shop, the one the dashboard shows. A message for an unknown number id
 gets no reply and no store write. Postgres plus more than one shop
-still refuses to boot until the two-shop isolation test passes
-against a real database; the shop_id column itself is in place.
+boots on the same database, each shop scoped to its own shop_id.
 
 Built by Muse (Aurora) as part of an autonomous build loop.
