@@ -730,9 +730,25 @@ class TestConnectPool(unittest.TestCase):
         self.assertEqual(url, "postgres://fake")
         self.assertEqual(kwargs["min_size"], 1)
         self.assertEqual(kwargs["max_size"], 4)
-        self.assertEqual(kwargs["connect_timeout"], 5)
+        self.assertEqual(kwargs["kwargs"]["connect_timeout"], 5)
         self.assertTrue(kwargs["open"])
         self.assertEqual(pool.url, "postgres://fake")
+
+    def test_connection_params_land_in_the_pool_kwargs(self):
+        # libpq parameters such as options are connection parameters:
+        # they ride inside kwargs, where psycopg_pool passes them to
+        # connect, instead of as pool arguments, where they are
+        # rejected. The live test's search_path rides this way.
+        module, state = self._fake_pool_module(fail_times=0)
+        with mock.patch.dict(sys.modules, {"psycopg_pool": module}):
+            connect_pool(
+                "postgres://fake", options="-c search_path=studio_test"
+            )
+        _, kwargs = state["calls"][0]
+        self.assertEqual(
+            kwargs["kwargs"]["options"], "-c search_path=studio_test"
+        )
+        self.assertEqual(kwargs["kwargs"]["connect_timeout"], 5)
 
     def test_gives_up_after_three_tries(self):
         module, state = self._fake_pool_module(fail_times=3)
