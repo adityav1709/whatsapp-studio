@@ -7,7 +7,7 @@ Run: WHATSAPP_STUDIO_TEST_DATABASE_URL=postgres://user:pass@host/db \
 """
 import os
 import unittest
-from datetime import date, timedelta
+from datetime import timedelta
 
 try:
     import psycopg
@@ -22,7 +22,10 @@ from whatsapp_studio.leads import DuplicateMessageError
 URL = os.environ.get("WHATSAPP_STUDIO_TEST_DATABASE_URL")
 SCHEMA = "whatsapp_studio_test"
 PHONE = "919999900001"
-DAY = date(2026, 11, 20)
+# Tomorrow, always: cancel_latest only touches upcoming bookings, so a
+# fixed date goes stale the day after it is written and the cancel
+# tests start failing with nothing wrong in the stores.
+DAY = india_today() + timedelta(days=1)
 
 
 @unittest.skipUnless(
@@ -68,7 +71,7 @@ class TestPostgresLive(unittest.TestCase):
             PHONE, "Priya", service, DAY, 660
         )
         self.assertIsNotNone(booking)
-        self.assertEqual(booking["date"], "2026-11-20")
+        self.assertEqual(booking["date"], DAY.isoformat())
         # The same slot is taken now.
         self.assertIsNone(
             self.stores.bookings.book(
@@ -80,7 +83,7 @@ class TestPostgresLive(unittest.TestCase):
             PHONE, "Priya", service, DAY + timedelta(days=1), 720
         )
         self.assertEqual(cancelled["id"], booking["id"])
-        self.assertEqual(moved["date"], "2026-11-21")
+        self.assertEqual(moved["date"], (DAY + timedelta(days=1)).isoformat())
         self.assertEqual(
             self.stores.bookings.cancel_latest(PHONE)["id"], moved["id"]
         )
