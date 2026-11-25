@@ -185,10 +185,14 @@ class Studio:
         self._last_handoff = None
         # Drafts the owner asked the brain for, one per open handoff.
         # A draft is only a suggestion: it prefills the reply box and
-        # is never sent. The failed set remembers a draft the model
-        # could not produce, so the page says so instead of going quiet.
+        # is never sent. The failures dict remembers why a draft could
+        # not be produced, one record per handoff id, so the page can
+        # say why instead of going quiet. A record is {"kind", "detail",
+        # "tries"}; detail is the provider's own words, truncated, and
+        # is only ever written to the server log, never shown on the
+        # page. Like _drafts it lives in memory only and dies on restart.
         self._drafts = {}
-        self._draft_failed = set()
+        self._draft_failures = {}
         # Dry run forces record-only even when a token is set, so a pilot
         # can watch exactly what would be sent before anything leaves.
         self.dry_run = dry_run if dry_run is not None else os.environ.get("WHATSAPP_DRY_RUN") == "1"
@@ -763,26 +767,66 @@ class Studio:
             return None
         return None
 
-    def draft_reply(self, phone):
+    def _record_draft_failure(self, handoff_id, kind, detail=""):
+        """Remember why a draft failed, and log it for Aditya. The
+        record is keyed by handoff id so the Replies tab can show the
+        right line; tries counts consecutive failures of the same kind,
+        so a second failure can stop offering a retry. The detail is
+        the provider's own words, truncated to 120 chars; it is never
+        rendered on the page, only written to stdout, where the Render
+        logs keep it. No phone number or customer text is logged."""
+        detail = (detail or "")[:120]
+        if handoff_id is not None:
+            previous = self._draft_failures.get(handoff_id) or {}
+            tries = previous.get("tries", 0) + 1 if previous.get("kind") == kind else 1
+            self._draft_failures[handoff_id] = {
+                "kind": kind,
+                "detail": detail,
+                "tries": tries,
+            }
+        print(
+            "draft failed handoff={} kind={} detail={}".format(
+                handoff_id if handoff_id is not None else "?",
+                kind,
+                detail,
+            ),
+            flush=True,
+        )
+
+    def draft_reply(self, phone, handoff_id=None):
         """Ask the brain to draft a reply for the owner to review and
-        send. Returns the draft text, or None when there is no key or
-        the model could not draft one. The draft is never sent, and the
+        send. Returns the draft text, or None when there is no key, no
+        customer message to draft from, the model call failed, or the
+        model answered with nothing. The draft is never sent, and the
         model gets no tools here, so drafting cannot book, cancel, or
-        change anything."""
+        change anything. On failure the reason is recorded (see
+        _record_draft_failure) so the Replies tab can say why; on
+        success any earlier failure record for the handoff is cleared.
+        Only the handler knows the handoff id, so a direct caller that
+        omits it still gets the same None return, just without the
+        record."""
         if self.llm is None:
+            self._record_draft_failure(handoff_id, "no_key")
             return None
         lead = self.leads.get(phone)
         if lead is None or not lead["messages"]:
+            self._record_draft_failure(handoff_id, "no_messages")
             return None
         messages = [{"role": "system", "content": build_draft_prompt(self.profile)}]
         messages.extend(self._llm_history(phone))
         try:
             result = self.llm.chat(messages)
-        except Exception:
+        except Exception as exc:
+            self._record_draft_failure(
+                handoff_id, "provider_error", str(exc) or exc.__class__.__name__
+            )
             return None
         content = (result or {}).get("content")
         if not content or not content.strip():
+            self._record_draft_failure(handoff_id, "empty_reply")
             return None
+        if handoff_id is not None:
+            self._draft_failures.pop(handoff_id, None)
         return content.strip()[:MAX_LLM_CHARS]
 
     def _run_tool(self, name, args, phone, sender_name, now, trigger_text):
@@ -1820,21 +1864,63 @@ class Studio:
                 value,
                 reply_label,
             )
+            draft_button = (
+                "<form method='post' action='/handoffs/{}/draft" + scope_query + "'>"
+                "<button type='submit' class='ghost'>Draft a reply</button></form>"
+            ).format(handoff["id"])
             if self.llm is None:
                 box += (
-                    "<p class='quiet'>Drafts need an LLM key. The bot cannot "
-                    "reply without one. Set LLM_API_KEY on the server and restart.</p>"
-                )
-            elif handoff["id"] in self._draft_failed:
-                box += (
-                    "<p class='quiet'>Could not draft a reply right now. "
-                    "Just write your own.</p>"
+                    "<p class='quiet'>No draft for now. The reply helper is not "
+                    "switched on yet, so ask Aditya to switch it on. You can still "
+                    "write your own reply in the box above.</p>"
                 )
             else:
-                box += (
-                    "<form method='post' action='/handoffs/{}/draft" + scope_query + "'>"
-                    "<button type='submit' class='ghost'>Draft a reply</button></form>"
-                ).format(handoff["id"])
+                failure = self._draft_failures.get(handoff["id"])
+                if failure is not None and failure["kind"] == "no_messages":
+                    # The cause can heal: if the customer has since
+                    # written, there is something to draft from now.
+                    lead = self.leads.get(handoff["phone"])
+                    if lead is not None and lead["messages"]:
+                        self._draft_failures.pop(handoff["id"], None)
+                        failure = None
+                if failure is None:
+                    box += draft_button
+                elif failure["kind"] == "no_messages":
+                    box += (
+                        "<p class='quiet'>Nothing to draft from yet. This customer has not "
+                        "written anything to answer, so wait for their next message. "
+                        "You can still write your own reply in the box above.</p>"
+                    )
+                elif failure["kind"] == "no_key":
+                    box += (
+                        "<p class='quiet'>No draft for now. The reply helper is not "
+                        "switched on yet, so ask Aditya to switch it on. You can still "
+                        "write your own reply in the box above.</p>"
+                    )
+                elif failure.get("tries", 1) >= 2:
+                    # Tried twice already. Stop offering a retry that
+                    # keeps failing; the reply is hers to write, and
+                    # Aditya is the one who can fix the helper.
+                    box += (
+                        "<p class='quiet'>The AI is not answering. Write your own reply, "
+                        "and let Aditya know drafts are not working.</p>"
+                    )
+                elif failure["kind"] == "provider_error":
+                    box += (
+                        "<p class='quiet'>The draft did not come through. The reply helper "
+                        "did not answer, so tap Draft a reply to try again. If it keeps "
+                        "failing, ask Aditya to check it.</p>"
+                    )
+                    box += draft_button
+                else:
+                    # empty_reply, or a record without a kind we
+                    # recognise: same shape, try again once.
+                    box += (
+                        "<p class='quiet'>No draft this time. The reply helper came back "
+                        "with nothing to suggest, so tap Draft a reply to try again or "
+                        "write your own reply in the box above.</p>"
+                    )
+                    box += draft_button
             if not self.live:
                 box += (
                     "<p class='quiet'>Sending is off. Your reply will be "
@@ -3520,7 +3606,7 @@ def make_handler(studio, router=None, dashboard_passwords=None):
                     self._send_json(404, {"error": "handoff not found"})
                     return
                 scoped._drafts.pop(handoff_id, None)
-                scoped._draft_failed.discard(handoff_id)
+                scoped._draft_failures.pop(handoff_id, None)
                 self._redirect("/")
                 return
             if parsed.path.startswith("/handoffs/") and parsed.path.endswith("/draft"):
@@ -3542,14 +3628,11 @@ def make_handler(studio, router=None, dashboard_passwords=None):
                 if handoff is None:
                     self._send_json(404, {"error": "handoff not found"})
                     return
-                draft = scoped.draft_reply(handoff["phone"])
+                draft = scoped.draft_reply(handoff["phone"], handoff_id)
                 if draft is None:
-                    if scoped.llm is not None:
-                        scoped._draft_failed.add(handoff_id)
                     scoped._drafts.pop(handoff_id, None)
                 else:
                     scoped._drafts[handoff_id] = draft
-                    scoped._draft_failed.discard(handoff_id)
                 self._redirect("/?tab=replies")
                 return
             if parsed.path.startswith("/handoffs/") and parsed.path.endswith("/reply"):
@@ -3595,7 +3678,7 @@ def make_handler(studio, router=None, dashboard_passwords=None):
                 # not answer is answered too.
                 scoped.missed.resolve_for_handoff(handoff_id, "answered")
                 scoped._drafts.pop(handoff_id, None)
-                scoped._draft_failed.discard(handoff_id)
+                scoped._draft_failures.pop(handoff_id, None)
                 self._redirect("/")
                 return
             self._send_json(404, {"error": "not found"})
