@@ -253,9 +253,50 @@ class TestShopRouter(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._router(registry=registry)
 
-    def test_postgres_with_two_shops_refuses_boot(self):
-        with self.assertRaises(RuntimeError):
-            self._router(database_url="postgresql://localhost/studio")
+    def test_postgres_with_two_shops_boots(self):
+        # The refusal is lifted: the two-shop isolation test in
+        # test_db_live.py now passes against a real database, so a
+        # second shop on Postgres boots. The stores are faked here
+        # because this file never opens a real database; the live
+        # test proves the scoping, this proves the router hands each
+        # shop its own id.
+        from unittest import mock
+
+        from whatsapp_studio.db import build_stores as real_build_stores
+
+        seen = []
+
+        def fake_build_stores(database_url, data_dir, shop_id=None, **kwargs):
+            seen.append((database_url, shop_id))
+            return real_build_stores(None, data_dir)
+
+        with mock.patch(
+            "whatsapp_studio.multishop.build_stores",
+            side_effect=fake_build_stores,
+        ):
+            router = self._router(
+                database_url="postgresql://localhost/studio"
+            )
+        self.assertEqual(router.shop_ids, ["glow", "snips"])
+        self.assertEqual(
+            {shop for _, shop in seen}, {"glow", "snips"}
+        )
+        self.assertTrue(
+            all(url == "postgresql://localhost/studio" for url, _ in seen)
+        )
+        count = router.handle_webhook_payload(
+            _payload(SHOP_A, "919810000001", "haircut price?", "wamid-a")
+        )
+        count += router.handle_webhook_payload(
+            _payload(SHOP_B, "919810000001", "haircut price?", "wamid-b")
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(
+            len(router.studio_for(SHOP_A).leads.all_leads()), 1
+        )
+        self.assertEqual(
+            len(router.studio_for(SHOP_B).leads.all_leads()), 1
+        )
 
     def test_postgres_with_one_shop_boots(self):
         registry = {
