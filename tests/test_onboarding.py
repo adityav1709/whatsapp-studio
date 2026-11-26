@@ -360,6 +360,26 @@ class TestOnboardingHTTP(unittest.TestCase):
         self.assertNotIn("action='/setup/save'", body)
         self.assertNotIn("<script>alert", body)
 
+    def test_closed_on_days_are_finger_sized_chips(self):
+        status, body = self._get("/onboard", auth=False)
+        self.assertEqual(status, 200)
+        self.assertIn("class='closed-days'", body)
+        self.assertEqual(body.count("name='closed'"), 7)
+        self.assertIn(
+            ".closed-days label.inline{display:inline-flex;"
+            "align-items:center;min-height:44px",
+            body,
+        )
+
+    def test_closed_day_still_submits_through_the_chips(self):
+        status, body, _ = self._post(
+            "/onboard",
+            valid_fields(closed=["tue"]),
+            auth=False,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("closed Tuesday", body)
+
     def test_added_service_row_submits(self):
         status, body, _ = self._post(
             "/onboard",
