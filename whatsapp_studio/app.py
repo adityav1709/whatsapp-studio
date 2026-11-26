@@ -2013,8 +2013,9 @@ class Studio:
                         b["start_min"],
                     )
                 rows.append(
-                    "<li><strong>{}</strong> · {} for {} · {} · "
-                    "<a href='tel:+{}'>{}</a>{}</li>".format(
+                    "<li><span class='b-line'><strong>{}</strong> · {}</span>"
+                    "<span class='b-line'>{} · {}</span>"
+                    "<span class='b-line'><a href='tel:+{}'>{}</a></span>{}</li>".format(
                         html.escape(format_time(b["start_min"])),
                         html.escape(b["service"]),
                         html.escape(b.get("name") or b["phone"]),
@@ -2178,20 +2179,20 @@ class Studio:
         --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
         body{margin:0;font-family:var(--sans);font-size:18px;line-height:1.6;color:var(--ink);background:var(--paper)}
         .wrap{max-width:960px;margin:0 auto;padding:0 0 80px}
-        header{padding:56px 24px 24px;animation:fadeUp .6s ease both}
+        header{padding:56px 24px 24px}
         h1{font-family:var(--serif);font-size:56px;line-height:1.05;margin:0;font-weight:400;letter-spacing:-.01em;color:var(--ink)}
         .dateline{color:var(--grey);font-size:15px;margin:12px 0 0}
         .greeting{font-family:var(--serif);font-style:italic;font-size:28px;font-weight:400;margin:20px 0 0;color:var(--ink)}
         .greeting .type{display:inline-block;overflow:hidden;white-space:nowrap;vertical-align:bottom;max-width:0;animation:typeIn 1.1s steps(16) .35s forwards}
         .greeting .type::after{content:"";display:inline-block;width:2px;height:1em;background:var(--gold);margin-left:3px;vertical-align:-.1em;animation:caret 2.4s steps(1) .35s forwards}
         .warmline{font-size:18px;color:#4a4a44;margin:12px 0 0;line-height:1.6;max-width:700px}
-        .tabs{display:flex;flex-wrap:wrap;gap:10px;padding:28px 24px 16px;border-bottom:1px solid var(--sage);animation:fadeUp .6s ease .08s both}
+        .tabs{display:flex;flex-wrap:wrap;gap:10px;padding:28px 24px 16px;border-bottom:1px solid var(--sage)}
         .tabs a{padding:11px 20px;border-radius:999px;border:1px solid var(--ink);background:#fff;color:var(--ink);text-decoration:none;font-weight:500;font-size:15px;transition:background .18s ease}
         .tabs a.active{background:var(--ink);color:var(--paper)}
         .tabs a:hover{background:var(--sage)}
         .tabs a.active:hover{background:var(--ink)}
         .tabs a:active,.call:active,button:active{transform:translateY(1px)}
-        .hero{margin:24px;padding:56px 32px;background:var(--ink);border-radius:20px;color:var(--paper);animation:fadeUp .6s ease .14s both}
+        .hero{margin:24px;padding:56px 32px;background:var(--ink);border-radius:20px;color:var(--paper)}
         .hero .today{font-family:var(--serif);font-size:24px;line-height:1.4;color:var(--paper);margin:0 0 20px}
         .hero .money{font-family:var(--serif);font-size:88px;line-height:1;font-weight:400;letter-spacing:-.02em;color:var(--gold);margin:0}
         .hero .moneylbl{color:#C9C9C2;font-size:15px;margin:14px 0 0}
@@ -2199,7 +2200,7 @@ class Studio:
         .nums{display:flex;gap:32px;margin:0 24px 32px}
         .num .big{display:block;font-family:var(--serif);font-size:40px;font-weight:400;color:var(--ink);line-height:1.1}
         .num .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--grey)}
-        .bot{background:#fff;border:1px solid var(--sage);border-radius:20px;padding:28px 32px;margin:0 24px 32px;color:var(--ink);animation:fadeUp .6s ease .2s both}
+        .bot{background:#fff;border:1px solid var(--sage);border-radius:20px;padding:28px 32px;margin:0 24px 32px;color:var(--ink)}
         .bot p{margin:0 0 10px;color:var(--ink);max-width:700px}
         .bot p:last-child{margin-bottom:0}
         .bot.loud p{font-size:20px;font-weight:500}
@@ -2247,6 +2248,8 @@ class Studio:
         .list{list-style:none;padding:0;margin:0 24px}
         .list li{background:#fff;border:1px solid var(--sage);border-radius:14px;padding:16px 18px;margin:10px 0;color:var(--ink)}
         .list li.failed{background:var(--goldpale)}
+        .b-line{display:block}
+        .nowrap{white-space:nowrap}
         .err{color:var(--ink);font-weight:500}
         .replybox{background:var(--paper);border-radius:14px;padding:16px;margin-top:16px}
         .replybox .quiet{margin:0 0 4px;color:var(--grey)}
@@ -2272,9 +2275,9 @@ class Studio:
         @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
         @keyframes typeIn{to{max-width:24ch}}
         @keyframes caret{0%{opacity:1}40%{opacity:0}55%{opacity:1}90%{opacity:0}100%{opacity:0}}
-        @supports (animation-timeline:view()){.card,.list li,.thread,h2,.nums,.alerts,.insight,.selftest,.allclear{animation:fadeUp .6s ease both;animation-timeline:view();animation-range:entry 0% entry 50%}}
+        @supports (animation-timeline:view()){.card,.list li,.thread{animation:fadeUp .6s ease both;animation-timeline:view();animation-range:entry 0% entry 50%}}
         @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}.greeting .type{max-width:none!important}.greeting .type::after{display:none}}
-        @media (max-width:480px){h1{font-size:40px}header{padding:40px 20px 16px}.tabs{padding:20px 20px 12px;gap:8px}.tabs a{padding:9px 14px;font-size:14px}.hero{padding:40px 24px;margin:16px}.hero .money{font-size:64px}.hero .today{font-size:20px}.num .big{font-size:32px}.nums{gap:20px}.card{padding:22px}.bot{padding:22px 24px}h2{font-size:28px}}
+        @media (max-width:480px){h1{font-size:40px}header{padding:40px 20px 16px}.tabs{padding:20px 20px 12px;gap:8px}.tabs a{padding:9px 14px;font-size:14px}.hero{padding:32px 20px;margin:16px}.hero .money{font-size:48px}.hero .today{font-size:18px;line-height:1.5}.num .big{font-size:32px}.nums{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 20px 28px}.num .lbl{font-size:11px;letter-spacing:.05em;line-height:1.4}.card{padding:22px}.bot{padding:22px 24px}h2{font-size:28px}.greeting .type{animation:none;max-width:none}.greeting .type::after{display:none}button.inline{min-height:44px}}
         """
 
         # With no priced bookings this week the money part would read
@@ -2412,9 +2415,9 @@ class Studio:
                 if money_html
                 else ""
             ) + notice_html + (
-                "<h2>Bookings today ({})</h2>"
+                "<h2>Bookings today <span class='nowrap'>({})</span></h2>"
                 "<ul class='list'>{}</ul>"
-                "<h2>Tomorrow ({})</h2>"
+                "<h2>Tomorrow <span class='nowrap'>({})</span></h2>"
                 "<ul class='list'>{}</ul>"
                 "<p class='insight'>{}</p>"
                 "<h2>Block a time</h2>"
@@ -2626,6 +2629,8 @@ h2::after{content:"";display:block;width:56px;height:3px;background:var(--gold);
 .field{margin:0 24px}
 label{display:block;font-size:15px;font-weight:500;margin:14px 0 0}
 label.inline{display:inline-block;margin:8px 16px 0 0;font-weight:400}
+.closed-days{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.closed-days label.inline{display:inline-flex;align-items:center;min-height:44px;padding:6px 12px;margin:0;border:1px solid #D8D8D2;border-radius:999px}
 [hidden]{display:none!important}
 input[type=text],input[type=time],input[type=tel],select{width:100%;box-sizing:border-box;min-height:46px;padding:11px 14px;font-size:16px;border:1px solid #D8D8D2;border-radius:14px;margin:8px 0;background:#fff;color:var(--ink)}
 input[type=radio],input[type=checkbox]{min-height:0;margin:0 6px 0 0}
@@ -2833,12 +2838,12 @@ def _onboard_form_html(fields, errors):
         "})();</script>"
     )
     closed = set(fields.get("closed") or [])
-    closed_boxes = "".join(
+    closed_boxes = "<div class='closed-days'>" + "".join(
         "<label class='inline'><input type='checkbox' name='closed' value='{}'{}> {}</label>".format(
             key, " checked" if key in closed else "", short
         )
         for key, short in zip(DAY_KEYS, ONBOARD_DAY_SHORT)
-    )
+    ) + "</div>"
     open_value = _onboard_value(fields, "open", "10:00")
     close_value = _onboard_value(fields, "close", "20:00")
     if len(open_value) != 5 or open_value[2] != ":":
