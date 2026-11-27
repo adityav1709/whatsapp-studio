@@ -117,6 +117,7 @@ def main():
             handoffs=stores.handoffs,
             blocks=stores.blocks,
             missed=stores.missed,
+            pending_pings=stores.pending_pings,
             outbox_store=stores.outbox,
             llm=llm,
             profile_path=profile_path(),
