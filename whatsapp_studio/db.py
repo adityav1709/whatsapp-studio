@@ -1279,7 +1279,15 @@ def build_stores(database_url=None, data_dir=None, shop_id=None, **pool_kwargs):
     from .handoffs import HandoffStore
     from .leads import LeadStore
     from .missed import MissedStore
+    from .pending_pings import PendingPingStore
 
+    # Held owner pings stay a JSON file on both backends, by design:
+    # a Postgres migration for a handful of overnight rows is not
+    # worth it, and the file works the same under either backend.
+    data = Path(data_dir) if data_dir else None
+    pending_pings = PendingPingStore(
+        data / "pending_pings.json" if data else None
+    )
     if database_url:
         shop_id = shop_id if shop_id is not None else DEFAULT_SHOP_ID
         if not shop_id.strip():
@@ -1294,9 +1302,9 @@ def build_stores(database_url=None, data_dir=None, shop_id=None, **pool_kwargs):
             blocks=PgBlockStore(pool, shop_id),
             missed=PgMissedStore(pool, shop_id),
             outbox=PgOutboxStore(pool, shop_id),
+            pending_pings=pending_pings,
             pool=pool,
         )
-    data = Path(data_dir) if data_dir else None
     return SimpleNamespace(
         leads=LeadStore(data / "leads.json" if data else None),
         bookings=BookingStore(data / "bookings.json" if data else None),
@@ -1304,5 +1312,6 @@ def build_stores(database_url=None, data_dir=None, shop_id=None, **pool_kwargs):
         blocks=BlockStore(data / "blocks.json" if data else None),
         missed=MissedStore(data / "missed.json" if data else None),
         outbox=JsonOutboxStore(data / "outbox.json" if data else None),
+        pending_pings=pending_pings,
         pool=None,
     )
