@@ -8,6 +8,7 @@ current hour, so the suite passes whatever hour it runs in.
 """
 import base64
 import json
+import re
 import tempfile
 import threading
 import unittest
@@ -428,6 +429,78 @@ class TestOnboardingHTTP(unittest.TestCase):
         self.assertIn("type='hidden' name='phone' value='919899127791'", body)
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
         self.assertEqual(self.studio.profile.name, "Glow & Grace Salon")
+
+    def test_confirmation_shows_the_number_back_with_a_whatsapp_link(self):
+        # The number comes back big, with a link to open it in
+        # WhatsApp and the honest shape only line. The link carries
+        # the number she typed, not a normalised guess.
+        status, body, _ = self._post("/onboard", valid_fields(), auth=False)
+        self.assertEqual(status, 200)
+        self.assertIn("Your WhatsApp number", body)
+        self.assertIn("+91 9899127791", body)
+        self.assertIn("https://wa.me/919899127791", body)
+        self.assertIn("Is this the number your customers already message?", body)
+        self.assertIn(
+            "Tap the link to open it in WhatsApp and check it is yours.", body
+        )
+        self.assertIn(
+            "If it is wrong, tap Change it and fix it before you send the file.",
+            body,
+        )
+        self.assertIn("We checked the shape of this number only.", body)
+        self.assertIn(
+            "When he does, reply yes, and nothing goes live until you say so.",
+            body,
+        )
+        self.assertIn(">Change it</button>", body)
+
+    def test_change_it_returns_to_the_form_with_everything_kept(self):
+        # Change it is the same edit round trip as Change something:
+        # back to the form with every field she typed, services and
+        # prices included, so she never retypes them.
+        _, confirmation, _ = self._post("/onboard", valid_fields(), auth=False)
+        self.assertIn("name='_action' value='edit'", confirmation)
+        status, body, _ = self._post(
+            "/onboard", dict(valid_fields(), _action=["edit"]), auth=False
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Set up your shop", body)
+        self.assertIn("value='Snips Salon'", body)
+        self.assertIn("value='Hair Spa'", body)
+        self.assertIn("value='199'", body)
+        self.assertIn("value='919899127791'", body)
+        self.assertNotIn("Download your shop file", body)
+
+    def test_form_helper_lines_say_what_is_checked(self):
+        status, body = self._get("/onboard", auth=False)
+        self.assertEqual(status, 200)
+        self.assertIn(
+            "Use the number your customers already message on WhatsApp. "
+            "We check the shape of the number here. Aditya will message "
+            "you on this number to switch it on, so check it reads right. "
+            "Only Aditya sees this number.",
+            body,
+        )
+        self.assertIn(
+            "Type the same number again. If the two do not match, we will "
+            "ask you to check them.",
+            body,
+        )
+        self.assertNotIn("No calls, no spam", body)
+        self.assertNotIn(
+            "A wrong number means your receptionist answers from nowhere.", body
+        )
+
+    def test_number_block_has_no_dash(self):
+        # The number block she reads back must have no dash anywhere
+        # in its visible words: digits, link, question, and the shape
+        # only line. Scoped to the block, because the hours line
+        # elsewhere on the page legitimately carries one.
+        _, body, _ = self._post("/onboard", valid_fields(), auth=False)
+        start = body.index("<h2>Your WhatsApp number</h2>")
+        end = body.index("<h2>What your customers will see</h2>")
+        text = re.sub(r"<[^>]+>", "", body[start:end])
+        self.assertNotIn("-", text)
 
     def test_invalid_submission_keeps_what_she_typed(self):
         status, body, _ = self._post(
