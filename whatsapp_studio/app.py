@@ -68,7 +68,14 @@ from .llm import (
     openai_tool_calls,
 )
 from .missed import MissedStore, REFUSAL_ERRORS, plain_reason
-from .notify import TelegramNotifier, notifier_from_env
+from .notify import (
+    FanoutNotifier,
+    NullNotifier,
+    WhatsAppNotifier,
+    notifier_from_env,
+    owner_whatsapp_configured,
+    whatsapp_channel_status,
+)
 from .security import (
     check_basic_auth,
     resolve_dashboard_scope,
@@ -136,7 +143,7 @@ def handoff_confirmation(profile, reason, now=None):
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, missed=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, outbox_store=None, llm=None, demo_mode=None, profile_path=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, missed=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, outbox_store=None, llm=None, demo_mode=None, profile_path=None, shop_id=None):
         self.profile = profile
         # Where the profile lives on disk, when the server knows it.
         # The setup form saves through this path; without it, a save
@@ -170,16 +177,28 @@ class Studio:
         # One shot notice for the dashboard, set by a form handler and
         # shown once on the next page render, then cleared.
         self._notice = None
-        self.notifier = notifier if notifier is not None else notifier_from_env()
+        # The sender first: the owner WhatsApp ping sends through it,
+        # so the notifier needs it at build time.
         self.sender = sender if sender is not None else sender_from_env()
-        # The brain. None means no key is set and the bot cannot reply;
-        # run.py builds it from the environment, tests pass a fake.
-        self.llm = llm
         # Demo showcase: off by default. With DEMO_MODE=1 the page
         # shows the bot on with sample customers, so a visitor sees
         # the product at work instead of an empty page. A real install
-        # keeps saying plainly when it has no key or number.
+        # keeps saying plainly when it has no key or number. Known
+        # before the notifier: the WhatsApp ping is never built in
+        # demo mode, where it would message a real personal number
+        # about fake customers.
         self.demo_mode = demo_mode if demo_mode is not None else os.environ.get("DEMO_MODE") == "1"
+        self._shop_id = shop_id
+        self.notifier = notifier if notifier is not None else notifier_from_env(
+            sender=self.sender,
+            shop_id=shop_id,
+            demo_mode=self.demo_mode,
+            shop_number=self.profile.phone,
+            is_live=lambda: self.live and not self.demo_mode,
+        )
+        # The brain. None means no key is set and the bot cannot reply;
+        # run.py builds it from the environment, tests pass a fake.
+        self.llm = llm
         # The handoff the hand_over tool opened during this reply, if
         # any, so the reply entry can carry its id.
         self._last_handoff = None
@@ -313,12 +332,52 @@ class Studio:
             )
         else:
             items.append(("Services and prices filled in", True, ""))
-        if isinstance(self.notifier, TelegramNotifier):
+        # One notifier object may fan out to several channels, so the
+        # checklist inspects the children instead of the object's type.
+        children = (
+            self.notifier.notifiers
+            if isinstance(self.notifier, FanoutNotifier)
+            else [self.notifier]
+        )
+        if any(not isinstance(n, NullNotifier) for n in children):
             items.append(("Owner alerts on", True, ""))
         else:
             items.append(
                 ("Owner alerts on", False, "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID on Render so the owner is pinged.")
             )
+        if owner_whatsapp_configured(self._shop_id):
+            whatsapp = next(
+                (n for n in children if isinstance(n, WhatsAppNotifier)), None
+            )
+            if whatsapp is not None:
+                note = whatsapp.failure_note()
+                if note is None:
+                    items.append(
+                        (
+                            "Owner WhatsApp ping to {}".format(
+                                whatsapp.owner_number
+                            ),
+                            True,
+                            "",
+                        )
+                    )
+                else:
+                    items.append(("Owner WhatsApp ping", False, note))
+            else:
+                _ready, reason = whatsapp_channel_status(
+                    self.sender,
+                    self._shop_id,
+                    self.profile.phone,
+                    self.demo_mode,
+                )
+                items.append(
+                    (
+                        "Owner WhatsApp ping",
+                        False,
+                        reason
+                        or "Set OWNER_WHATSAPP_NUMBER and OWNER_TEMPLATE_NAME on Render.",
+                    )
+                )
         return items
 
     def _newly_closed_with_bookings(self, new_hours):
