@@ -6,14 +6,14 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
 from test_llm import C, FixedLLM, ScriptedLLM, T
 from whatsapp_studio.app import Studio, make_server
 from whatsapp_studio.blocks import BlockStore
-from whatsapp_studio.bookings import BookingStore, india_today
+from whatsapp_studio.bookings import IST, BookingStore, india_today
 from whatsapp_studio.config import BusinessProfile, Service
 from whatsapp_studio.handoffs import HandoffStore
 from whatsapp_studio.leads import LeadStore
@@ -224,8 +224,12 @@ class TestNonTextMessages(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_voice_note_gets_reply_handoff_and_ping(self):
+        # Open hours, pinned: without a now the ping is held for
+        # opening once the shop has closed, and the test fails at
+        # night for a reason that has nothing to do with voice notes.
         count = self.studio.handle_webhook_payload(
-            _payload("919810000001", "audio", "wamid.voice1")
+            _payload("919810000001", "audio", "wamid.voice1"),
+            now=datetime(2026, 11, 15, 11, 0, tzinfo=IST),
         )
         self.assertEqual(count, 1)
         self.assertEqual(len(self.studio.outbox), 1)
