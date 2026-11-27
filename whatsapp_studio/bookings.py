@@ -211,6 +211,30 @@ def _span_for_day(hours_for_weekday, day):
     return span
 
 
+def next_opening(hours_for_weekday, now):
+    """The next time the shop opens, at or after `now`, or None when
+    no day opens in the next eight days. Days the shop is shut are
+    skipped; a day whose hours do not parse counts as open right now,
+    the same fail-open rule `_is_open_now` uses, so a typo in the
+    profile can never hold a ping. `now` is India time, like
+    `_closed_stretch_start`'s."""
+    day = now.date()
+    for _ in range(8):
+        hours = hours_for_weekday(day.weekday())
+        if is_closed(hours):
+            day = day + timedelta(days=1)
+            continue
+        span = parse_hours_range(hours)
+        if span is None:
+            return now
+        opening = datetime(day.year, day.month, day.day, tzinfo=IST)
+        opening = opening + timedelta(minutes=span[0])
+        if opening >= now:
+            return opening
+        day = day + timedelta(days=1)
+    return None
+
+
 def _closed_stretch_start(hours_for_weekday, now):
     """Start of the most recent closed stretch: the closing time of
     the last open day before the closed run that contains now, or
