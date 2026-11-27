@@ -5,16 +5,18 @@ never a reason for a handoff, a booking, or a form submit to fail.
 The interface is an object with ``notify(business_name, handoff)``,
 ``notify_booking(business_name, booking)``,
 ``notify_send_failed(business_name, entry)`` and
-``notify_onboard(profile, seen_before=False)``, so a WhatsApp notifier
-can plug in later without touching the app. Today there are two
+``notify_onboard(profile, seen_before=False)``. There are four
 implementations: Telegram (owner-supplied bot token and chat id from
-the environment, off by default) and a null one that does nothing. No
+the environment, off by default), WhatsApp (a Meta template message to
+the owner's personal number, for handoffs only), a fan-out that sends
+through each channel in turn, and a null one that does nothing. No
 credentials live in this repo.
 """
 from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.request
 from datetime import date
 
@@ -169,9 +171,235 @@ class NullNotifier:
         return None
 
 
-def notifier_from_env():
+def _digits(number):
+    return "".join(c for c in (number or "") if c.isdigit())
+
+
+def _shop_env_suffix(shop_id):
+    """The per-shop suffix for an env var, `_SHOP`, with the shop id
+    uppercased and anything that cannot appear in an env var turned
+    into an underscore — the same rule as
+    ``security.py::dashboard_password_env_name``."""
+    if not shop_id:
+        return ""
+    safe = "".join(c if c.isalnum() else "_" for c in str(shop_id).upper())
+    return "_" + safe
+
+
+def _owner_whatsapp_env(shop_id):
+    """(owner number, template name, language) for one shop: per-shop
+    vars win over the base vars. The number is the owner's personal
+    WhatsApp number, digits with an optional leading +, and the
+    template is the name Meta approved for owner alerts. Unset means
+    the channel was never configured."""
+    suffix = _shop_env_suffix(shop_id)
+    number = os.environ.get("OWNER_WHATSAPP_NUMBER" + suffix) or os.environ.get(
+        "OWNER_WHATSAPP_NUMBER"
+    )
+    template = os.environ.get("OWNER_TEMPLATE_NAME" + suffix) or os.environ.get(
+        "OWNER_TEMPLATE_NAME"
+    )
+    language = (
+        os.environ.get("OWNER_TEMPLATE_LANGUAGE" + suffix)
+        or os.environ.get("OWNER_TEMPLATE_LANGUAGE")
+        or "en_US"
+    )
+    return number, template, language
+
+
+def owner_whatsapp_configured(shop_id):
+    """True when the owner has started setting up the WhatsApp ping —
+    the number or the template name is set. The setup checklist shows
+    the ping line only then: the ping is an optional upgrade, and a
+    Telegram-only shop is a complete setup."""
+    number, template, _language = _owner_whatsapp_env(shop_id)
+    return bool(number or template)
+
+
+def whatsapp_channel_status(sender, shop_id, shop_number, demo_mode):
+    """(ready, reason) for the owner WhatsApp ping: ready True when the
+    channel can be built; reason the plain-words cause when it cannot,
+    or None when the channel was simply never configured — not an
+    error, and not worth a boot log line."""
+    number, template, _language = _owner_whatsapp_env(shop_id)
+    if not number and not template:
+        return False, None
+    if demo_mode:
+        return False, "Demo mode is on, so the owner WhatsApp ping is off."
+    if sender is None:
+        return (
+            False,
+            "Set WHATSAPP_TOKEN and PHONE_NUMBER_ID on Render so the owner WhatsApp ping can send.",
+        )
+    if not number:
+        return (
+            False,
+            "Set OWNER_WHATSAPP_NUMBER on Render — your personal number, not the shop's number.",
+        )
+    digits = _digits(number)
+    if not 7 <= len(digits) <= 15:
+        return False, "OWNER_WHATSAPP_NUMBER is not a valid WhatsApp number."
+    if not template:
+        return (
+            False,
+            "Set OWNER_TEMPLATE_NAME on Render — the name of the template Meta approved for owner alerts.",
+        )
+    if shop_number and digits == _digits(shop_number):
+        return (
+            False,
+            "The owner number is the shop's own number — set your personal number, not the shop's.",
+        )
+    return True, None
+
+
+def _meta_error(exc):
+    """(code, message) from a failed Meta send: the error body when the
+    call reached Meta, else no code and the exception's own words."""
+    if getattr(exc, "read", None) is not None:
+        try:
+            error = json.loads(exc.read().decode("utf-8")).get("error") or {}
+            return error.get("code"), error.get("message") or str(exc)
+        except Exception:
+            pass
+    return None, str(exc)
+
+
+# Meta's words for the failures an owner can actually fix, keyed by
+# the code in the error body. Anything else is reported by its code.
+_META_ERROR_WORDS = {
+    132000: "template not approved by Meta yet",
+    131030: "template or recipient problem",
+}
+
+
+class WhatsAppNotifier:
+    """Ping the owner on WhatsApp the moment a handoff opens, with a
+    Meta template message — the only way to reach the owner outside
+    the 24-hour window. Handoffs only: every message shape needs its
+    own approved template, and the handoff is the urgent one; bookings
+    and onboarding stay on Telegram."""
+
+    def __init__(self, sender, owner_number, template_name, language="en_US", is_live=None):
+        self.sender = sender
+        self.owner_number = owner_number
+        self.template_name = template_name
+        self.language = language
+        self._is_live = is_live
+        # The last failed ping, {"code", "message", "at"}: the checklist
+        # reports it, so a template still waiting for Meta approval
+        # says so plainly instead of failing silently. In memory only.
+        self.last_failure = None
+
+    def failure_note(self):
+        """One plain line about the last failed ping, or None when the
+        last ping went out. Never carries Meta's raw error text."""
+        if self.last_failure is None:
+            return None
+        code = self.last_failure.get("code")
+        words = _META_ERROR_WORDS.get(code)
+        if words:
+            return "Last ping failed: {}.".format(words)
+        if code is not None:
+            return "Last ping failed (Meta error {}).".format(code)
+        return "Last ping failed: {}.".format(
+            _short(self.last_failure.get("message"), 120)
+        )
+
+    def notify(self, business_name, handoff):
+        if self._is_live is not None and not self._is_live():
+            # Dry run or the kill switch: record what would have gone
+            # out, send nothing.
+            print(
+                "owner whatsapp ping skipped, sending is off: {} to {}".format(
+                    business_name, self.owner_number
+                )
+            )
+            return None
+        parameters = [
+            _short(business_name, 80),
+            "{} ({})".format(
+                _short(handoff.get("name") or "Customer", 60), handoff["phone"]
+            ),
+            _short(handoff.get("reason") or "", 120),
+            _short(handoff.get("trigger") or "", 200),
+        ]
+        try:
+            self.sender.send_template(
+                self.owner_number, self.template_name, self.language, parameters
+            )
+        except Exception as exc:
+            code, message = _meta_error(exc)
+            self.last_failure = {
+                "code": code,
+                "message": message[:200],
+                "at": int(time.time()),
+            }
+            detail = "{} {}".format(code, message) if code is not None else message
+            print("owner whatsapp ping failed: {}".format(detail[:200]))
+        return None
+
+    def notify_booking(self, business_name, booking):
+        return None
+
+    def notify_send_failed(self, business_name, entry):
+        return None
+
+    def notify_onboard(self, profile, seen_before=False):
+        return None
+
+
+class FanoutNotifier:
+    """Send every notification through each channel in turn, so one
+    channel failing never stops the next: while the template is still
+    waiting for Meta approval, Telegram still pings."""
+
+    def __init__(self, notifiers):
+        self.notifiers = [n for n in notifiers if n is not None]
+
+    def _each(self, method, *args):
+        for notifier in self.notifiers:
+            try:
+                getattr(notifier, method)(*args)
+            except Exception:
+                pass
+
+    def notify(self, business_name, handoff):
+        self._each("notify", business_name, handoff)
+
+    def notify_booking(self, business_name, booking):
+        self._each("notify_booking", business_name, booking)
+
+    def notify_send_failed(self, business_name, entry):
+        self._each("notify_send_failed", business_name, entry)
+
+    def notify_onboard(self, profile, seen_before=False):
+        self._each("notify_onboard", profile, seen_before)
+
+
+def notifier_from_env(sender=None, shop_id=None, demo_mode=False, shop_number=None, is_live=None):
+    """The notifier for one shop: Telegram, WhatsApp, both through a
+    fan-out, or null when neither is configured. The no-argument call
+    keeps working — existing tests construct a Studio without a
+    notifier and rely on the env fallback."""
+    channels = []
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if token and chat_id:
-        return TelegramNotifier(token, chat_id)
-    return NullNotifier()
+        channels.append(TelegramNotifier(token, chat_id))
+    ready, reason = whatsapp_channel_status(sender, shop_id, shop_number, demo_mode)
+    if ready:
+        number, template, language = _owner_whatsapp_env(shop_id)
+        channels.append(
+            WhatsAppNotifier(
+                sender, _digits(number), template, language, is_live=is_live
+            )
+        )
+    elif reason is not None:
+        # A half-configured channel is worth one boot line; a channel
+        # that was never configured is silence, not an error.
+        print("owner whatsapp ping off: {}".format(reason))
+    if not channels:
+        return NullNotifier()
+    if len(channels) == 1:
+        return channels[0]
+    return FanoutNotifier(channels)
