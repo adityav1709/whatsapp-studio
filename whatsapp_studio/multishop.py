@@ -217,6 +217,7 @@ class ShopRouter:
             llm=self.llm,
             demo_mode=demo_mode,
             profile_path=str(profile_path),
+            shop_id=entry["shop"],
         )
 
     def _build_shops(self):
