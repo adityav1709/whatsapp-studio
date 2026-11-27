@@ -570,7 +570,8 @@ class TestStudioLLM(unittest.TestCase):
             )
         )
         entry = studio.handle_message(
-            "919810000001", "can I talk to a person please", "Rahul"
+            "919810000001", "can I talk to a person please", "Rahul",
+            now=datetime(2026, 11, 15, 11, 0, tzinfo=IST),
         )
         self.assertIn("passed this to the team", entry["body"])
         handoff = studio.handoffs.open_for("919810000001")
