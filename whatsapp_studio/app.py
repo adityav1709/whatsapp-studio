@@ -40,6 +40,7 @@ from .bookings import (
     india_now,
     india_today,
     is_closed,
+    next_opening,
     parse_day,
     parse_hours_range,
     parse_time,
@@ -71,11 +72,14 @@ from .missed import MissedStore, REFUSAL_ERRORS, plain_reason
 from .notify import (
     FanoutNotifier,
     NullNotifier,
+    TelegramNotifier,
     WhatsAppNotifier,
+    _waiting_since,
     notifier_from_env,
     owner_whatsapp_configured,
     whatsapp_channel_status,
 )
+from .pending_pings import PendingPingStore
 from .security import (
     check_basic_auth,
     resolve_dashboard_scope,
@@ -143,7 +147,7 @@ def handoff_confirmation(profile, reason, now=None):
 class Studio:
     """Holds the business profile, lead store and outgoing replies."""
 
-    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, missed=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, outbox_store=None, llm=None, demo_mode=None, profile_path=None, shop_id=None):
+    def __init__(self, profile, lead_store, verify_token="studio-demo", bookings=None, handoffs=None, blocks=None, missed=None, notifier=None, sender=None, dry_run=None, app_secret=None, dashboard_password=None, outbox_path=None, outbox_store=None, llm=None, demo_mode=None, profile_path=None, shop_id=None, pending_pings=None):
         self.profile = profile
         # Where the profile lives on disk, when the server knows it.
         # The setup form saves through this path; without it, a save
@@ -158,6 +162,14 @@ class Studio:
         self.handoffs = handoffs if handoffs is not None else HandoffStore()
         self.blocks = blocks if blocks is not None else BlockStore()
         self.missed = missed if missed is not None else MissedStore()
+        # Owner pings held for opening time, one entry per handoff.
+        # A JSON file, never Postgres: the queue must survive a
+        # restart, and a migration for a handful of overnight rows is
+        # not worth it. run.py and the router pass the shop's file;
+        # tests get the in-memory store.
+        self.pending_pings = (
+            pending_pings if pending_pings is not None else PendingPingStore()
+        )
         # What this turn did, reset at the start of _llm_reply: the
         # booking refusals in order, whether a booking landed, and
         # whether an unanswered question was already recorded. A turn
@@ -295,6 +307,198 @@ class Studio:
         recorded, so the owner can see what would have gone out."""
         self.sending_disabled = True
 
+    def _notifier_children(self):
+        """The channels inside the notifier, fan-out or single: the
+        sweep reaches each channel directly, the way the checklist
+        already does, instead of going through the fan-out."""
+        if isinstance(self.notifier, FanoutNotifier):
+            return list(self.notifier.notifiers)
+        return [self.notifier]
+
+    def _channel(self, kind):
+        for child in self._notifier_children():
+            if isinstance(child, kind):
+                return child
+        return None
+
+    def _call_notifier(self, notifier, business_name, handoff):
+        """One notifier call, as a status: a notifier that answers
+        nothing counts as sent, the call was attempted and no failure
+        was reported, and a raising one counts as failed, never as a
+        reason to break the caller."""
+        try:
+            status = notifier.notify(business_name, handoff)
+        except Exception:
+            return "failed"
+        return status if status is not None else "sent"
+
+    def _handoff_by_id(self, handoff_id):
+        """The handoff record for an id, open or resolved, or None.
+        The queue keys entries by handoff id, not phone, so a second
+        handoff from the same customer can never collide with the
+        first. Both store backends list every handoff, so the scan
+        works the same on JSON and Postgres."""
+        for handoff in self.handoffs.all_handoffs():
+            if handoff["id"] == handoff_id:
+                return handoff
+        return None
+
+    def notify_handoff(self, handoff, now=None):
+        """The one place a handoff ping leaves the shop: now, or held
+        for opening. During open hours it goes out at once, exactly
+        as before. After hours the ping is held: the owner's phone
+        stays quiet until morning, and the queue, a file, remembers
+        it across a restart. Returns "sent", "failed", "skipped", or
+        "held". Demo mode never enqueues: showcase handoffs are not
+        real customers. A queue write that fails falls back to
+        sending now: a night ping beats a lost ping."""
+        now = now or india_now()
+        if self.demo_mode:
+            return self._call_notifier(
+                self.notifier, self.profile.name, handoff
+            )
+        if _is_open_now(self.profile, now):
+            return self._call_notifier(
+                self.notifier, self.profile.name, handoff
+            )
+        try:
+            self.pending_pings.hold(
+                handoff["id"], handoff["phone"], handoff["opened_at"]
+            )
+        except Exception as exc:
+            print("quiet hours queue failed, pinging now: {}".format(exc))
+            return self._call_notifier(
+                self.notifier, self.profile.name, handoff
+            )
+        return "held"
+
+    def deliver_due_pings(self, now=None):
+        """Send the held owner pings whose shop has opened, and the
+        one nudge for the handoffs still open 15 minutes later. Runs
+        on the first request after opening, never on a timer: on the
+        free tier the process spins down overnight, so nothing here
+        can fire at a wall-clock time. Never raises: a throwing
+        sweep must not break the request it rode in on."""
+        try:
+            self._deliver_due_pings(now=now)
+        except Exception as exc:
+            print("quiet hours sweep failed: {}".format(exc))
+
+    def _deliver_due_pings(self, now=None):
+        now = now or india_now()
+        if self.demo_mode:
+            return
+        entries = self.pending_pings.all()
+        if not entries:
+            return
+        # A handoff resolved before morning gets no ping at all: the
+        # owner already knows, and the dashboard already shows it
+        # resolved. Entries whose ping already went out stay for the
+        # nudge pass below.
+        due = []
+        for entry in entries:
+            handoff = self._handoff_by_id(entry["handoff_id"])
+            if handoff is None or handoff["status"] != "open":
+                self.pending_pings.drop(entry["handoff_id"])
+                continue
+            if entry.get("ping_sent_at") is not None:
+                continue
+            opening = next_opening(
+                self.profile.hours_today,
+                datetime.fromtimestamp(entry["opened_at"], tz=IST),
+            )
+            if opening is None or now >= opening:
+                due.append((entry, handoff))
+        if due:
+            self._send_due_pings(due, now)
+        self._send_due_nudges(now)
+
+    def _send_due_pings(self, due, now):
+        """The morning delivery: one Telegram summary for the
+        handoffs the owner is actually being told about, and one
+        WhatsApp template ping per handoff, each carrying its age.
+        Telegram only: the summary is the delivery, and its result
+        decides the entries. With WhatsApp the summary goes out
+        after the loop, for the attempted handoffs only, so a ping
+        skipped because sending is off is never announced twice
+        when it finally goes out. Sent entries stay for the nudge;
+        failed ones drop, the failure already on the checklist;
+        skipped ones stay queued for the next sweep."""
+        whatsapp = self._channel(WhatsAppNotifier)
+        telegram = self._channel(TelegramNotifier)
+        if whatsapp is None and telegram is not None:
+            status = telegram.notify_overnight_summary(
+                self.profile.name, [h for _e, h in due], now=now
+            )
+            for entry, _handoff in due:
+                if status == "sent":
+                    self.pending_pings.mark_sent(
+                        entry["handoff_id"], int(now.timestamp())
+                    )
+                elif status == "failed":
+                    self.pending_pings.drop(entry["handoff_id"])
+            return
+        attempted = []
+        for entry, handoff in due:
+            if whatsapp is not None:
+                aged = dict(handoff)
+                aged["reason"] = "Waiting since {}: {}".format(
+                    _waiting_since(handoff["opened_at"], now),
+                    (handoff.get("reason") or "").strip(),
+                )
+                status = self._call_notifier(
+                    whatsapp, self.profile.name, aged
+                )
+            else:
+                status = self._call_notifier(
+                    self.notifier, self.profile.name, handoff
+                )
+            if status == "sent":
+                self.pending_pings.mark_sent(
+                    entry["handoff_id"], int(now.timestamp())
+                )
+                attempted.append(handoff)
+            elif status == "failed":
+                self.pending_pings.drop(entry["handoff_id"])
+                attempted.append(handoff)
+        if telegram is not None and attempted:
+            telegram.notify_overnight_summary(
+                self.profile.name, attempted, now=now
+            )
+
+    def _send_due_nudges(self, now):
+        """The one nudge, 15 minutes after the morning ping, only
+        while the handoff is still open and the shop is open. One
+        Telegram summary for every handoff still waiting, never one
+        per customer, and never on WhatsApp: the template cannot say
+        "still waiting" as a group. A nudge whose time falls after
+        closing is skipped, not sent late, and an entry past its
+        nudge time is done either way, so it never lingers."""
+        telegram = self._channel(TelegramNotifier)
+        waiting = []
+        for entry in self.pending_pings.all():
+            sent_at = entry.get("ping_sent_at")
+            if not sent_at or entry.get("nudged"):
+                continue
+            if now < datetime.fromtimestamp(sent_at, tz=IST) + timedelta(
+                minutes=15
+            ):
+                continue
+            handoff = self._handoff_by_id(entry["handoff_id"])
+            if handoff is None or handoff["status"] != "open":
+                self.pending_pings.drop(entry["handoff_id"])
+                continue
+            waiting.append((entry, handoff))
+        if not waiting:
+            return
+        if telegram is not None and _is_open_now(self.profile, now):
+            telegram.notify_still_waiting(
+                self.profile.name, [h for _e, h in waiting], now=now
+            )
+        for entry, _handoff in waiting:
+            self.pending_pings.mark_nudged(entry["handoff_id"])
+            self.pending_pings.drop(entry["handoff_id"])
+
     def setup_checklist(self):
         """Four things a real install needs before it can serve a shop:
         a brain that replies, a WhatsApp number, services with prices,
@@ -378,6 +582,36 @@ class Studio:
                         or "Set OWNER_WHATSAPP_NUMBER and OWNER_TEMPLATE_NAME on Render.",
                     )
                 )
+        # A ping held for opening is working as designed, not a
+        # failure: it reads as a checked line, never as a failure
+        # note, so the owner is not taught to ignore the checklist
+        # on the mornings the queue did its job.
+        held = [
+            e
+            for e in self.pending_pings.all()
+            if e.get("ping_sent_at") is None
+        ]
+        if held:
+            openings = [
+                next_opening(
+                    self.profile.hours_today,
+                    datetime.fromtimestamp(e["opened_at"], tz=IST),
+                )
+                for e in held
+            ]
+            openings = [o for o in openings if o is not None]
+            if openings:
+                soonest = min(openings)
+                title = "Owner ping held until {} ({} handoff{})".format(
+                    format_time(soonest.hour * 60 + soonest.minute),
+                    len(held),
+                    "s" if len(held) != 1 else "",
+                )
+            else:
+                title = "Owner ping held ({} handoff{})".format(
+                    len(held), "s" if len(held) != 1 else ""
+                )
+            items.append((title, True, ""))
         return items
 
     def _newly_closed_with_bookings(self, new_hours):
@@ -709,7 +943,7 @@ class Studio:
             self._dispatch(entry)
             self._save_outbox()
             try:
-                self.notifier.notify(self.profile.name, handoff)
+                self.notify_handoff(handoff, now)
             except Exception:
                 pass
             return entry
@@ -1215,7 +1449,7 @@ class Studio:
                 )
                 self._turn_unanswered = True
             try:
-                self.notifier.notify(self.profile.name, handoff)
+                self.notify_handoff(handoff, now)
             except Exception:
                 pass
             return {
@@ -1238,7 +1472,7 @@ class Studio:
         )
         return sorted(free, key=lambda s: abs(s - start))[:limit]
 
-    def handle_non_text_message(self, phone, msg_type, sender_name="", wamid=None):
+    def handle_non_text_message(self, phone, msg_type, sender_name="", wamid=None, now=None):
         """A voice note, photo, or anything else that is not typed text
         gets an honest answer, a lead record, and a handoff — never
         silence. The bot reads typed messages, not voice notes, and says
@@ -1275,13 +1509,21 @@ class Studio:
         self._dispatch(entry)
         self._save_outbox()
         try:
-            self.notifier.notify(self.profile.name, handoff)
+            self.notify_handoff(handoff, now)
         except Exception:
             pass
         return entry
 
-    def handle_webhook_payload(self, payload):
-        """Process a Meta WhatsApp Cloud API webhook payload. Returns count."""
+    def handle_webhook_payload(self, payload, now=None):
+        """Process a Meta WhatsApp Cloud API webhook payload. Returns count.
+
+        A pinned `now` fixes the clock the handoff ping reads, so a
+        test can hold the shop at one hour of the day; live webhooks
+        never pass one."""
+        # A webhook is a request for this shop, so it sweeps the held
+        # pings first: the morning's first customer message is often
+        # what carries the overnight ping out.
+        self.deliver_due_pings(now=now)
         count = 0
         # Meta mixes status updates and non-text messages into the same payload
         # shape. Skip status updates, but answer non-text messages honestly
@@ -1308,12 +1550,12 @@ class Studio:
                     try:
                         if msg.get("type") != "text":
                             self.handle_non_text_message(
-                                phone, msg.get("type", ""), contacts.get(phone, ""), wamid=wamid
+                                phone, msg.get("type", ""), contacts.get(phone, ""), wamid=wamid, now=now
                             )
                             count += 1
                             continue
                         text = (msg.get("text") or {}).get("body", "")
-                        self.handle_message(phone, text, contacts.get(phone, ""), wamid=wamid)
+                        self.handle_message(phone, text, contacts.get(phone, ""), now=now, wamid=wamid)
                         count += 1
                     except DuplicateMessageError:
                         # A second delivery that slipped past the check
@@ -1445,6 +1687,16 @@ class Studio:
         open_handoffs = [
             h for h in self.handoffs.all_handoffs() if h["status"] == "open"
         ]
+        # Handoffs whose owner ping is still held for opening: the
+        # "Needs you now" alert and the card's urgent line stay quiet
+        # for them, and the card says when the ping goes out instead.
+        # A ping already sent is no longer held, so the normal rules
+        # apply to it again.
+        held_ids = {
+            e["handoff_id"]
+            for e in self.pending_pings.all()
+            if e.get("ping_sent_at") is None
+        }
         resolved = [
             h for h in self.handoffs.all_handoffs() if h["status"] == "resolved"
         ]
@@ -1721,6 +1973,8 @@ class Studio:
                 )
             )
         for handoff in open_handoffs:
+            if handoff["id"] in held_ids:
+                continue
             if int(time.time()) - handoff["opened_at"] > 4 * 3600:
                 digits = "".join(c for c in handoff["phone"] if c.isdigit())
                 name = handoff.get("name") or handoff["phone"]
@@ -1745,7 +1999,11 @@ class Studio:
 
         def handoff_card(handoff):
             digits = "".join(c for c in handoff["phone"] if c.isdigit())
-            urgent = int(time.time()) - handoff["opened_at"] > 4 * 3600
+            held = handoff["id"] in held_ids
+            urgent = (
+                int(time.time()) - handoff["opened_at"] > 4 * 3600
+                and not held
+            )
             name = handoff.get("name")
             display = name or handoff["phone"]
             initial = (name or "?")[:1].upper()
@@ -1767,6 +2025,25 @@ class Studio:
                 html.escape(handoff["reason"]),
                 html.escape(age_text(handoff["opened_at"])),
             )
+            if held:
+                # Its own state, distinct from sent and from failed:
+                # the owner checking at midnight sees the ping is
+                # waiting for opening, not lost and not failed.
+                entry = self.pending_pings.get(handoff["id"])
+                opening = next_opening(
+                    self.profile.hours_today,
+                    datetime.fromtimestamp(entry["opened_at"], tz=IST),
+                )
+                if opening is None or now >= opening:
+                    card += "<p class='held'>Owner ping held, waiting to send</p>"
+                else:
+                    card += (
+                        "<p class='held'>Owner ping held until opening at {}</p>"
+                    ).format(
+                        html.escape(
+                            format_time(opening.hour * 60 + opening.minute)
+                        )
+                    )
             if urgent:
                 card += "<p class='urgent'>Waiting a long time. Call them soon.</p>"
             card += "<p class='quote'>&ldquo;{}&rdquo;</p>".format(
@@ -2291,6 +2568,7 @@ class Studio:
         .latest{font-size:16px;color:#4a4a44;margin:8px 0;max-width:700px}
         .latest span{font-weight:500;text-transform:uppercase;font-size:12px;letter-spacing:.08em;color:var(--ink)}
         .urgent{color:var(--ink);font-weight:500;margin:8px 0;text-decoration:underline wavy var(--gold) 2px;text-underline-offset:4px}
+        .held{color:var(--grey);font-size:14px;margin:8px 0}
         .call{display:block;text-align:center;background:var(--ink);color:var(--paper);padding:14px 20px;border-radius:999px;font-weight:500;font-size:17px;text-decoration:none;margin:18px 0 0;transition:background .18s ease}
         .call:hover{background:#3a3a3e}
         .thread{background:var(--sage);border-radius:18px;padding:16px;margin:16px 24px;display:flex;flex-direction:column;gap:8px;max-width:760px}
@@ -3180,6 +3458,13 @@ def make_handler(studio, router=None, dashboard_passwords=None, now=None):
             except Exception:
                 pass
 
+        def _sweep(self, target):
+            """Held owner pings go out on the first request after
+            opening, so every request for a shop sweeps that shop's
+            queue first. The sweep never raises, and the pinned `now`
+            a test passes in keeps the sweep on the test's clock."""
+            target.deliver_due_pings(now=now)
+
         def _redirect(self, location):
             """303 back to the dashboard, keeping the master shop in
             the URL so the next request stays in the same shop. A
@@ -3220,10 +3505,12 @@ def make_handler(studio, router=None, dashboard_passwords=None, now=None):
             shop = (qs.get("shop") or [""])[0] or None
             if router is None:
                 if not studio.dashboard_password:
+                    self._sweep(studio)
                     return studio
                 if check_basic_auth(
                     studio.dashboard_password, self.headers.get("Authorization")
                 ):
+                    self._sweep(studio)
                     return studio
                 self._unauthorized()
                 return None
@@ -3246,12 +3533,17 @@ def make_handler(studio, router=None, dashboard_passwords=None, now=None):
             if scoped is None:
                 self._unauthorized()
                 return None
+            self._sweep(scoped)
             return scoped
 
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path == "/health":
-                # The uptime check. On the database backend it also says
+                # The uptime check, and a sweep: a health check is
+                # often the first request of the day, so it is a
+                # fair trigger for a held ping whose shop has opened.
+                self._sweep(studio)
+                # On the database backend it also says
                 # whether saving works: a 503 when the database is down
                 # tells Render and Meta that the shop cannot take
                 # bookings right now, instead of quietly losing them.
