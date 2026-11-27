@@ -47,15 +47,23 @@ class FakeNotifier:
 class FakeSender:
     """Stand-in for the WhatsApp sender: records calls, never touches a network."""
 
-    def __init__(self, fail_with=None):
+    def __init__(self, fail_with=None, fail_template_with=None):
         self.calls = []
+        self.template_calls = []
         self.fail_with = fail_with
+        self.fail_template_with = fail_template_with
 
     def send(self, to, body):
         self.calls.append((to, body))
         if self.fail_with is not None:
             raise self.fail_with
         return f"wamid.sent.{len(self.calls)}"
+
+    def send_template(self, to, template_name, language, parameters):
+        self.template_calls.append((to, template_name, language, list(parameters)))
+        if self.fail_template_with is not None:
+            raise self.fail_template_with
+        return f"wamid.template.{len(self.template_calls)}"
 
 
 def make_studio(tmp, sender=None, dry_run=False):
