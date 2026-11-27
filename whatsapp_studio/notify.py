@@ -18,10 +18,28 @@ import json
 import os
 import time
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timedelta
 
-from .bookings import format_date, format_time
+from .bookings import IST, format_date, format_time
 from .config import DAY_KEYS, DAY_LABELS
+
+
+def _waiting_since(opened_at, now):
+    """When a handoff opened, in plain words for the morning ping:
+    "last night at 10:20 PM", "today at 8:00 AM", "yesterday at
+    3:00 PM", or "Tue at 10:20 PM". The age is the point of a held
+    ping: without it the owner reads an overnight wait as fresh."""
+    opened = datetime.fromtimestamp(opened_at, tz=IST)
+    when = format_time(opened.hour * 60 + opened.minute)
+    today = now.date()
+    if opened.date() == today:
+        return "today at {}".format(when)
+    if opened.date() == today - timedelta(days=1):
+        if opened.hour >= 18:
+            return "last night at {}".format(when)
+        return "yesterday at {}".format(when)
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    return "{} at {}".format(days[opened.weekday()], when)
 
 
 def _short(text, limit):
@@ -86,12 +104,59 @@ class TelegramNotifier:
             return False
 
     def notify(self, business_name, handoff):
-        self._send(
+        """Returns "sent" or "failed": the queue needs to know whether
+        the ping went out, so a failed morning ping is not mistaken
+        for a delivered one."""
+        if self._send(
             f"Customer needs you — {business_name}\n"
             f"{handoff.get('name') or 'Customer'} ({handoff['phone']})\n"
             f"Reason: {handoff['reason']}\n"
             f"\"{handoff['trigger']}\""
+        ):
+            return "sent"
+        return "failed"
+
+    def _held_lines(self, handoffs, now):
+        """One line per held handoff, oldest first: name, number,
+        reason, and when it opened. The age is what lets the owner
+        call the longest waiter first."""
+        lines = []
+        for handoff in sorted(handoffs, key=lambda h: h["opened_at"]):
+            lines.append(
+                "{}, {}, waiting since {}".format(
+                    "{} ({})".format(
+                        handoff.get("name") or "Customer", handoff["phone"]
+                    ),
+                    (handoff.get("reason") or "").strip() or "asked for a person",
+                    _waiting_since(handoff["opened_at"], now),
+                )
+            )
+            lines.append("\"{}\"".format(handoff.get("trigger") or ""))
+        return lines
+
+    def notify_overnight_summary(self, business_name, handoffs, now=None):
+        """One morning message for every held handoff, oldest first.
+        Returns "sent" or "failed". The WhatsApp template is one
+        customer per message, so the single catch-up list lives here,
+        on the free-form channel."""
+        now = now or datetime.now(IST)
+        headline = (
+            "Customer waited overnight at {}"
+            if len(handoffs) == 1
+            else "Customers waited overnight at {}"
+        ).format(business_name)
+        text = "\n".join([headline] + self._held_lines(handoffs, now))
+        return "sent" if self._send(text) else "failed"
+
+    def notify_still_waiting(self, business_name, handoffs, now=None):
+        """The one nudge: same list, different sentence, so it never
+        reads as a resend glitch. Returns "sent" or "failed"."""
+        now = now or datetime.now(IST)
+        text = "\n".join(
+            ["Still waiting, no reply yet at {}".format(business_name)]
+            + self._held_lines(handoffs, now)
         )
+        return "sent" if self._send(text) else "failed"
 
     def notify_booking(self, business_name, booking):
         day = date.fromisoformat(booking["date"])
@@ -159,7 +224,9 @@ class NullNotifier:
     dashboard."""
 
     def notify(self, business_name, handoff):
-        return None
+        # Nothing to send through, so the queue leaves the ping held
+        # rather than dropping it as delivered.
+        return "skipped"
 
     def notify_booking(self, business_name, booking):
         return None
@@ -306,6 +373,11 @@ class WhatsAppNotifier:
         )
 
     def notify(self, business_name, handoff):
+        """Returns "sent", "skipped", or "failed": the queue treats the
+        three differently, so they must not all look alike. Skipped
+        means dry run or the kill switch, never a send; failed means
+        Meta said no, and the failure is remembered for the
+        checklist."""
         if self._is_live is not None and not self._is_live():
             # Dry run or the kill switch: record what would have gone
             # out, send nothing.
@@ -314,7 +386,7 @@ class WhatsAppNotifier:
                     business_name, self.owner_number
                 )
             )
-            return None
+            return "skipped"
         parameters = [
             _short(business_name, 80),
             "{} ({})".format(
@@ -336,7 +408,8 @@ class WhatsAppNotifier:
             }
             detail = "{} {}".format(code, message) if code is not None else message
             print("owner whatsapp ping failed: {}".format(detail[:200]))
-        return None
+            return "failed"
+        return "sent"
 
     def notify_booking(self, business_name, booking):
         return None
@@ -364,7 +437,24 @@ class FanoutNotifier:
                 pass
 
     def notify(self, business_name, handoff):
-        self._each("notify", business_name, handoff)
+        """Send through every channel; returns the combined status.
+        "sent" when any channel sent, else "failed" when any failed,
+        else "skipped". A notifier that answers nothing (an old test
+        double, or a channel that predates statuses) counts as sent:
+        the call was attempted and no failure was reported, so the
+        queue must not hold the ping forever waiting on it."""
+        statuses = []
+        for notifier in self.notifiers:
+            try:
+                status = notifier.notify(business_name, handoff)
+            except Exception:
+                status = "failed"
+            statuses.append(status if status is not None else "sent")
+        if "sent" in statuses:
+            return "sent"
+        if "failed" in statuses:
+            return "failed"
+        return "skipped"
 
     def notify_booking(self, business_name, booking):
         self._each("notify_booking", business_name, booking)
