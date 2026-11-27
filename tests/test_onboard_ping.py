@@ -182,8 +182,8 @@ class TestOnboardPingHttp(unittest.TestCase):
 
     def test_form_tells_her_aditya_will_be_told(self):
         _, body = self._get("/onboard")
-        self.assertIn("we will let him know you set up your shop", body)
-        self.assertIn("No calls, no spam", body)
+        self.assertIn("Aditya will message you on this number to switch it on", body)
+        self.assertIn("Only Aditya sees this number.", body)
 
     def test_confirmation_says_aditya_will_message(self):
         _, body, _ = self._post_form("/onboard", _fields())
