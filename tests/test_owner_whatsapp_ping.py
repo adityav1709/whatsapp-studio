@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError
@@ -16,6 +17,7 @@ from urllib.error import HTTPError
 from test_live_send import FakeSender, make_profile
 from test_llm import FixedLLM
 from whatsapp_studio.app import Studio
+from whatsapp_studio.bookings import IST
 from whatsapp_studio.handoffs import HandoffStore
 from whatsapp_studio.leads import LeadStore
 from whatsapp_studio.notify import (
@@ -138,8 +140,12 @@ class UnapprovedTemplateTest(unittest.TestCase):
             studio = make_studio(tmp, sender=sender)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
+                # Open hours, pinned: without a now the ping is held
+                # for opening once the shop has closed, and the
+                # template error never fires.
                 entry = studio.handle_non_text_message(
-                    "919999999998", "audio", sender_name="Priya"
+                    "919999999998", "audio", sender_name="Priya",
+                    now=datetime(2026, 11, 15, 11, 0, tzinfo=IST),
                 )
                 for thread in studio._send_threads:
                     thread.join(timeout=5)
