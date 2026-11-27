@@ -273,6 +273,32 @@ Run the tests with `python3 -m unittest discover -s tests` from the project fold
   it pings, and reports the last failure in plain words. Never in demo
   mode, dry run, or while sending is paused
 
+**v0.5 — quiet-hours queue (no ping at night, one catch-up at opening)**
+- A handoff that opens after hours holds the owner ping until the shop
+  opens: the owner's phone stays quiet at night, and the queue is a
+  file (`data/pending_pings.json`, per shop under `data/shops/<id>/`),
+  so a restart overnight cannot lose it. A handoff resolved before
+  morning gets no ping at all
+- At opening the owner hears about it once, with how long the customer
+  has waited: one Telegram summary listing every held handoff, oldest
+  first, and one WhatsApp template ping per handoff, each carrying
+  "Waiting since last night at 10:20 PM" in the reason. Fifteen
+  minutes later, one Telegram nudge ("Still waiting, no reply yet")
+  if any of them is still open. No daytime nudges, and no nudge on
+  WhatsApp: the template cannot say "still waiting" as a group
+- The dashboard shows a held ping as its own state ("Owner ping held
+  until opening at 10:00 AM"), never as a failure, and the 4-hour
+  "Needs you now" alert stays quiet for held handoffs. The checklist
+  gains a held line too, so a held ping is visible without opening a
+  handoff card
+- Honest limits: the ping goes out on the first request after opening,
+  not at opening itself — on the free tier the process spins down
+  overnight, so nothing here can fire at a wall-clock time. WhatsApp
+  sends one ping per handoff, not one summary: the approved template
+  is one customer per message, and a true WhatsApp summary needs a new
+  template and Meta approval. A WhatsApp-only shop gets the morning
+  ping and the dashboard, and no nudge
+
 **v0.3 — human handoff (the promise kept)**
 - A customer asking for a person ("talk to someone", "manager se baat karni
   hai", "call me") — or the bot failing them twice in a row — opens a
