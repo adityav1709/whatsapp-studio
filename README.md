@@ -89,8 +89,9 @@ Run the tests with `python3 -m unittest discover -s tests` from the project fold
   Atomic writes stop a crash corrupting a file; the export is the backup.
   Export before every redeploy. A persistent disk is a paid decision for
   when the first owner pays. The owner ping is Telegram (or the dashboard)
-  until Meta approves the WhatsApp template — the WhatsApp ping is not
-  built in code and must not be pretended. The bot reads typed messages,
+  until Meta approves the WhatsApp template — the WhatsApp ping is built
+  in code (v0.4b) but stays silent until the template is approved, and
+  the checklist says so plainly. The bot reads typed messages,
   not voice notes; it holds a free-form conversation through the model,
   but it can only do what its tools allow, so prices and bookings stay
   exact. One install per shop, 3–4 shops, no scale work.
@@ -248,6 +249,29 @@ Run the tests with `python3 -m unittest discover -s tests` from the project fold
   business-admin step, not code). That is v0.4b. Telegram (v0.3) still
   covers the owner's fast notification meanwhile. Webhook signature
   verification and dashboard auth landed in v1.0 (above)
+
+**v0.4b — owner ping on WhatsApp (the handoff reaches her phone)**
+- The moment a handoff opens, the owner gets a Meta template message on
+  her personal WhatsApp: shop name, customer name and phone, reason, and
+  the customer's own words (first 200 chars). Template messages are the
+  only way to reach someone outside Meta's 24-hour window, which is
+  exactly when a handoff matters
+- Set `OWNER_WHATSAPP_NUMBER` (your personal number, not the shop's
+  number) and `OWNER_TEMPLATE_NAME` (the name Meta approved) on Render;
+  `OWNER_TEMPLATE_LANGUAGE` defaults to `en_US`. Per-shop vars
+  (`OWNER_WHATSAPP_NUMBER_<SHOP>` and friends) win over the base vars.
+  The template must be approved as UTILITY, with four body parameters
+  in this order: shop name, customer name + phone, reason, trigger quote
+- Telegram still fires alongside WhatsApp until the WhatsApp ping proves
+  itself in the pilot — a shop with an unapproved template would go from
+  pinged to silent otherwise. Dropping Telegram is a separate decision,
+  not part of v0.4b
+- Best-effort, always: a failed ping never breaks the handoff or the
+  customer confirmation, and the failure is logged with Meta's error
+  code (132000 means the template is not approved yet). The setup
+  checklist shows the ping line once it is configured, with the number
+  it pings, and reports the last failure in plain words. Never in demo
+  mode, dry run, or while sending is paused
 
 **v0.3 — human handoff (the promise kept)**
 - A customer asking for a person ("talk to someone", "manager se baat karni
