@@ -2962,6 +2962,7 @@ h2::after{content:"";display:block;width:56px;height:3px;background:var(--gold);
 .card{background:#fff;border:1px solid var(--sage);border-radius:18px;padding:28px;margin:16px 24px}
 .card p{margin:0 0 10px}
 .card p:last-child{margin-bottom:0}
+.bignum{font-family:var(--serif);font-size:32px;line-height:1.2}
 .err{color:var(--ink);font-weight:500}
 .field{margin:0 24px}
 label{display:block;font-size:15px;font-weight:500;margin:14px 0 0}
@@ -2976,7 +2977,7 @@ button.primary{width:100%;margin-top:12px;background:var(--gold);color:var(--ink
 button.ghost{width:100%;margin-top:8px;background:transparent;color:var(--ink);border:1px solid var(--ink)}
 a{color:var(--ink);text-decoration:underline;text-decoration-color:var(--gold);text-underline-offset:3px}
 .foot{margin:40px 24px 0;color:var(--grey);font-size:14px}
-@media (max-width:480px){h1{font-size:40px}header{padding:40px 20px 16px}h2{font-size:28px}}
+@media (max-width:480px){h1{font-size:40px}header{padding:40px 20px 16px}h2{font-size:28px}.bignum{font-size:26px}}
 """
 
 
@@ -3222,14 +3223,14 @@ def _onboard_form_html(fields, errors):
         "<h2>How do we reach you</h2>"
         "<div class='field'><label>Your WhatsApp number "
         "<input type='tel' name='phone' inputmode='tel' value='{}'></label>{}"
-        "<p class='quiet'>The number your customers already message. "
-        "Only Aditya sees it. When you press 'See my receptionist', "
-        "we will let him know you set up your shop, so he can message "
-        "you on WhatsApp to switch it on. No calls, no spam, nothing "
-        "goes live until you say so.</p>"
+        "<p class='quiet'>Use the number your customers already message on WhatsApp. "
+        "We check the shape of the number here. Aditya will message you on "
+        "this number to switch it on, so check it reads right. Only Aditya "
+        "sees this number.</p>"
         "<label>Type it again "
         "<input type='tel' name='phone_confirm' inputmode='tel' value='{}'></label>{}"
-        "<p class='quiet'>A wrong number means your receptionist answers from nowhere.</p>"
+        "<p class='quiet'>Type the same number again. If the two do not match, "
+        "we will ask you to check them.</p>"
         "<button type='submit' class='primary'>See my receptionist</button></div>"
         "</form>"
         "<p class='foot'><a href='/'>Back to the demo shop</a></p>".format(
@@ -3261,10 +3262,14 @@ def _onboard_form_html(fields, errors):
 def _onboard_confirmation_html(profile, fields):
     """What she told us, as the bot will use it, a sample of her own
     bot answering a customer, and the honest next step: send the file
-    to Aditya. Nothing here claims the bot is live."""
+    to Aditya. The number comes back big, with a link to open it in
+    WhatsApp and a way back to fix it, because the form only checked
+    its shape. Nothing here claims the bot is live."""
     owner_name = (fields.get("owner_name") or [""])[0].strip()
     title = "Thanks, {}.".format(owner_name) if owner_name else "Your shop file is ready."
     place = _onboard_place_word(profile["category"])
+    digits = profile["phone"]
+    wa_link = "https://wa.me/91{}".format(digits)
     service_lines = []
     for service in profile["services"]:
         if service["price"] is not None:
@@ -3293,6 +3298,17 @@ def _onboard_confirmation_html(profile, fields):
         "<p>{}</p>"
         "{}"
         "<ul>{}</ul></div>"
+        "<h2>Your WhatsApp number</h2>"
+        "<div class='card'><p class='bignum'><a href='{}'>+91 {}</a></p>"
+        "<p>Is this the number your customers already message?</p>"
+        "<p>Tap the link to open it in WhatsApp and check it is yours. "
+        "If it is wrong, tap Change it and fix it before you send the file.</p>"
+        "<p>We checked the shape of this number only. Aditya will message "
+        "you on WhatsApp using your shop name. When he does, reply yes, "
+        "and nothing goes live until you say so.</p>"
+        "<form method='post' action='/onboard'>{}"
+        "<input type='hidden' name='_action' value='edit'>"
+        "<button type='submit' class='ghost'>Change it</button></form></div>"
         "<h2>What your customers will see</h2>"
         "<div class='thread'><div class='msg in'><p>{}</p></div>"
         "<div class='msg out'><p>{}</p></div></div>"
@@ -3319,6 +3335,9 @@ def _onboard_confirmation_html(profile, fields):
                 else ""
             ),
             "".join(service_lines),
+            html.escape(wa_link, quote=True),
+            html.escape(digits),
+            hidden,
             html.escape(question),
             html.escape(answer),
             hidden,
