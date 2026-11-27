@@ -34,6 +34,7 @@ STORE_FILES = (
     "blocks.json",
     "missed.json",
     "outbox.json",
+    "pending_pings.json",
 )
 
 
@@ -212,6 +213,7 @@ class ShopRouter:
             handoffs=stores.handoffs,
             blocks=stores.blocks,
             missed=stores.missed,
+            pending_pings=stores.pending_pings,
             sender=sender,
             outbox_store=stores.outbox,
             llm=self.llm,
