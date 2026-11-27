@@ -299,6 +299,20 @@ Run the tests with `python3 -m unittest discover -s tests` from the project fold
   template and Meta approval. A WhatsApp-only shop gets the morning
   ping and the dashboard, and no nudge
 
+**v0.5a — number check-back at setup (the form only checked the shape)**
+- The confirmation page shows her WhatsApp number back big, with a
+  wa.me link to open it in WhatsApp and check it is hers, and a
+  Change it button that takes her back to the form with everything
+  she typed kept. The page says plainly that only the shape was
+  checked, and that Aditya will message her on WhatsApp using her
+  shop name: she replies yes, and nothing goes live until she says so
+- Honest limits: this still does not prove the number is on WhatsApp
+  or that she owns it. A code challenge is the next slice, gated on a
+  live sender and an approved template, and it never blocks the
+  download in demo mode. The old Meta lookup for this does not exist
+  any more, and matching against the connected business number would
+  reject every new shop, so neither is built
+
 **v0.3 — human handoff (the promise kept)**
 - A customer asking for a person ("talk to someone", "manager se baat karni
   hai", "call me") — or the bot failing them twice in a row — opens a
