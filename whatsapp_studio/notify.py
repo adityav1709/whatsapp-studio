@@ -274,6 +274,46 @@ def _owner_whatsapp_env(shop_id):
     return number, template, language
 
 
+def _code_template_env(shop_id):
+    """(template name, language) for the onboarding number check: the
+    template Meta approved for sending the setup code. Same shape as
+    _owner_whatsapp_env, per-shop vars winning over the base vars. A
+    prospect has no shop id yet, so the base CODE_TEMPLATE_NAME is
+    the one that bites at onboarding; the suffix shape is kept so the
+    helper works the same if the route ever runs under a shop scope.
+    Unset means the check was never configured."""
+    suffix = _shop_env_suffix(shop_id)
+    template = os.environ.get("CODE_TEMPLATE_NAME" + suffix) or os.environ.get(
+        "CODE_TEMPLATE_NAME"
+    )
+    language = (
+        os.environ.get("CODE_TEMPLATE_LANGUAGE" + suffix)
+        or os.environ.get("CODE_TEMPLATE_LANGUAGE")
+        or "en_US"
+    )
+    return template, language
+
+
+def code_challenge_status(sender, shop_id, demo_mode):
+    """(ready, reason) for the onboarding number check: ready True when
+    the code can be sent; reason the plain-words cause when it cannot,
+    or None when the check was simply never configured — not an error,
+    and not worth a boot log line. Mirrors whatsapp_channel_status:
+    demo mode and a missing sender keep the check off, and a missing
+    template means it was never set up."""
+    template, _language = _code_template_env(shop_id)
+    if not template:
+        return False, None
+    if demo_mode:
+        return False, "Demo mode is on, so the number check is off."
+    if sender is None:
+        return (
+            False,
+            "Set WHATSAPP_TOKEN and PHONE_NUMBER_ID on Render so the number check can send.",
+        )
+    return True, None
+
+
 def owner_whatsapp_configured(shop_id):
     """True when the owner has started setting up the WhatsApp ping —
     the number or the template name is set. The setup checklist shows
@@ -333,9 +373,14 @@ def _meta_error(exc):
 
 # Meta's words for the failures an owner can actually fix, keyed by
 # the code in the error body. Anything else is reported by its code.
+# 131026 is Meta's "message undeliverable": the number is not on
+# WhatsApp, the recipient has not accepted the current terms, or the
+# app is too old. The actionable reading is the first of the three,
+# which is why the code challenge treats it as not on WhatsApp.
 _META_ERROR_WORDS = {
     132000: "template not approved by Meta yet",
     131030: "template or recipient problem",
+    131026: "message could not be delivered",
 }
 
 
