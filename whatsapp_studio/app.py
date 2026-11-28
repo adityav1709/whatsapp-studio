@@ -20,8 +20,10 @@ data endpoints. Set both before the server is reachable from the internet.
 from __future__ import annotations
 
 import html
+import hmac
 import json
 import os
+import secrets
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -74,7 +76,10 @@ from .notify import (
     NullNotifier,
     TelegramNotifier,
     WhatsAppNotifier,
+    _code_template_env,
+    _meta_error,
     _waiting_since,
+    code_challenge_status,
     notifier_from_env,
     owner_whatsapp_configured,
     whatsapp_channel_status,
@@ -186,6 +191,19 @@ class Studio:
         # ping per number per day, in memory only. The form stores
         # nothing, so a restart forgets who was pinged.
         self._onboard_pinged = {}
+        # Onboarding number check codes, phone digits to one record:
+        # {"code", "expires_at", "sent_at", "wrong", "sends",
+        # "verified"}. In memory only, like the ping dedup, so a
+        # restart forgets every code and every checked state; that
+        # loss reads as an expired code, never as an error. The dict
+        # is capped so a long lived process cannot grow it without
+        # limit, and it has its own lock because the handler is
+        # threaded. Once Meta has said the code template is
+        # unapproved, the check hides until a restart, when the
+        # template may have been approved.
+        self._onboard_codes = {}
+        self._code_lock = threading.Lock()
+        self.code_template_unapproved = False
         # One shot notice for the dashboard, set by a form handler and
         # shown once on the next page render, then cleared.
         self._notice = None
@@ -717,6 +735,157 @@ class Studio:
             self._onboard_pinged.pop(next(iter(self._onboard_pinged)))
         self._onboard_pinged[phone] = day
         return True, seen_before
+
+    def code_challenge_ready(self):
+        """True when the onboarding number check can run: replies are
+        actually being sent, the page is not the demo, a code template
+        is configured, and Meta has not already said that template is
+        unapproved in this process. Anything else falls back to the
+        number shown back, with no mention of a code."""
+        if not self.live or self.demo_mode or self.code_template_unapproved:
+            return False
+        ready, _reason = code_challenge_status(
+            self.sender, self._shop_id, self.demo_mode
+        )
+        return ready
+
+    def onboard_code_state(self, phone, now=None):
+        """What the confirmation page shows for this number: "offer"
+        (no code sent yet, or the last one is gone), "sent" (a live
+        code is waiting for her to type it back), or "verified" (she
+        already proved this number). Derived from the stored record,
+        never from the POST that just happened, so a refresh after a
+        code was sent still shows the entry box. A missing record is
+        "offer": a restart forgets the code, and the page offers a
+        fresh one instead of an error."""
+        now = now or india_now()
+        with self._code_lock:
+            record = self._onboard_codes.get(phone)
+            if record is None:
+                return "offer"
+            if record.get("verified"):
+                return "verified"
+            if record.get("code") and record["expires_at"] > now:
+                return "sent"
+            return "offer"
+
+    def code_send_due(self, phone, now=None):
+        """(due, why) for sending a code to this number, a separate
+        throttle from the one ping per day on Aditya's Telegram ping:
+        that throttle stops buzzing him, while a code goes to her own
+        number at her own tap. A live code cannot be re-sent inside a
+        minute; no more than 5 codes go out to one number in a rolling
+        hour. A voided or expired code waives the minute: the resend
+        is a recovery from a dead code, not a repeat send. why is
+        None when due, else "cooldown" or "cap"."""
+        now = now or india_now()
+        with self._code_lock:
+            record = self._onboard_codes.get(phone)
+            if record is not None:
+                live = record.get("code") and record["expires_at"] > now
+                if live and (now - record["sent_at"]) < timedelta(
+                    seconds=ONBOARD_CODE_RESEND_SECONDS
+                ):
+                    return False, "cooldown"
+                sends = [
+                    sent
+                    for sent in record.get("sends", [])
+                    if (now - sent) < timedelta(hours=1)
+                ]
+                if len(sends) >= ONBOARD_CODE_MAX_SENDS_PER_HOUR:
+                    return False, "cap"
+            return True, None
+
+    def send_onboard_code(self, profile, now=None):
+        """Send a fresh six digit code to the number on this profile by
+        template, and remember it. Returns (True, None) on a send, or
+        (False, kind) where kind is "not_ready" (Meta said the
+        template is unapproved), "not_on_whatsapp" (Meta said the
+        message could not be delivered), or "failed" (anything else).
+        A failed send stores nothing and counts against no cap: no
+        code went out, so there is nothing to type back. The log line
+        carries the Meta code and the exception class, never the phone
+        number and never the code."""
+        now = now or india_now()
+        phone = profile["phone"]
+        template, language = _code_template_env(self._shop_id)
+        code = str(secrets.randbelow(900000) + 100000)
+        try:
+            self.sender.send_template(
+                "91" + phone, template, language, [code, profile["name"]]
+            )
+        except Exception as exc:
+            meta_code, _message = _meta_error(exc)
+            if meta_code == 132000:
+                self.code_template_unapproved = True
+                print("onboard code send failed code=132000")
+                return False, "not_ready"
+            if meta_code in (131030, 131026):
+                print(
+                    "onboard code send failed code={}".format(meta_code)
+                )
+                return False, "not_on_whatsapp"
+            if meta_code is not None:
+                print(
+                    "onboard code send failed code={} error={}".format(
+                        meta_code, type(exc).__name__
+                    )
+                )
+            else:
+                print(
+                    "onboard code send failed error={}".format(type(exc).__name__)
+                )
+            return False, "failed"
+        with self._code_lock:
+            record = self._onboard_codes.get(phone)
+            sends = []
+            if record is not None:
+                sends = [
+                    sent
+                    for sent in record.get("sends", [])
+                    if (now - sent) < timedelta(hours=1)
+                ]
+            if len(self._onboard_codes) >= ONBOARD_CODE_MAX_RECORDS:
+                self._onboard_codes.pop(next(iter(self._onboard_codes)))
+            self._onboard_codes[phone] = {
+                "code": code,
+                "expires_at": now + timedelta(minutes=ONBOARD_CODE_EXPIRY_MINUTES),
+                "sent_at": now,
+                "wrong": 0,
+                "sends": sends + [now],
+                "verified": False,
+            }
+        return True, None
+
+    def verify_onboard_code(self, phone, guess, now=None):
+        """Check her guess against the stored code. Returns "verified",
+        "wrong", "voided", or "expired". Three wrong guesses void the
+        code at once and she gets a fresh one, with no wait: there is
+        no lockout in this build, ever, because a wait reads as
+        punishment for mistyping one handed between customers, and
+        rotating the code bounds guessing without making her wait. A
+        missing record reads as expired: a restart forgets the code,
+        and the page offers a resend instead of an error."""
+        now = now or india_now()
+        guess = (guess or "").replace(" ", "")
+        with self._code_lock:
+            record = self._onboard_codes.get(phone)
+            if record is None or not record.get("code"):
+                return "expired"
+            if record.get("verified"):
+                return "verified"
+            if record["expires_at"] <= now:
+                record["code"] = None
+                return "expired"
+            if len(guess) > 6 or not hmac.compare_digest(guess, record["code"]):
+                record["wrong"] = record.get("wrong", 0) + 1
+                if record["wrong"] >= ONBOARD_CODE_MAX_WRONG:
+                    record["code"] = None
+                    record["wrong"] = 0
+                    return "voided"
+                return "wrong"
+            record["verified"] = True
+            return "verified"
 
     def self_test_line(self):
         """One quiet line inviting the owner to test the bot himself:
@@ -2924,6 +3093,15 @@ class Studio:
 
 ONBOARD_DURATIONS = (15, 30, 45, 60, 90, 120)
 ONBOARD_MAX_BODY = 65536
+# The number check code: ten minutes to type it back, a minute
+# between sends while one is live, three wrong guesses void the code
+# and offer a fresh one at once (no lockout, ever), five sends to one
+# number in a rolling hour, and no more than 500 records in memory.
+ONBOARD_CODE_EXPIRY_MINUTES = 10
+ONBOARD_CODE_RESEND_SECONDS = 60
+ONBOARD_CODE_MAX_WRONG = 3
+ONBOARD_CODE_MAX_SENDS_PER_HOUR = 5
+ONBOARD_CODE_MAX_RECORDS = 500
 ONBOARD_DAY_SHORT = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 ONBOARD_CATEGORIES = (
     ("salon", "Salon"),
@@ -3259,12 +3437,80 @@ def _onboard_form_html(fields, errors):
     )
 
 
-def _onboard_confirmation_html(profile, fields):
+def _onboard_code_block(profile, fields, code_state):
+    """The optional number check on the confirmation page, below the
+    download button: she taps to ask for a code, types it back, and
+    the page says her number is checked. The download is already
+    above this block and never depends on it. code_state is
+    {"kind", "error", "resend_hint"}: kind "offer" (no code waiting),
+    "sent" (a live code is waiting), "verified" (she already proved
+    this number), "not_ready" (Meta said the template is unapproved,
+    shown once). The error line, when there is one, sits at the top
+    of the card; the human way out sits under the code box from the
+    start, so a stuck owner always sees Aditya as the way forward."""
+    hidden = _onboard_hidden_fields(fields)
+    kind = code_state.get("kind")
+    error = code_state.get("error")
+    way_out = (
+        "<p>Stuck? Aditya will message you on WhatsApp and check it "
+        "with you. Nothing goes live until you say so.</p>"
+    )
+    if kind == "verified":
+        return (
+            "<h2>Check this number when you have a moment</h2>"
+            "<div class='card'><p>Your number is checked. Aditya will "
+            "message you on WhatsApp. When he does, send him your shop file.</p></div>"
+        )
+    if kind == "not_ready":
+        return (
+            "<div class='card'><p>The number check is not ready yet. "
+            "Aditya will message you on WhatsApp and check it with you.</p></div>"
+        )
+    error_html = "<p>{}</p>".format(html.escape(error)) if error else ""
+    if kind == "sent":
+        resend_hint = ""
+        if code_state.get("resend_hint", True):
+            resend_hint = (
+                "<p>No code yet? Wait a minute, then tap Send the code again.</p>"
+            )
+        return (
+            "<h2>Check this number when you have a moment</h2>"
+            "<div class='card'>"
+            + error_html
+            + "<p>We sent a code to +91 {} on WhatsApp. Type the code here "
+            "to show this number is yours.</p>"
+            "<form method='post' action='/onboard/code/verify'>{}"
+            "<div class='field'><label>Your code "
+            "<input type='text' name='code' inputmode='numeric' "
+            "autocomplete='one-time-code'></label></div>"
+            "<button type='submit' class='primary'>Confirm my number</button></form>"
+            "<form method='post' action='/onboard/code/send'>{}"
+            "<button type='submit' class='ghost'>Send the code again</button></form>"
+            + resend_hint
+            + way_out
+            + "</div>"
+        ).format(html.escape(profile["phone"]), hidden, hidden)
+    return (
+        "<h2>Check this number when you have a moment</h2>"
+        "<div class='card'>"
+        + error_html
+        + "<p>This is optional. Your file is ready above, and you can do "
+        "this now or later. It does not change your download.</p>"
+        "<form method='post' action='/onboard/code/send'>{}"
+        "<button type='submit' class='primary'>Send me a code</button></form>"
+        + way_out
+        + "</div>"
+    ).format(hidden)
+
+
+def _onboard_confirmation_html(profile, fields, code_state=None):
     """What she told us, as the bot will use it, a sample of her own
     bot answering a customer, and the honest next step: send the file
     to Aditya. The number comes back big, with a link to open it in
     WhatsApp and a way back to fix it, because the form only checked
-    its shape. Nothing here claims the bot is live."""
+    its shape. Nothing here claims the bot is live. code_state adds
+    the optional number check block below the download button; None
+    renders the page exactly as before, with no mention of a code."""
     owner_name = (fields.get("owner_name") or [""])[0].strip()
     title = "Thanks, {}.".format(owner_name) if owner_name else "Your shop file is ready."
     place = _onboard_place_word(profile["category"])
@@ -3287,6 +3533,9 @@ def _onboard_confirmation_html(profile, fields):
         service_lines.append("<li>{}</li>".format(html.escape(line)))
     question, answer = _onboard_sample_reply(profile)
     hidden = _onboard_hidden_fields(fields)
+    code_block = (
+        "" if code_state is None else _onboard_code_block(profile, fields, code_state)
+    )
     return _onboard_page(
         title,
         "<header><h1>{}</h1>"
@@ -3323,7 +3572,7 @@ def _onboard_confirmation_html(profile, fields):
         "<p class='quiet'>This file is your shop. Keep it safe and send it to Aditya.</p>"
         "<form method='post' action='/onboard'>{}"
         "<input type='hidden' name='_action' value='edit'>"
-        "<button type='submit' class='ghost'>Change something</button></form></div>"
+        "<button type='submit' class='ghost'>Change something</button></form></div>{}"
         "<p class='foot'><a href='/'>Back to the demo shop</a></p>".format(
             html.escape(title),
             html.escape(profile["name"]),
@@ -3342,6 +3591,7 @@ def _onboard_confirmation_html(profile, fields):
             html.escape(answer),
             hidden,
             hidden,
+            code_block,
         ),
     )
 
@@ -3761,8 +4011,165 @@ def make_handler(studio, router=None, dashboard_passwords=None, now=None):
                         daemon=True,
                     )
                     thread.start()
+                # The code step, when it can run, is derived from the
+                # stored record, so a refresh after a code was sent
+                # still shows the entry box, and a checked number
+                # still shows checked. Otherwise the page stands as
+                # it did, with no mention of a code.
+                code_state = None
+                if studio.code_challenge_ready():
+                    code_state = {
+                        "kind": studio.onboard_code_state(profile["phone"], now),
+                        "error": None,
+                        "resend_hint": True,
+                    }
                 self._send_text(
-                    200, _onboard_confirmation_html(profile, fields), "text/html"
+                    200,
+                    _onboard_confirmation_html(profile, fields, code_state),
+                    "text/html",
+                )
+                return
+            if parsed.path == "/onboard/code/send":
+                # The optional number check: she taps to ask for a
+                # code. The profile revalidates from the posted
+                # fields, the gate runs server side, and the page
+                # re-renders with the code entry box. The download
+                # never consults code state, so no outcome here can
+                # strand her file.
+                raw = self._read_body()
+                if raw is None:
+                    return
+                fields = parse_qs(
+                    raw.decode("utf-8", errors="replace"), keep_blank_values=True
+                )
+                profile, errors = validate_onboarding_profile(fields)
+                if errors:
+                    self._send_text(
+                        200, _onboard_form_html(fields, errors), "text/html"
+                    )
+                    return
+                code_state = None
+                if studio.code_challenge_ready():
+                    due, why = studio.code_send_due(profile["phone"], now)
+                    if not due:
+                        if why == "cooldown":
+                            error = (
+                                "No code yet? Wait a minute, then tap "
+                                "Send the code again."
+                            )
+                        else:
+                            error = (
+                                "No code yet? Check the number above. If it is "
+                                "right, tap Send the code again. If it is wrong, "
+                                "tap Change it and fix it."
+                            )
+                        code_state = {
+                            "kind": studio.onboard_code_state(profile["phone"], now),
+                            "error": error,
+                            "resend_hint": False,
+                        }
+                    else:
+                        sent, kind = studio.send_onboard_code(profile, now)
+                        if sent:
+                            code_state = {
+                                "kind": "sent",
+                                "error": None,
+                                "resend_hint": True,
+                            }
+                        elif kind == "not_ready":
+                            code_state = {
+                                "kind": "not_ready",
+                                "error": None,
+                                "resend_hint": True,
+                            }
+                        elif kind == "not_on_whatsapp":
+                            code_state = {
+                                "kind": studio.onboard_code_state(
+                                    profile["phone"], now
+                                ),
+                                "error": (
+                                    "This number is not on WhatsApp. Use the number "
+                                    "your customers message, or set up WhatsApp on it first."
+                                ),
+                                "resend_hint": True,
+                            }
+                        else:
+                            code_state = {
+                                "kind": studio.onboard_code_state(
+                                    profile["phone"], now
+                                ),
+                                "error": (
+                                    "No code yet? That happens sometimes. Your file is "
+                                    "still here, and Aditya will message you on WhatsApp "
+                                    "and check it with you."
+                                ),
+                                "resend_hint": True,
+                            }
+                self._send_text(
+                    200,
+                    _onboard_confirmation_html(profile, fields, code_state),
+                    "text/html",
+                )
+                return
+            if parsed.path == "/onboard/code/verify":
+                # She types the code back. Same round trip as the
+                # send: revalidate, gate server side, re-render the
+                # confirmation page with the outcome. A wrong guess
+                # never locks her out: three wrong guesses void the
+                # code and offer a fresh one at once.
+                raw = self._read_body()
+                if raw is None:
+                    return
+                fields = parse_qs(
+                    raw.decode("utf-8", errors="replace"), keep_blank_values=True
+                )
+                profile, errors = validate_onboarding_profile(fields)
+                if errors:
+                    self._send_text(
+                        200, _onboard_form_html(fields, errors), "text/html"
+                    )
+                    return
+                code_state = None
+                if studio.code_challenge_ready():
+                    guess = (fields.get("code") or [""])[0]
+                    result = studio.verify_onboard_code(profile["phone"], guess, now)
+                    if result == "verified":
+                        code_state = {
+                            "kind": "verified",
+                            "error": None,
+                            "resend_hint": True,
+                        }
+                    elif result == "wrong":
+                        code_state = {
+                            "kind": studio.onboard_code_state(profile["phone"], now),
+                            "error": (
+                                "That code does not match. Check the message "
+                                "on WhatsApp and try again."
+                            ),
+                            "resend_hint": True,
+                        }
+                    elif result == "voided":
+                        code_state = {
+                            "kind": studio.onboard_code_state(profile["phone"], now),
+                            "error": (
+                                "That code did not match. Tap Send the code again for "
+                                "a new one, or leave it and Aditya will check it with you."
+                            ),
+                            "resend_hint": True,
+                        }
+                    else:
+                        code_state = {
+                            "kind": studio.onboard_code_state(profile["phone"], now),
+                            "error": (
+                                "That code has run out. Tap Send the code again "
+                                "for a new one."
+                            ),
+                            "resend_hint": True,
+                        }
+                self._send_text(
+                    200,
+                    _onboard_confirmation_html(profile, fields, code_state),
+                    "text/html",
                 )
                 return
             if parsed.path == "/onboard/download":
