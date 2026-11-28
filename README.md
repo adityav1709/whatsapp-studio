@@ -313,6 +313,40 @@ Run the tests with `python3 -m unittest discover -s tests` from the project fold
   any more, and matching against the connected business number would
   reject every new shop, so neither is built
 
+**v0.5b — number check code at setup (optional, after the download)**
+- The confirmation page offers an optional code check below the
+  Download button, only when the sender is live and a code template
+  is configured. She taps "Send me a code", gets a six digit code on
+  WhatsApp, and types it back on the same page. The code proves she
+  can read WhatsApp on that number right now; it does not prove
+  business ownership, and Aditya messaging her and her replying yes
+  remains the switch on proof. The download is never gated on a
+  code, in any mode, in any code state, and demo mode shows no code
+  step at all
+- No lockout, ever: three wrong guesses void the code and offer a
+  fresh one at once, so mistyping one handed between customers never
+  punishes her with a wait. Codes live 10 minutes, a resend waits a
+  minute while one is live, and no more than 5 codes go to one number
+  in an hour. Codes live in memory only and are forgotten on restart,
+  which reads as an expired code with a resend, never an error
+- The code template is filed alongside the owner ping template: set
+  `CODE_TEMPLATE_NAME` (the name Meta approved) on Render;
+  `CODE_TEMPLATE_LANGUAGE` defaults to `en_US`. The template must be
+  approved as UTILITY, with two body parameters in this order: the
+  code digits, then the shop name. Do not reuse the owner ping
+  template: different shape, different parameters. Until Meta
+  approves it, the page stays exactly the v0.5a page and says nothing
+  about a code; if Meta says the template is unapproved (132000)
+  after she taps, the page says so once and then hides the check
+- Honest limits: a code proves control at that moment, not ownership,
+  and a shared family phone passes for the wrong person. Meta error
+  131026 (message undeliverable: not on WhatsApp, terms not accepted,
+  or an old app version) reads on the page as "This number is not on
+  WhatsApp", with the human way out underneath, because the page
+  cannot know which of the three it is. The send waits on Meta in
+  the request, up to the 10 second timeout, so the page knows the
+  outcome before it renders
+
 **v0.3 — human handoff (the promise kept)**
 - A customer asking for a person ("talk to someone", "manager se baat karni
   hai", "call me") — or the bot failing them twice in a row — opens a
